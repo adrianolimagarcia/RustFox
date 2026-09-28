@@ -333,6 +333,45 @@ impl TaskStore {
         Ok(ids)
     }
 
+    /// Task IDs for a session whose state may legally transition to `Cancelled`.
+    ///
+    /// `session_key` is stored in `sup_tasks.user_id` as `{bot_id}:{user_id}`
+    /// (portal uses bot id `default`). See [`crate::agent::session_key`].
+    pub async fn list_cancellable_ids_for_session(&self, session_key: &str) -> Result<Vec<String>> {
+        use crate::supervisor::task::TaskStatus;
+        let conn = self.conn.lock().await;
+        // States that `transition_allowed(_, Cancelled)` accepts today.
+        let states = [
+            serde_json::to_string(&TaskStatus::Intake)?,
+            serde_json::to_string(&TaskStatus::Route)?,
+            serde_json::to_string(&TaskStatus::Clarify)?,
+            serde_json::to_string(&TaskStatus::Plan)?,
+            serde_json::to_string(&TaskStatus::PrepareWorkspace)?,
+            serde_json::to_string(&TaskStatus::Execute)?,
+            serde_json::to_string(&TaskStatus::Review)?,
+            serde_json::to_string(&TaskStatus::Paused)?,
+        ];
+        let placeholders = states
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id FROM sup_tasks WHERE user_id=?1 AND state IN ({placeholders}) ORDER BY updated_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + states.len());
+        params.push(&session_key);
+        for s in &states {
+            params.push(s);
+        }
+        let ids = stmt
+            .query_map(params.as_slice(), |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
     pub async fn transitions(&self, task_id: &str) -> Result<Vec<TransitionRow>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
@@ -428,5 +467,20 @@ mod tests {
         let history = store.transitions(&t.id).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].to, TaskStatus::Classify);
+    }
+    #[tokio::test]
+    async fn list_cancellable_ids_for_session_filters_by_session_key() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let key = crate::agent::session_key("main", "42");
+        let other = crate::agent::session_key("main", "99");
+
+        let t1 = crate::supervisor::task::Task::new("A", "a");
+        let t2 = crate::supervisor::task::Task::new("B", "b");
+        store.create(&t1, "telegram", &key, None).await.unwrap();
+        store.create(&t2, "telegram", &other, None).await.unwrap();
+
+        let ids = store.list_cancellable_ids_for_session(&key).await.unwrap();
+        assert_eq!(ids, vec![t1.id]);
     }
 }
