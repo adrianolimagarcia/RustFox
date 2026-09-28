@@ -451,7 +451,12 @@ async fn add_bot(
     let token = body.bot_token.clone();
     let uid = body.allowed_user_id;
     let result = tokio::task::spawn_blocking(move || {
-        crate::agents_edit::append_bot_binding(&path, &id, &token, uid)
+        let home = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let (store, _) = crate::secret_store::open(&home)?;
+        crate::agents_edit::append_bot_binding(&path, &id, &token, uid, store.as_ref())
     })
     .await;
 
@@ -856,7 +861,13 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     println!("\n✓ config.toml saved to {}", config_path.display());
 
     for (id, token, caller) in &extra_bots {
-        match crate::agents_edit::append_bot_binding(&config_path, id, token, *caller) {
+        let home = config_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        match crate::secret_store::open(&home).and_then(|(store, _)| {
+            crate::agents_edit::append_bot_binding(&config_path, id, token, *caller, store.as_ref())
+        }) {
             Ok(r) => println!(
                 "✓ Added bot `{}` (persona=`{}`) bak={}",
                 r.id,
@@ -1412,11 +1423,13 @@ allowed_directory = "/tmp"
         )
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
+        let store = crate::secret_store::FakeSecretStore::new();
         let r = crate::agents_edit::append_bot_binding(
             &path,
             "researcher",
             "222222222:AANewTokenSecretValueYYYYYY",
             7,
+            &store,
         )
         .unwrap();
         assert_eq!(r.id, "researcher");

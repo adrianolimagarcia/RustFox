@@ -224,6 +224,16 @@ impl MissingSecretError {
     }
 }
 
+// Manual Debug so we never dump known_values.
+impl fmt::Debug for SecretBridge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretBridge")
+            .field("portal_base", &self.portal_base)
+            .field("known_values", &"[REDACTED_SET]")
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,15 +326,5 @@ mod tests {
         let safe = bridge.redact(echo);
         assert!(!safe.contains("unique-secret-value-ZZ9"));
         assert!(!format!("{safe:?}").contains("unique-secret-value-ZZ9"));
-    }
-}
-
-// Manual Debug so we never dump known_values.
-impl fmt::Debug for SecretBridge {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecretBridge")
-            .field("portal_base", &self.portal_base)
-            .field("known_values", &"[REDACTED_SET]")
-            .finish_non_exhaustive()
     }
 }

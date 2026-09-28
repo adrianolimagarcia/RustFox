@@ -7,6 +7,7 @@
 //! Slice 2: pending claims + Telegram notify + portal claim form.
 //! Slice 3: missing→notify, sandbox/tool env inject, redaction hooks.
 
+mod bot_token;
 mod bridge;
 mod fake;
 mod file;
@@ -15,6 +16,10 @@ mod notify;
 mod pending;
 mod value;
 
+pub use bot_token::{
+    bot_token_secret_name, bot_token_secret_ref, is_secret_ref, migrate_plaintext_bot_tokens,
+    parse_secret_ref, resolve_bot_token, store_bot_token,
+};
 pub use bridge::{
     MissingSecret, MissingSecretError, SecretBridge, SecretNotifyFn, SECRET_REF_PREFIX,
 };
