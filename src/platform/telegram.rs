@@ -172,8 +172,48 @@ pub(crate) fn supported_commands() -> Vec<teloxide::types::BotCommand> {
     ]
 }
 
+/// Crate version for online/up messages.
+///
+/// TL lock: `CARGO_PKG_VERSION` only — no build-time git sha is wired in this
+/// binary (no `build.rs` / vergen). If sha is added later, append it here.
+pub fn rustfox_version_label() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Host-local server time for online/up messages (`YYYY-MM-DD HH:MM +08:00`).
+pub fn format_server_local_time(now: chrono::DateTime<chrono::Local>) -> String {
+    now.format("%Y-%m-%d %H:%M %:z").to_string()
+}
+
+/// Format the per-bot startup / online Telegram message (no secrets).
+pub fn format_startup_notify(
+    version: &str,
+    server_time: &str,
+    model: &str,
+    mcp_count: usize,
+    skills_count: usize,
+    memory_status: &str,
+) -> String {
+    format!(
+        "RustFox is online 🦊\n\
+Version: {version}\n\
+Server time: {server_time}\n\
+Model: {model}\n\
+MCP: {mcp} server(s) connected\n\
+Skills: {skills} loaded\n\
+Memory: {memory}",
+        version = version,
+        server_time = server_time,
+        model = model,
+        mcp = mcp_count,
+        skills = skills_count,
+        memory = memory_status,
+    )
+}
+
 /// Send startup notification to all allowed users.
 /// Best-effort: logs failures, never blocks startup.
+/// Called once per bot dispatcher (`run`), so multi-bot installs notify separately.
 pub async fn notify_startup(
     bot: &teloxide::Bot,
     allowed_user_ids: &[u64],
@@ -188,9 +228,13 @@ pub async fn notify_startup(
         "FTS5 only"
     };
 
-    let msg = format!(
-        "RustFox is online 🦊\nModel: {model}\nMCP: {mcp} server(s) connected\nSkills: {skills} loaded\nMemory: {memory}",
-        model = model, mcp = mcp_count, skills = skills_count, memory = memory_status,
+    let msg = format_startup_notify(
+        &rustfox_version_label(),
+        &format_server_local_time(chrono::Local::now()),
+        model,
+        mcp_count,
+        skills_count,
+        memory_status,
     );
 
     for &user_id in allowed_user_ids {
@@ -2516,6 +2560,48 @@ impl PlatformSender for TelegramAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_notify_includes_version_and_datetime_not_secrets() {
+        let msg = format_startup_notify(
+            "1.0.2",
+            "2026-09-28 23:45 +08:00",
+            "test-model",
+            2,
+            5,
+            "FTS5 only",
+        );
+        assert!(msg.contains("RustFox is online"));
+        assert!(msg.contains("Version: 1.0.2"));
+        assert!(msg.contains("Server time: 2026-09-28 23:45 +08:00"));
+        assert!(msg.contains("Model: test-model"));
+        assert!(msg.contains("MCP: 2 server(s) connected"));
+        assert!(msg.contains("Skills: 5 loaded"));
+        assert!(msg.contains("Memory: FTS5 only"));
+        // Never echo secrets / tokens.
+        assert!(!msg.contains("bot_token"));
+        assert!(!msg.contains("sk-"));
+        assert!(!msg.contains("api_key"));
+        assert_eq!(rustfox_version_label(), env!("CARGO_PKG_VERSION"));
+        let stamped = format_server_local_time(chrono::Local::now());
+        assert!(
+            stamped.len() >= 16,
+            "unexpected server time format: {stamped}"
+        );
+        assert!(
+            stamped.as_bytes()[4] == b'-' && stamped.as_bytes()[7] == b'-',
+            "expected YYYY-MM-DD prefix: {stamped}"
+        );
+        assert!(
+            stamped.contains('+') || stamped.contains('-'),
+            "expected offset label in: {stamped}"
+        );
+        // Offset should not be glued to minutes without a space.
+        assert!(
+            stamped.chars().nth(16) == Some(' '),
+            "expected space before offset: {stamped}"
+        );
+    }
 
     #[test]
     fn test_should_split_stream_at_4000_chars() {
