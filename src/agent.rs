@@ -934,7 +934,7 @@ impl Agent {
         };
 
         // §7.5: main loop can peer-invoke (depth/cycle + via attribution).
-        // Seed stack with this bot's id so cycles back to the caller are rejected.
+        // Seed with bot_id (canonical); persona aliases resolve to this key.
         let root_stack = vec![bot_id.to_string()];
         let special_handler = {
             let self_weak = self.self_weak.clone();
@@ -1394,12 +1394,8 @@ impl Agent {
                 .collect::<Vec<_>>()
         });
 
-        if let Err(e) = crate::peer_invoke::guard_peer_invoke(&invoke_stack, &agent_name) {
-            warn!(peer_target = %agent_name, stack = ?invoke_stack, "{e}");
-            return e;
-        }
-
-        // Classify for logging / attribution label (agents → skills → bots).
+        // Classify first (agents → skills → bots), then guard/push a *canonical*
+        // stack key: BotPersona → bot_id (persona is alias); agent/skill keep name.
         let in_agents = self.agents.read().await.get(&agent_name).is_some();
         let in_skills = if in_agents {
             false
@@ -1412,17 +1408,29 @@ impl Agent {
             in_skills,
             &self.config.bots,
         );
+        let stack_key = crate::peer_invoke::stack_key_for_invoke(&agent_name, &source);
+
+        if let Err(e) = crate::peer_invoke::guard_peer_invoke(&invoke_stack, &stack_key) {
+            warn!(
+                peer_target = %agent_name,
+                stack_key = %stack_key,
+                stack = ?invoke_stack,
+                "{e}"
+            );
+            return e;
+        }
+
         let via_label = match &source {
             Some(crate::peer_invoke::InvokeSource::BotPersona { persona, .. }) => persona.clone(),
             _ => agent_name.clone(),
         };
 
         info!(
-            "Invoking agent '{}' (source: {:?}, model_override: {:?}, stack: {:?})",
-            agent_name, source, model_override, invoke_stack
+            "Invoking agent '{}' (source: {:?}, stack_key: {}, model_override: {:?}, stack: {:?})",
+            agent_name, source, stack_key, model_override, invoke_stack
         );
 
-        let child_stack = crate::peer_invoke::push_invoke_stack(&invoke_stack, &agent_name);
+        let child_stack = crate::peer_invoke::push_invoke_stack(&invoke_stack, &stack_key);
         let result = self
             .run_subagent(
                 Some(&agent_name),

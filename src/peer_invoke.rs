@@ -23,8 +23,9 @@ pub enum InvokeSource {
 
 /// Reject cycles and depth overflow before pushing `target` onto `stack`.
 ///
-/// `stack` is seeded with the root caller id (e.g. bot id / persona). Peer
-/// depth is `stack.len() - 1` (frames beyond the root).
+/// `stack` is seeded with the root caller **bot_id**. Callers must pass a
+/// canonical `target` from [`stack_key_for_invoke`] (bot personas → `bot_id`;
+/// agents/skills keep their registry name). Peer depth is `stack.len() - 1`.
 pub fn guard_peer_invoke(stack: &[String], target: &str) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
@@ -93,6 +94,17 @@ pub fn find_bot_persona(bots: &[BotConfig], name: &str) -> Option<(String, Strin
         .map(|b| (b.id.trim().to_string(), b.persona.trim().to_string()))
 }
 
+/// Canonical invoke-stack key after resolve (agents → skills → bots).
+///
+/// - [`InvokeSource::BotPersona`] → prefer stable `bot_id` (`persona` is an alias)
+/// - Agent / skill registry (or unknown) → trimmed invoke name
+pub fn stack_key_for_invoke(name: &str, source: &Option<InvokeSource>) -> String {
+    match source {
+        Some(InvokeSource::BotPersona { bot_id, .. }) => bot_id.clone(),
+        _ => name.trim().to_string(),
+    }
+}
+
 /// Look up the bot config for a peer target (id or persona).
 pub fn bot_config_for_peer<'a>(bots: &'a [BotConfig], name: &str) -> Option<&'a BotConfig> {
     let name = name.trim();
@@ -101,7 +113,7 @@ pub fn bot_config_for_peer<'a>(bots: &'a [BotConfig], name: &str) -> Option<&'a 
         .or_else(|| bots.iter().find(|b| b.persona.trim() == name))
 }
 
-/// Push `target` onto a cloned stack (caller must have already guarded).
+/// Push a canonical `target` onto a cloned stack (caller must have already guarded).
 pub fn push_invoke_stack(stack: &[String], target: &str) -> Vec<String> {
     let mut next = stack.to_vec();
     next.push(target.trim().to_string());
@@ -212,5 +224,38 @@ mod tests {
             push_invoke_stack(&["main".into()], "researcher"),
             vec!["main".to_string(), "researcher".to_string()]
         );
+    }
+
+    #[test]
+    fn stack_key_bot_persona_prefers_bot_id() {
+        let bots = vec![bot("r1", "researcher")];
+        let by_persona = resolve_invoke_source("researcher", false, false, &bots);
+        let by_id = resolve_invoke_source("r1", false, false, &bots);
+        assert_eq!(stack_key_for_invoke("researcher", &by_persona), "r1");
+        assert_eq!(stack_key_for_invoke("r1", &by_id), "r1");
+        // Agent registry wins over bots — keep registry name.
+        let agent_src = resolve_invoke_source("researcher", true, false, &bots);
+        assert_eq!(stack_key_for_invoke("researcher", &agent_src), "researcher");
+    }
+
+    #[test]
+    fn cycle_reject_persona_alias_when_stack_has_bot_id() {
+        // TL HOLD: stack seeded with bot_id=r1; invoke by persona=researcher
+        // must canonicalize to r1 and reject as self/cycle.
+        let bots = vec![bot("r1", "researcher")];
+        let stack = vec!["r1".to_string()];
+        let source = resolve_invoke_source("researcher", false, false, &bots);
+        let key = stack_key_for_invoke("researcher", &source);
+        assert_eq!(key, "r1", "persona alias must resolve to bot_id");
+        let err = guard_peer_invoke(&stack, &key).unwrap_err();
+        assert!(
+            err.contains("cycle") && err.contains("'r1'"),
+            "unexpected: {err}"
+        );
+        // Symmetric: stack has bot_id, invoke by id also rejects.
+        let source_id = resolve_invoke_source("r1", false, false, &bots);
+        let key_id = stack_key_for_invoke("r1", &source_id);
+        let err_id = guard_peer_invoke(&stack, &key_id).unwrap_err();
+        assert!(err_id.contains("cycle"), "unexpected: {err_id}");
     }
 }
