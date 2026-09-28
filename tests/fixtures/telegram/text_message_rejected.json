@@ -1,0 +1,18 @@
+{
+  "update_id": 900002,
+  "message": {
+    "message_id": 11,
+    "date": 1700000101,
+    "from": {
+      "id": 999999,
+      "is_bot": false,
+      "first_name": "Stranger"
+    },
+    "chat": {
+      "id": 999999,
+      "type": "private",
+      "first_name": "Stranger"
+    },
+    "text": "should be ignored"
+  }
+}

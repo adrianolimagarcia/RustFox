@@ -1,6 +1,6 @@
 # Multi-bot E2E checklist (§7.7)
 
-Automated coverage (no live Telegram / no Update JSON injector):
+Automated coverage (no live Telegram):
 
 ```bash
 cargo test --test multi_bot_e2e_gate
@@ -28,8 +28,12 @@ Both may share the same owner `allowed_user_ids` in v1 examples; per-bot allowli
 
 ## Out of scope (backlog)
 
-- E2E Update JSON injector harness
 - `mcp::update_config_tokens` bak follow-up
+
+## Update injector
+
+Telegram Update JSON injector (allowlist / message / callback / media + optional Bot API mock):
+[`docs/telegram-update-injector.md`](telegram-update-injector.md) — `cargo test --test telegram_update_injector`.
 
 ## Related
 

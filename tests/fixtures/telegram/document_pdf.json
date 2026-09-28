@@ -1,0 +1,25 @@
+{
+  "update_id": 900004,
+  "message": {
+    "message_id": 13,
+    "date": 1700000103,
+    "from": {
+      "id": 111001,
+      "is_bot": false,
+      "first_name": "QA"
+    },
+    "chat": {
+      "id": 111001,
+      "type": "private",
+      "first_name": "QA"
+    },
+    "caption": "quarterly report",
+    "document": {
+      "file_name": "report.pdf",
+      "mime_type": "application/pdf",
+      "file_id": "BQAC-qa-doc-pdf",
+      "file_unique_id": "qadoc1",
+      "file_size": 12345
+    }
+  }
+}

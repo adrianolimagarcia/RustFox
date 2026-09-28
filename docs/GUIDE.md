@@ -89,7 +89,7 @@ Shared sections (`[sandbox]`, `[skills]`, `[agents]`, MCP, providers) stay insta
 - **`/agents`** — list / show / create + bind token (`bot_token=***`). Details: [`/agents`](#agents-create-persona--bind-token).
 - **`/config`** — allowlisted `config.toml` edits with the same bak path (secrets denied). Details: [`/config` slash map](#config-slash-map-allowlist).
 
-Live E2E checklist (≥2 BotFather test bots): [`docs/multi-bot-e2e.md`](multi-bot-e2e.md). Automated gate (no Update injector): `cargo test --test multi_bot_e2e_gate`.
+Live E2E checklist (≥2 BotFather test bots): [`docs/multi-bot-e2e.md`](multi-bot-e2e.md). Automated gate: `cargo test --test multi_bot_e2e_gate`. Telegram Update injector (no Desktop): [`docs/telegram-update-injector.md`](telegram-update-injector.md) — `cargo test --test telegram_update_injector`.
 
 ---
 

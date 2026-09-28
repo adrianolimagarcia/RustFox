@@ -1,0 +1,13 @@
+{
+  "update_id": 900005,
+  "callback_query": {
+    "id": "qa-cb-model-1",
+    "from": {
+      "id": 111001,
+      "is_bot": false,
+      "first_name": "QA"
+    },
+    "chat_instance": "qa-chat-instance",
+    "data": "model:openai/gpt-4o-mini"
+  }
+}
