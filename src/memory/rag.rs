@@ -133,7 +133,7 @@ mod tests {
     async fn test_auto_retrieve_skips_short_query() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "rag_u1")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "rag_u1")
             .await
             .unwrap();
         store
@@ -150,7 +150,7 @@ mod tests {
     async fn test_auto_retrieve_skips_commands() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "rag_u2")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "rag_u2")
             .await
             .unwrap();
         store
@@ -167,7 +167,7 @@ mod tests {
     async fn test_auto_retrieve_returns_none_for_empty_results() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "rag_u3")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "rag_u3")
             .await
             .unwrap();
         // Empty conversation — nothing to retrieve
@@ -217,7 +217,7 @@ mod tests {
     async fn test_auto_retrieve_uses_rewritten_query_for_search() {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "rewrite_test")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "rewrite_test")
             .await
             .unwrap();
 
@@ -242,7 +242,7 @@ mod tests {
     async fn test_retrieve_context_for_compaction_returns_none_for_short_query() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "compact_u1")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "compact_u1")
             .await
             .unwrap();
         let to_summarize = vec![ChatMessage {
@@ -262,7 +262,7 @@ mod tests {
     async fn test_retrieve_context_for_compaction_finds_user_message_in_preserved() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "compact_u2")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "compact_u2")
             .await
             .unwrap();
 

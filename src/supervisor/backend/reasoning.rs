@@ -28,6 +28,7 @@ impl ReasoningBackend {
             Box::pin(async move {
                 let incoming = crate::platform::IncomingMessage {
                     platform: "supervisor".into(),
+                    bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
                     user_id: user,
                     chat_id: chat,
                     user_name: "supervisor".into(),

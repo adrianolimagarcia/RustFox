@@ -221,8 +221,9 @@ async fn main() -> Result<()> {
     let scheduler = Arc::new(Scheduler::new().await?);
 
     // One teloxide::Bot per [[bots]] entry. Agent / scheduler / TelegramAdapter
-    // keep the shim (primary) bot for this slice; conversation bot_id isolation
-    // and per-bot scheduler identity are later slices (§7.3+).
+    // keep the shim (primary) bot for send/schedule; conversation history and
+    // cancel keys are isolated per bot_id (§7.3). Per-bot scheduler identity
+    // and persona binding are later slices.
     let bot_runtimes: Vec<(String, Arc<teloxide::Bot>, Vec<u64>)> = config
         .bots
         .iter()
@@ -791,7 +792,8 @@ async fn main() -> Result<()> {
         let id_for_log = bot_id.clone();
         join_set.spawn(async move {
             info!(bot_id = %id_for_log, "Telegram dispatcher starting");
-            let result = platform::telegram::run(dispatch_agent, allowlist, dispatch_bot).await;
+            let result =
+                platform::telegram::run(dispatch_agent, allowlist, dispatch_bot, bot_id).await;
             (id_for_log, result)
         });
     }

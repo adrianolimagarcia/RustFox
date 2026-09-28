@@ -49,7 +49,7 @@ fn msg(role: &str, text: &str) -> ChatMessage {
 async fn compaction_never_loses_user_request() {
     let store = MemoryStore::open_in_memory().unwrap();
     let conv = store
-        .get_or_create_conversation("telegram", "intent_u1")
+        .get_or_create_conversation("telegram", rustfox::platform::DEFAULT_BOT_ID, "intent_u1")
         .await
         .unwrap();
 
@@ -90,6 +90,7 @@ async fn compaction_never_loses_user_request() {
     let mut cmgr = ConversationManager::new(
         &store,
         "telegram",
+        rustfox::platform::DEFAULT_BOT_ID,
         "intent_u1",
         "system prompt".to_string(),
         &rustfox::skills::SkillRegistry::new(),

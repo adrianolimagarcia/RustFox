@@ -15,22 +15,32 @@ pub(crate) fn f32_vec_to_bytes(floats: &[f32]) -> Vec<u8> {
 }
 
 impl MemoryStore {
-    /// Get or create an active (non-archived) conversation for a platform user.
-    /// If all existing conversations for the user are archived, a new one is created.
+    /// Get or create an active (non-archived) conversation for a platform+bot+user.
+    /// Empty `bot_id` is normalized to `"default"`. If all existing conversations for
+    /// that triple are archived, a new one is created.
+    ///
+    /// **Legacy claim/remap:** migration backfills pre-§7.3 rows to `bot_id = "default"`,
+    /// but primary Telegram bots often use `[[bots]].id = "main"`. On miss for a primary
+    /// alias (`"main"`; `"default"` is a no-op here), claim the active
+    /// `(platform, "default", user_id)` row by updating its `bot_id` so history is not
+    /// orphaned. Secondary bot ids (e.g. `"researcher"`) never claim.
     pub async fn get_or_create_conversation(
         &self,
         platform: &str,
+        bot_id: &str,
         user_id: &str,
     ) -> Result<String> {
+        let bot_id = crate::platform::normalize_bot_id(bot_id);
         let conn = self.conn.lock().await;
 
         // Try to find an existing active conversation
         let existing: Option<String> = conn
             .query_row(
                 "SELECT id FROM conversations
-                 WHERE platform = ?1 AND user_id = ?2 AND (is_archived IS NULL OR is_archived = 0)
+                 WHERE platform = ?1 AND bot_id = ?2 AND user_id = ?3
+                   AND (is_archived IS NULL OR is_archived = 0)
                  ORDER BY updated_at DESC LIMIT 1",
-                rusqlite::params![platform, user_id],
+                rusqlite::params![platform, bot_id, user_id],
                 |row| row.get(0),
             )
             .ok();
@@ -39,11 +49,36 @@ impl MemoryStore {
             return Ok(id);
         }
 
+        // Primary-bot legacy claim: remap active default-row to this bot_id.
+        // `"default"` looking up `"default"` already returned above if present.
+        if bot_id == "main" {
+            let legacy: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE platform = ?1 AND bot_id = ?2 AND user_id = ?3
+                       AND (is_archived IS NULL OR is_archived = 0)
+                     ORDER BY updated_at DESC LIMIT 1",
+                    rusqlite::params![platform, crate::platform::DEFAULT_BOT_ID, user_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if let Some(id) = legacy {
+                conn.execute(
+                    "UPDATE conversations SET bot_id = ?1, updated_at = datetime('now')
+                     WHERE id = ?2",
+                    rusqlite::params![bot_id, &id],
+                )
+                .context("Failed to claim legacy default conversation")?;
+                return Ok(id);
+            }
+        }
+
         // Create a new conversation
         let id = Uuid::new_v4().to_string();
         conn.execute(
-            "INSERT INTO conversations (id, platform, user_id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![&id, platform, user_id],
+            "INSERT INTO conversations (id, platform, bot_id, user_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&id, platform, bot_id, user_id],
         )
         .context("Failed to create conversation")?;
 
@@ -110,14 +145,21 @@ impl MemoryStore {
         Ok(id)
     }
 
-    /// Clear a conversation (soft archive: mark as archived, don't delete messages)
-    pub async fn clear_conversation(&self, platform: &str, user_id: &str) -> Result<()> {
+    /// Clear a conversation (soft archive: mark as archived, don't delete messages).
+    /// Scoped to `(platform, bot_id, user_id)` so clearing bot A does not archive bot B.
+    pub async fn clear_conversation(
+        &self,
+        platform: &str,
+        bot_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let bot_id = crate::platform::normalize_bot_id(bot_id);
         let conn = self.conn.lock().await;
 
         conn.execute(
             "UPDATE conversations SET is_archived = 1, updated_at = datetime('now')
-             WHERE platform = ?1 AND user_id = ?2",
-            rusqlite::params![platform, user_id],
+             WHERE platform = ?1 AND bot_id = ?2 AND user_id = ?3",
+            rusqlite::params![platform, bot_id, user_id],
         )?;
 
         Ok(())
@@ -454,11 +496,11 @@ mod tests {
     async fn test_search_messages_scoped_to_conversation() {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
         let conv_a = store
-            .get_or_create_conversation("test", "user_a")
+            .get_or_create_conversation("test", "default", "user_a")
             .await
             .unwrap();
         let conv_b = store
-            .get_or_create_conversation("test", "user_b")
+            .get_or_create_conversation("test", "default", "user_b")
             .await
             .unwrap();
 
@@ -488,7 +530,7 @@ mod tests {
     async fn test_load_messages_respects_raw_limit() {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "user_limit")
+            .get_or_create_conversation("test", "default", "user_limit")
             .await
             .unwrap();
 
@@ -508,11 +550,254 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bot_id_isolates_conversations_for_same_user() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conv_a = store
+            .get_or_create_conversation("telegram", "bot_a", "user1")
+            .await
+            .unwrap();
+        let conv_b = store
+            .get_or_create_conversation("telegram", "bot_b", "user1")
+            .await
+            .unwrap();
+        assert_ne!(
+            conv_a, conv_b,
+            "same platform+user on different bots must get distinct conversations"
+        );
+
+        // Re-fetch returns the same ids
+        let again_a = store
+            .get_or_create_conversation("telegram", "bot_a", "user1")
+            .await
+            .unwrap();
+        let again_b = store
+            .get_or_create_conversation("telegram", "bot_b", "user1")
+            .await
+            .unwrap();
+        assert_eq!(conv_a, again_a);
+        assert_eq!(conv_b, again_b);
+    }
+
+    #[tokio::test]
+    async fn test_main_claims_legacy_default_conversation() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+
+        // History created under migration backfill bot_id = "default"
+        let legacy_id = store
+            .get_or_create_conversation("telegram", "default", "legacy_user")
+            .await
+            .unwrap();
+        store
+            .save_message(&legacy_id, &make_msg("user", "hello from before multi-bot"))
+            .await
+            .unwrap();
+
+        // First lookup as primary alias "main" must reclaim the same row
+        let claimed = store
+            .get_or_create_conversation("telegram", "main", "legacy_user")
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed, legacy_id,
+            "main must reclaim the legacy default conversation id"
+        );
+
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let stored_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&claimed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations
+                 WHERE platform = 'telegram' AND user_id = 'legacy_user'
+                   AND (is_archived IS NULL OR is_archived = 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(stored_bot, "main", "bot_id column must be remapped to main");
+        assert_eq!(
+            active_count, 1,
+            "must not create a duplicate blank conversation"
+        );
+
+        let messages = store.load_messages(&claimed).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .as_ref()
+                .map(|c| c.as_text())
+                .unwrap()
+                .contains("hello from before multi-bot"),
+            "legacy messages must still load after claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secondary_bot_does_not_steal_default_history() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+
+        let legacy_id = store
+            .get_or_create_conversation("telegram", "default", "shared_user")
+            .await
+            .unwrap();
+        store
+            .save_message(&legacy_id, &make_msg("user", "primary history"))
+            .await
+            .unwrap();
+
+        let researcher = store
+            .get_or_create_conversation("telegram", "researcher", "shared_user")
+            .await
+            .unwrap();
+        assert_ne!(
+            researcher, legacy_id,
+            "secondary bot must not steal default history"
+        );
+
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let legacy_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&legacy_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let researcher_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&researcher],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(legacy_bot, "default");
+        assert_eq!(researcher_bot, "researcher");
+    }
+
+    #[tokio::test]
+    async fn test_clear_one_bot_does_not_archive_other() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conv_a = store
+            .get_or_create_conversation("telegram", "bot_a", "user1")
+            .await
+            .unwrap();
+        let conv_b = store
+            .get_or_create_conversation("telegram", "bot_b", "user1")
+            .await
+            .unwrap();
+
+        store
+            .clear_conversation("telegram", "bot_a", "user1")
+            .await
+            .unwrap();
+
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let archived_a: i64 = conn
+            .query_row(
+                "SELECT is_archived FROM conversations WHERE id = ?1",
+                rusqlite::params![&conv_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let archived_b: i64 = conn
+            .query_row(
+                "SELECT is_archived FROM conversations WHERE id = ?1",
+                rusqlite::params![&conv_b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(archived_a, 1);
+        assert_eq!(archived_b, 0);
+
+        // Clearing bot_a yields a fresh conversation; bot_b keeps its id
+        let new_a = store
+            .get_or_create_conversation("telegram", "bot_a", "user1")
+            .await
+            .unwrap();
+        let still_b = store
+            .get_or_create_conversation("telegram", "bot_b", "user1")
+            .await
+            .unwrap();
+        assert_ne!(new_a, conv_a);
+        assert_eq!(still_b, conv_b);
+    }
+
+    #[tokio::test]
+    async fn test_migration_backfills_null_bot_id_to_default() {
+        use rusqlite::Connection;
+
+        // Simulate a pre-§7.3 DB: conversations without bot_id (or NULL).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_archived INTEGER DEFAULT 0
+            );
+            INSERT INTO conversations (id, platform, user_id) VALUES ('c1', 'telegram', 'u1');
+            ",
+        )
+        .unwrap();
+
+        // Run the same ALTER + backfill steps as run_migrations.
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN bot_id TEXT;")
+            .ok();
+        conn.execute_batch(
+            "UPDATE conversations SET bot_id = 'default' WHERE bot_id IS NULL OR bot_id = '';",
+        )
+        .unwrap();
+
+        let bot_id: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = 'c1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bot_id, "default");
+
+        // Also verify open_in_memory (full migrations) yields default on empty bot_id lookup
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let id = store
+            .get_or_create_conversation("telegram", "", "legacy_user")
+            .await
+            .unwrap();
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let stored: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "default");
+    }
+
+    #[tokio::test]
     async fn test_clear_archives_instead_of_deleting() {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
 
         let conv = store
-            .get_or_create_conversation("test", "archive_u2")
+            .get_or_create_conversation("test", "default", "archive_u2")
             .await
             .unwrap();
         let msg = crate::llm::ChatMessage {
@@ -525,7 +810,7 @@ mod tests {
 
         // Clear
         store
-            .clear_conversation("test", "archive_u2")
+            .clear_conversation("test", "default", "archive_u2")
             .await
             .unwrap();
 
@@ -560,7 +845,7 @@ mod tests {
 
         // Create a conversation
         let conv = store
-            .get_or_create_conversation("test", "archive_u1")
+            .get_or_create_conversation("test", "default", "archive_u1")
             .await
             .unwrap();
 
@@ -575,7 +860,7 @@ mod tests {
 
         // get_or_create_conversation should return a NEW conversation
         let conv2 = store
-            .get_or_create_conversation("test", "archive_u1")
+            .get_or_create_conversation("test", "default", "archive_u1")
             .await
             .unwrap();
 
@@ -602,7 +887,7 @@ mod tests {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
 
         let conv = store
-            .get_or_create_conversation("test", "archive_search_u1")
+            .get_or_create_conversation("test", "default", "archive_search_u1")
             .await
             .unwrap();
         let msg = crate::llm::ChatMessage {
@@ -617,7 +902,7 @@ mod tests {
 
         // Archive
         store
-            .clear_conversation("test", "archive_search_u1")
+            .clear_conversation("test", "default", "archive_search_u1")
             .await
             .unwrap();
 
@@ -641,7 +926,7 @@ mod tests {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
 
         let conv = store
-            .get_or_create_conversation("test", "archive_u3")
+            .get_or_create_conversation("test", "default", "archive_u3")
             .await
             .unwrap();
         let msg = crate::llm::ChatMessage {
@@ -654,7 +939,7 @@ mod tests {
 
         // Archive
         store
-            .clear_conversation("test", "archive_u3")
+            .clear_conversation("test", "default", "archive_u3")
             .await
             .unwrap();
 

@@ -100,7 +100,11 @@ impl AgentOps for PreviewAgent {
             let text = incoming.text.clone();
             let memory = self.memory.clone();
             let conv = memory
-                .get_or_create_conversation(&incoming.platform, &incoming.user_id)
+                .get_or_create_conversation(
+                    &incoming.platform,
+                    rustfox::platform::DEFAULT_BOT_ID,
+                    &incoming.user_id,
+                )
                 .await
                 .unwrap_or_default();
             if !conv.is_empty() {
@@ -257,7 +261,9 @@ user_name = "web"
             None,
         )
         .await?;
-    let conv = memory.get_or_create_conversation("web", "web").await?;
+    let conv = memory
+        .get_or_create_conversation("web", rustfox::platform::DEFAULT_BOT_ID, "web")
+        .await?;
     for (role, content) in [
         (
             "user",

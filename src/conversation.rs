@@ -34,12 +34,15 @@ impl ConversationManager {
     pub async fn new(
         memory: &MemoryStore,
         platform: &str,
+        bot_id: &str,
         user_id: &str,
         system_prompt: String,
         _skills: &SkillRegistry,
         _config: &Config,
     ) -> Result<Self> {
-        let conversation_id = memory.get_or_create_conversation(platform, user_id).await?;
+        let conversation_id = memory
+            .get_or_create_conversation(platform, bot_id, user_id)
+            .await?;
         let history = memory
             .load_messages(&conversation_id)
             .await
@@ -434,7 +437,7 @@ mod tests {
     async fn apply_summary_layer_rebuilds_messages_and_persists() {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "layer_u1")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "layer_u1")
             .await
             .unwrap();
         let mut cm = manager(vec![
@@ -751,7 +754,7 @@ mod tests {
     async fn compact_success_path_preserves_user_intent() {
         let store = crate::memory::MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "compact_u1")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "compact_u1")
             .await
             .unwrap();
         let mut cm = manager(vec![

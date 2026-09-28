@@ -74,7 +74,10 @@ impl AgentOps for Agent {
     }
     fn is_processing(&self, user_id: &str) -> futures::future::BoxFuture<'_, bool> {
         let user_id = user_id.to_string();
-        Box::pin(async move { self.is_processing(&user_id).await })
+        Box::pin(async move {
+            self.is_processing(crate::platform::DEFAULT_BOT_ID, &user_id)
+                .await
+        })
     }
     fn set_model(&self, model_id: String) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move { self.set_model(&model_id).await })
@@ -83,10 +86,16 @@ impl AgentOps for Agent {
         Box::pin(async move { self.reload_skills_and_agents().await })
     }
     fn cancel_processing(&self, user_id: String) -> futures::future::BoxFuture<'_, bool> {
-        Box::pin(async move { self.cancel_processing(&user_id).await })
+        Box::pin(async move {
+            self.cancel_processing(crate::platform::DEFAULT_BOT_ID, &user_id)
+                .await
+        })
     }
     fn clear_cancel_token(&self, user_id: String) -> futures::future::BoxFuture<'_, ()> {
-        Box::pin(async move { self.clear_cancel_token(&user_id).await })
+        Box::pin(async move {
+            self.clear_cancel_token(crate::platform::DEFAULT_BOT_ID, &user_id)
+                .await
+        })
     }
     fn skill_entries(&self) -> futures::future::BoxFuture<'_, Vec<SkillInfo>> {
         Box::pin(async move {

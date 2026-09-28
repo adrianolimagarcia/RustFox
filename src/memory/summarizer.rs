@@ -132,7 +132,7 @@ mod tests {
     async fn test_get_unsummarized_messages_returns_correct_count() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "sum_u1")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "sum_u1")
             .await
             .unwrap();
         store
@@ -152,7 +152,7 @@ mod tests {
     async fn test_mark_messages_summarized_clears_them() {
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "sum_u2")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "sum_u2")
             .await
             .unwrap();
         store
@@ -174,7 +174,7 @@ mod tests {
     async fn test_get_active_conversations_returns_recent() {
         let store = MemoryStore::open_in_memory().unwrap();
         store
-            .get_or_create_conversation("test", "active_user")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "active_user")
             .await
             .unwrap();
         let active = store.get_active_conversations(7).await.unwrap();
@@ -190,7 +190,7 @@ mod tests {
         // (We can't call LLM in tests, but we test the threshold guard)
         let store = MemoryStore::open_in_memory().unwrap();
         let conv = store
-            .get_or_create_conversation("test", "sum_threshold")
+            .get_or_create_conversation("test", crate::platform::DEFAULT_BOT_ID, "sum_threshold")
             .await
             .unwrap();
         store
