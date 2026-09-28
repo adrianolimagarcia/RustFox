@@ -198,14 +198,46 @@ MCP tools are namespaced as `mcp_<server-name>_<tool-name>` (e.g. `mcp_git_git_l
 | `/tools` | List all available tools | Active |
 | `/skills` | List all loaded skills | Active |
 | `/verbose` | Toggle live tool call progress display | Active |
-| `/query-rewrite` | Toggle RAG query rewriting for memory search | Active |
+| `/queryrewrite` | Toggle RAG query rewriting for memory search | Active |
 | `/update-skills` | Re-sync bundled skills/agents (backs up local edits) | Active |
+| `/models` | Browse and change the LLM model | Active |
+| `/format` | Switch message format: rich, markdown, or auto | Active |
+| `/portal` | Portal URLs (web UI) for this network | Active |
+| `/config` | Show / set allowlisted `config.toml` keys (secrets redacted) | Active |
+| `/config show` | Redacted config summary (sandbox path read-only) | Active |
+| `/config keys` | Slash map: editable keys vs restart-required vs denied | Active |
+| `/config set <key> <value>` | Validate → `config.toml.bak` → atomic write | Active |
+| `/restart` | Ack, then clean process exit (systemd/launchd/shell brings it back) | Active |
 | `/supervise <text>` | Submit a new supervisor task | Planned |
 | `/tasks` | List active / recent supervisor tasks | Planned |
 | `/resume <id>` | Resume a paused supervisor task | Planned |
 | `/cancel <id>` | Cancel a supervisor task | Planned |
 | `/approve <id>` | Approve a supervisor task | Planned |
 | `/clarify <id> <text>` | Reply to a clarification prompt | Planned |
+
+### `/config` slash map (allowlist)
+
+Editable via Telegram (only users already on the bot allowlist):
+
+| Key | Needs `/restart`? | Notes |
+|-----|-------------------|-------|
+| `openrouter.model` (alias `model`) | No (also live via `/models`) | Non-empty model id |
+| `memory.query_rewriter_enabled` | Yes | Default for new sessions |
+| `agent.max_iterations` | Yes | ≥ 1 |
+| `agent.loop_detection.enabled` | Yes | Bool |
+| `learning.skill_extraction_enabled` | Yes | Bool |
+| `general.location` | Yes | Prompt location string |
+| `supervisor.default_autonomy_mode` | Yes | `fast` / `standard` / `rigorous` |
+| `portal.enabled` / `portal.port` / `portal.bind` / `portal.user_name` | Yes | Portal knobs (not tokens) |
+| `mcp.<server>.enabled` | Yes | Toggle a named `[[mcp_servers]]` entry |
+
+**Read-only display:** `sandbox.allowed_directory`.
+
+**Denied (never editable via chat):** `bot_token` / API keys / provider secrets; portal `token` / `token_sha256`; MCP `command` / `args` / `env`; `allowed_user_ids` (empty allowlist is a hard error); `database_path`; `general.home`.
+
+**Write path:** validate → copy `config.toml` → `config.toml.bak` → atomic write → ack. On parse failure after write, restore from `.bak` and abort restart. Secrets are never echoed in Telegram replies, logs, or `/config show`.
+
+**`/restart`:** after a successful write (or alone) reply OK, then clean process exit so the service manager or user shell brings the bot back. v1 does **not** hot-reload Telegram dispatchers in-process.
 
 ---
 

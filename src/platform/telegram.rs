@@ -117,7 +117,9 @@ pub(crate) fn parse_command(s: &str) -> Option<(String, String)> {
     }
     let rest = &s[1..];
     let mut it = rest.splitn(2, char::is_whitespace);
-    let cmd = it.next()?.to_string();
+    // Strip @BotName suffix so /config@MyBot works the same as /config.
+    let cmd_raw = it.next()?;
+    let cmd = cmd_raw.split('@').next().unwrap_or(cmd_raw).to_string();
     let arg = it.next().unwrap_or("").trim().to_string();
     Some((cmd, arg))
 }
@@ -154,6 +156,14 @@ pub(crate) fn supported_commands() -> Vec<teloxide::types::BotCommand> {
         BotCommand::new(
             "portal",
             "Portal URLs — how to reach the web UI from this device",
+        ),
+        BotCommand::new(
+            "config",
+            "Show or set allowlisted config.toml keys (secrets redacted)",
+        ),
+        BotCommand::new(
+            "restart",
+            "Clean process exit so the service/shell brings the bot back",
         ),
     ]
 }
@@ -666,6 +676,171 @@ async fn set_model_and_reply(
     Ok(())
 }
 
+/// `/config` — show / list keys / set allowlisted config.toml values.
+///
+/// Auth is enforced by the dispatcher allowlist filter before this runs.
+/// Secrets are never echoed (see [`crate::config_edit::format_show`]).
+async fn handle_config_command(
+    bot: Bot,
+    chat_id: ChatId,
+    agent: &Arc<Agent>,
+    arg: &str,
+    msg_format: MessageFormat,
+) -> ResponseResult<()> {
+    let arg = arg.trim();
+    let (sub, rest) = match arg.split_once(char::is_whitespace) {
+        Some((a, b)) => (a, b.trim()),
+        None => (arg, ""),
+    };
+
+    match sub {
+        "" | "show" => {
+            // Prefer on-disk config so values set since boot are visible (still redacted).
+            let disk_cfg = crate::config::Config::load(&agent.config_path).ok();
+            let cfg = disk_cfg.as_ref().unwrap_or(&agent.config);
+            let reply = if rest.is_empty() {
+                crate::config_edit::format_show(cfg)
+            } else {
+                let key = crate::config_edit::normalize_key(rest);
+                match crate::config_edit::classify_key(&key) {
+                    crate::config_edit::KeyAccess::Denied(reason) => {
+                        format!("⛔ `{key}` denied: {reason}")
+                    }
+                    crate::config_edit::KeyAccess::ReadOnly => {
+                        if key == "sandbox.allowed_directory" {
+                            format!(
+                                "`sandbox.allowed_directory` (read-only) = `{}`",
+                                cfg.sandbox.allowed_directory.display()
+                            )
+                        } else {
+                            format!("`{key}` is read-only")
+                        }
+                    }
+                    crate::config_edit::KeyAccess::Editable { .. } => {
+                        crate::config_edit::format_show(cfg)
+                    }
+                }
+            };
+            return send_markdown_message(&bot, chat_id, &reply, msg_format).await;
+        }
+        "keys" | "help" => {
+            return send_markdown_message(
+                &bot,
+                chat_id,
+                &crate::config_edit::slash_map_markdown(),
+                msg_format,
+            )
+            .await;
+        }
+        "set" => {
+            let (key, value) = match rest.split_once(char::is_whitespace) {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => {
+                    return send_markdown_message(
+                        &bot,
+                        chat_id,
+                        "Usage: `/config set <key> <value>`\nSee `/config keys`.",
+                        msg_format,
+                    )
+                    .await;
+                }
+            };
+            if key.is_empty() || value.is_empty() {
+                return send_markdown_message(
+                    &bot,
+                    chat_id,
+                    "Usage: `/config set <key> <value>`\nSee `/config keys`.",
+                    msg_format,
+                )
+                .await;
+            }
+
+            // Never log raw value if the key looks secret (defense in depth).
+            let key_norm = crate::config_edit::normalize_key(key);
+            if matches!(
+                crate::config_edit::classify_key(&key_norm),
+                crate::config_edit::KeyAccess::Denied(_)
+            ) {
+                tracing::warn!(key = %key_norm, "Telegram /config set denied");
+                return send_markdown_message(
+                    &bot,
+                    chat_id,
+                    &format!(
+                        "⛔ Denied `{key_norm}`. Secrets and dangerous keys cannot be set via Telegram."
+                    ),
+                    msg_format,
+                )
+                .await;
+            }
+
+            match crate::config_edit::apply_config_edit(&agent.config_path, key, value) {
+                Ok(result) => {
+                    // Soft-apply model live when possible (no full hot-reload).
+                    if result.key == "openrouter.model" {
+                        if let Err(e) = agent.set_model(value.trim()).await {
+                            tracing::warn!(error = %e, "Live set_model after config write failed");
+                        }
+                    }
+                    let restart_hint = if result.restart_required {
+                        "\n\n⚠️ Restart required — run `/restart` to apply."
+                    } else {
+                        "\n\nApplied (model may already be live)."
+                    };
+                    let reply = format!(
+                        "✅ Set `{key}` (backup: `{}`).{restart_hint}",
+                        result.bak_path.display()
+                    );
+                    // Avoid echoing the raw value for any key.
+                    tracing::info!(key = %result.key, restart = result.restart_required, "Telegram /config set ok");
+                    return send_markdown_message(&bot, chat_id, &reply, msg_format).await;
+                }
+                Err(e) => {
+                    // Error messages must not include secret values we rejected.
+                    tracing::warn!(key = %key_norm, error = %e, "Telegram /config set failed");
+                    return send_markdown_message(
+                        &bot,
+                        chat_id,
+                        &format!("❌ Config update failed: {e}"),
+                        msg_format,
+                    )
+                    .await;
+                }
+            }
+        }
+        _ => {
+            return send_markdown_message(
+                &bot,
+                chat_id,
+                &format!(
+                    "Unknown `/config` subcommand `{sub}`.\n\n{}",
+                    crate::config_edit::slash_map_markdown()
+                ),
+                msg_format,
+            )
+            .await;
+        }
+    }
+}
+
+/// `/restart` — ack, then clean process exit so the supervisor brings us back.
+///
+/// v1: no in-process Telegram dispatcher hot-reload (TL lock).
+async fn handle_restart_command(bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+    let _ = bot
+        .send_message(
+            chat_id,
+            "✅ Restarting — clean exit; service/shell will bring me back.",
+        )
+        .await;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Err(e) = crate::learning::restart_bot() {
+            tracing::error!(error = %e, "Telegram /restart failed");
+        }
+    });
+    Ok(())
+}
+
 async fn handle_message(
     bot: Bot,
     msg: Message,
@@ -796,7 +971,9 @@ async fn handle_message(
              **/models** — Browse and change the model\n\
              **/stop** — Cancel the current processing gracefully\n\
              **/btw** — Ask a parallel question while the bot is busy\n\
-             **/portal** — Portal URLs (web UI) for this network";
+             **/portal** — Portal URLs (web UI) for this network
+             **/config** — Show/set allowlisted config keys (secrets redacted)
+             **/restart** — Clean restart (exit; service/shell brings it back)";
         return send_markdown_message(&bot, msg.chat.id, help, msg_format).await;
     }
 
@@ -1180,6 +1357,12 @@ async fn handle_message(
                     .reply_markup(InlineKeyboardMarkup::new(keyboard))
                     .await?;
                 return Ok(());
+            }
+            "config" => {
+                return handle_config_command(bot, msg.chat.id, &agent, &arg, msg_format).await;
+            }
+            "restart" => {
+                return handle_restart_command(bot, msg.chat.id).await;
             }
             _ => {} // ignore unknown commands for now
         }
@@ -2239,6 +2422,8 @@ mod tests {
             "skills",
             "verbose",
             "queryrewrite",
+            "config",
+            "restart",
         ] {
             assert!(
                 names.contains(required),
