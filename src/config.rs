@@ -977,6 +977,23 @@ impl Config {
             .unwrap_or(&bots[0])
     }
 
+    /// Whether `bot_id` may claim legacy `(platform, "default", user)` conversation rows.
+    ///
+    /// PO lock (sole-custom-id follow-up):
+    /// - Exactly one `[[bots]]` whose id is not `"default"`: that bot owns claim/routing.
+    /// - Two or more bots: §7.3 unchanged — only `"main"` claims; secondary never steals.
+    /// - Looking up `"default"` is a no-op (row already keyed correctly).
+    pub fn bot_claims_legacy_default(bots: &[BotConfig], bot_id: &str) -> bool {
+        let bot_id = crate::platform::normalize_bot_id(bot_id);
+        if bot_id == crate::platform::DEFAULT_BOT_ID {
+            return false;
+        }
+        match bots {
+            [sole] => crate::platform::normalize_bot_id(sole.id.as_str()) == bot_id,
+            _ => bot_id == "main",
+        }
+    }
+
     fn validate_bots(bots: &[BotConfig]) -> Result<()> {
         if bots.is_empty() {
             anyhow::bail!("[[bots]] must contain at least one entry");
@@ -1915,6 +1932,49 @@ mod tests {
         );
         assert_eq!(cfg2.telegram.bot_token, "tok-default");
         assert_eq!(cfg2.telegram.allowed_user_ids, vec![9]);
+    }
+
+    #[test]
+    fn bot_claims_legacy_default_sole_custom_and_multi() {
+        fn bot(id: &str, token: &str) -> BotConfig {
+            BotConfig {
+                id: id.into(),
+                bot_token: token.into(),
+                allowed_user_ids: vec![1],
+                persona: "main".into(),
+                system_prompt_file: None,
+                model: None,
+                tools: None,
+            }
+        }
+
+        // Sole custom id — owns claim; default lookup is a no-op.
+        let sole_custom = [bot("fox", "tok-fox")];
+        assert!(Config::bot_claims_legacy_default(&sole_custom, "fox"));
+        assert!(!Config::bot_claims_legacy_default(&sole_custom, "default"));
+        assert!(!Config::bot_claims_legacy_default(&sole_custom, "other"));
+
+        // Sole legacy default — no claim remap needed.
+        let sole_default = [bot("default", "tok-default")];
+        assert!(!Config::bot_claims_legacy_default(&sole_default, "default"));
+
+        // Sole main — claims (same as §7.3 primary alias).
+        let sole_main = [bot("main", "tok-main")];
+        assert!(Config::bot_claims_legacy_default(&sole_main, "main"));
+
+        // Multi — only main claims; secondary never steals.
+        let multi = [bot("main", "tok-main"), bot("researcher", "tok-r")];
+        assert!(Config::bot_claims_legacy_default(&multi, "main"));
+        assert!(!Config::bot_claims_legacy_default(&multi, "researcher"));
+        assert!(!Config::bot_claims_legacy_default(&multi, "default"));
+
+        // Multi without main — §7.3 unchanged: no custom primary invents claim.
+        let multi_custom = [bot("fox", "tok-fox"), bot("researcher", "tok-r")];
+        assert!(!Config::bot_claims_legacy_default(&multi_custom, "fox"));
+        assert!(!Config::bot_claims_legacy_default(
+            &multi_custom,
+            "researcher"
+        ));
     }
 
     #[test]

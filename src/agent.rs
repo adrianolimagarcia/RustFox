@@ -857,10 +857,13 @@ impl Agent {
             .map(ChatId)
             .unwrap_or(ChatId(0));
 
-        // Get or create persistent conversation (isolated by bot_id)
+        // Get or create persistent conversation (isolated by bot_id).
+        // Sole-custom-id installs claim legacy default rows; multi-bot §7.3.
+        let claim_legacy =
+            crate::config::Config::bot_claims_legacy_default(&self.config.bots, bot_id);
         let conversation_id = self
             .memory
-            .get_or_create_conversation(platform, bot_id, user_id)
+            .get_or_create_conversation_with_claim(platform, bot_id, user_id, claim_legacy)
             .await?;
 
         // Always build the system prompt from the live registry, scoped to
