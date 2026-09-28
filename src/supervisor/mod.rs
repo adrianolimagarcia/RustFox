@@ -340,6 +340,43 @@ impl Supervisor {
         self.execute_now(task_id).await
     }
 
+    /// Cancel a task: signal any in-flight jobs via [`Backend::cancel`], then
+    /// mark the task `Cancelled`. Job lookup uses persisted `Pending`/`Running`
+    /// rows (Running is set in-memory during `run`; the store usually still
+    /// shows Pending while the backend is executing).
+    pub async fn cancel(&self, task_id: &str) -> anyhow::Result<()> {
+        let task = self
+            .store
+            .get(task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+
+        let jobs = self.store.jobs_for_task(task_id).await?;
+        for job in jobs.iter().filter(|j| {
+            matches!(
+                j.status,
+                crate::supervisor::job::JobStatus::Pending
+                    | crate::supervisor::job::JobStatus::Running
+            )
+        }) {
+            let backend = self.registry.select_by_name(&job.backend).ok_or_else(|| {
+                anyhow::anyhow!("backend not found for job {}: {}", job.id, job.backend)
+            })?;
+            backend.cancel(&job.id).await?;
+        }
+
+        self.store
+            .record_transition(
+                task_id,
+                task.status,
+                TaskStatus::Cancelled,
+                "user",
+                Some("cancelled"),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// IDs of tasks that look resumable on startup (paused or mid-pipeline).
     pub async fn resumable_task_ids(&self) -> anyhow::Result<Vec<String>> {
         self.store.list_resumable_task_ids().await
@@ -477,5 +514,103 @@ impl Supervisor {
                 reason: format!("{other:?}"),
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supervisor::backend::{Backend, BackendCapabilities, RunContext};
+    use crate::supervisor::job::{Job, JobOutput, JobStatus, JobType};
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingCancelBackend {
+        cancelled: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for RecordingCancelBackend {
+        fn name(&self) -> &str {
+            "recording_cancel"
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                reasoning: true,
+                ..Default::default()
+            }
+        }
+        fn can_handle(&self, _: &JobType) -> bool {
+            true
+        }
+        async fn run(&self, _job: &mut Job, _ctx: &RunContext) -> anyhow::Result<JobOutput> {
+            anyhow::bail!("RecordingCancelBackend is cancel-only in tests")
+        }
+        async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
+            self.cancelled.lock().unwrap().push(job_id.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_invokes_backend_cancel_for_pending_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        sup.registry.register(Arc::new(RecordingCancelBackend {
+            cancelled: Arc::clone(&cancelled),
+        }));
+
+        let task = crate::supervisor::task::Task::new("T", "cancel me");
+        sup.store
+            .create(&task, "telegram", "u", Some("c"))
+            .await
+            .unwrap();
+        let mut job = Job::new(&task.id, JobType::ExecutorJob, "recording_cancel", "g");
+        let job_id = job.id.clone();
+        job.status = JobStatus::Pending;
+        sup.store.create_job(&job).await.unwrap();
+
+        // Intake → Cancelled is allowed by the transition table.
+        sup.cancel(&task.id).await.unwrap();
+
+        assert_eq!(*cancelled.lock().unwrap(), vec![job_id]);
+        assert_eq!(sup.state(&task.id).await.unwrap(), TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_task_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+        let err = sup.cancel("missing").await.unwrap_err();
+        assert!(err.to_string().contains("task not found"));
+    }
+
+    #[tokio::test]
+    async fn cancel_skips_terminal_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        sup.registry.register(Arc::new(RecordingCancelBackend {
+            cancelled: Arc::clone(&cancelled),
+        }));
+
+        let task = crate::supervisor::task::Task::new("T", "done already");
+        sup.store
+            .create(&task, "telegram", "u", None)
+            .await
+            .unwrap();
+        let mut job = Job::new(&task.id, JobType::ExecutorJob, "recording_cancel", "g");
+        job.status = JobStatus::Succeeded;
+        sup.store.create_job(&job).await.unwrap();
+
+        // Intake → Cancelled is allowed.
+        sup.cancel(&task.id).await.unwrap();
+        assert!(cancelled.lock().unwrap().is_empty());
+        assert_eq!(sup.state(&task.id).await.unwrap(), TaskStatus::Cancelled);
     }
 }
