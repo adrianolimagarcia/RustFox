@@ -113,13 +113,7 @@ impl RerunQueue {
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE pending_reruns
-             SET state = 'superseded', updated_at = datetime('now')
-             WHERE task_id = ?1 AND state IN ('queued', 'awaiting_user')",
-            rusqlite::params![task_id],
-        )
-        .context("Failed to supersede live rerun rows")?;
+        Self::supersede_live_locked(&conn, task_id)?;
         conn.execute(
             "INSERT INTO pending_reruns
              (id, task_id, original_run_id, fail_reason, attempts, state, next_eligible_at)
@@ -139,7 +133,29 @@ impl RerunQueue {
         Ok(id)
     }
 
-    /// Rows eligible to fire now (state=queued, next_eligible_at in the past).
+    /// Supersede every live (`queued`|`awaiting_user`) row for `task_id`.
+    /// Used by enqueue (latest definition wins) and by a successful scheduled
+    /// run so a later cron cannot stale-replay leftover queue rows.
+    pub async fn supersede_live_for_task(&self, task_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        Self::supersede_live_locked(&conn, task_id)
+    }
+
+    fn supersede_live_locked(conn: &Connection, task_id: &str) -> Result<usize> {
+        conn.execute(
+            "UPDATE pending_reruns
+             SET state = 'superseded', updated_at = datetime('now')
+             WHERE task_id = ?1 AND state IN ('queued', 'awaiting_user')",
+            rusqlite::params![task_id],
+        )
+        .context("Failed to supersede live rerun rows")
+    }
+
+    /// Rows safe to auto-fire once: `queued`, never yet dispatched (`attempts=0`),
+    /// and past eligibility. Human `retry()` resets `attempts=0` so a retried
+    /// row can enter this set again. After `mark_dispatched`, `attempts>0` so
+    /// the same row cannot double-fire while in-flight or after eligibility
+    /// elapses mid-run.
     pub async fn due(&self) -> Result<Vec<PendingRerun>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
@@ -147,7 +163,9 @@ impl RerunQueue {
                 "SELECT id, task_id, original_run_id, fail_reason, attempts, state,
                         next_eligible_at, created_at
                  FROM pending_reruns
-                 WHERE state = 'queued' AND next_eligible_at <= datetime('now')
+                 WHERE state = 'queued'
+                   AND attempts = 0
+                   AND next_eligible_at <= datetime('now')
                  ORDER BY next_eligible_at",
             )
             .context("Failed to prepare due query")?;
@@ -158,9 +176,11 @@ impl RerunQueue {
             .context("Failed to deserialize due reruns")
     }
 
-    /// Watchdog dispatches a row: bump attempts + push eligibility forward.
-    /// Done *before* the send so a crash mid-dispatch can't strand an
-    /// attempt counter at 0 → see `reset_inflight_on_boot` for the flip side.
+    /// Watchdog claims a row *before* send: bump attempts + push eligibility.
+    /// Combined with `due()`'s `attempts = 0` filter this is the in-flight
+    /// lock — a crash between claim and outcome is healed by
+    /// `reset_inflight_on_boot` (attempts back to 0 so the auto budget is not
+    /// silently burned).
     pub async fn mark_dispatched(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -315,11 +335,14 @@ impl RerunQueue {
         Ok(n)
     }
 
-    /// Crash safety at boot: a queued row with attempts>0 means we dispatched
-    /// a re-fire that never got its outcome persisted (process died mid-run).
-    /// Reset the counter so the row keeps *auto*-attempt semantics — without
-    /// this, a phantom consumed attempt would upgrade a later failure to
-    /// "ask the human" for a re-fire that never actually happened.
+    /// Crash safety at boot: a queued row with `attempts>0` means we claimed
+    /// it via `mark_dispatched` but never persisted an outcome (process died
+    /// mid-run, or dispatch send failed after the claim). Reset `attempts=0`
+    /// and push eligibility forward so `due()` can auto-fire it once — without
+    /// this, the consumed attempt would either stall forever (`due` requires
+    /// attempts=0) or, on a later failure path that still looked at the
+    /// counter, quietly upgrade to "ask the human" for a re-fire that never
+    /// actually ran.
     pub async fn reset_inflight_on_boot(&self) -> Result<usize> {
         let conn = self.conn.lock().await;
         let n = conn
@@ -641,5 +664,87 @@ mod tests {
         // if the task is inactive — eligibility filters at dispatch time.
         let id = q.enqueue("ghost", "run-x", "e").await.unwrap();
         assert!(q.get(&id).await.unwrap().is_some());
+    }
+
+    /// P0 #1: after claim, the row must not re-enter `due()` even if eligibility
+    /// is forced into the past (long in-flight run / crash-before-outcome).
+    #[tokio::test]
+    async fn due_excludes_dispatched_row_even_when_eligibility_elapsed() {
+        let (q, conn) = queue_with_tasks().await;
+        seed_task(&conn, "t1", "active", false).await;
+        let id = q.enqueue("t1", "run-t1", "e").await.unwrap();
+        {
+            let c = conn.lock().await;
+            c.execute(
+                "UPDATE pending_reruns SET next_eligible_at = datetime('now','-1 minute') WHERE id=?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            q.due().await.unwrap().len(),
+            1,
+            "fresh queued attempts=0 is due"
+        );
+        q.mark_dispatched(&id).await.unwrap();
+        assert_eq!(q.get(&id).await.unwrap().unwrap().attempts, 1);
+        {
+            let c = conn.lock().await;
+            // Simulate a long run: eligibility window elapsed while still in-flight.
+            c.execute(
+                "UPDATE pending_reruns SET next_eligible_at = datetime('now','-1 minute') WHERE id=?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        assert!(
+            q.due().await.unwrap().is_empty(),
+            "attempts>0 must never auto-fire again until human retry or boot reset"
+        );
+    }
+
+    /// P0 #2: a successful cron (no rerun_id) must clear leftover live rows so
+    /// the next watchdog tick cannot stale-replay them.
+    #[tokio::test]
+    async fn success_supersede_clears_live_rows_for_task() {
+        let (q, conn) = queue_with_tasks().await;
+        seed_task(&conn, "t1", "active", false).await;
+        seed_task(&conn, "t2", "active", false).await;
+        let awaiting = q.enqueue_manual("t1", "run-t1", "max iter").await.unwrap();
+        // Sibling queued row for the same task (bypass enqueue so both stay live).
+        let queued = "queued-sibling".to_string();
+        {
+            let c = conn.lock().await;
+            c.execute(
+                "INSERT INTO pending_reruns
+                 (id, task_id, original_run_id, fail_reason, attempts, state, next_eligible_at)
+                 VALUES (?1, 't1', 'run-t1b', 'stale 429', 0, 'queued', datetime('now','+30 minutes'))",
+                rusqlite::params![queued],
+            )
+            .unwrap();
+        }
+        let other = q.enqueue("t2", "run-t2", "other").await.unwrap();
+        assert_eq!(q.list_active().await.unwrap().len(), 3);
+        let n = q.supersede_live_for_task("t1").await.unwrap();
+        assert_eq!(n, 2, "both live t1 rows superseded");
+        assert_eq!(
+            q.get(&queued).await.unwrap().unwrap().state,
+            RerunState::Superseded
+        );
+        assert_eq!(
+            q.get(&awaiting).await.unwrap().unwrap().state,
+            RerunState::Superseded
+        );
+        assert_eq!(
+            q.get(&other).await.unwrap().unwrap().state,
+            RerunState::Queued,
+            "other tasks untouched"
+        );
+        assert!(q
+            .list_active()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.task_id == "t2"));
     }
 }
