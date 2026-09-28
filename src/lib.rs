@@ -17,6 +17,7 @@ pub mod loop_runner;
 pub mod mcp;
 pub mod memory;
 pub mod memory_tools;
+pub mod peer_invoke;
 pub mod persona_prompt;
 pub mod platform;
 pub mod portal;

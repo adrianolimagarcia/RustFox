@@ -166,7 +166,7 @@ MCP tools are namespaced as `mcp_<server-name>_<tool-name>` (e.g. `mcp_git_git_l
 | Tool | Description |
 |------|-------------|
 | `spawn_agents` | Spawn ad-hoc subagents with inline system prompts (supports parallel batch) |
-| `invoke_agent` | Run a predefined agent from `agents/` in an isolated agentic loop |
+| `invoke_agent` | Run a predefined agent from `agents/`, a subagent skill, or a `[[bots]]` persona id (optional `bot=` synonym). Nested peer depth max 2; cycles rejected; results prepend `via <persona>:` |
 | `read_agent_file` | Read a file from within an agent's directory |
 | `write_agent_file` | Write a file into an agent's directory |
 | `reload_agents` | Hot-reload the agent registry |

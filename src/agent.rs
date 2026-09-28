@@ -933,6 +933,134 @@ impl Agent {
             recovery_nudge: None,
         };
 
+        // §7.5: main loop can peer-invoke (depth/cycle + via attribution).
+        // Seed stack with this bot's id so cycles back to the caller are rejected.
+        let root_stack = vec![bot_id.to_string()];
+        let special_handler = {
+            let self_weak = self.self_weak.clone();
+            let parent_stack = root_stack.clone();
+            move |name: &str, args: &Value, _user_id: &str, _chat_id: &str| {
+                let name_owned = name.to_string();
+                let args_owned = args.clone();
+                let self_weak = self_weak.clone();
+                let parent_stack = parent_stack.clone();
+                Box::pin(async move {
+                    match name_owned.as_str() {
+                        "invoke_agent" => {
+                            let agent = match self_weak.upgrade() {
+                                Some(a) => a,
+                                None => return Some("Agent is shutting down".to_string()),
+                            };
+                            Some(
+                                agent
+                                    .handle_invoke_agent_tool(&args_owned, parent_stack)
+                                    .await,
+                            )
+                        }
+                        "spawn_agents" => {
+                            // Parse tasks inline (same shape as subagent handler).
+                            let parsed_tasks: Vec<AdHocTask> = if let Some(tasks) =
+                                args_owned["tasks"].as_array()
+                            {
+                                if tasks.is_empty() {
+                                    return Some("tasks array is empty".to_string());
+                                }
+                                let mut parsed = Vec::with_capacity(tasks.len());
+                                for (i, task) in tasks.iter().enumerate() {
+                                    let system_prompt = match task["system_prompt"].as_str() {
+                                        Some(s) => s.to_string(),
+                                        None => {
+                                            return Some(format!(
+                                                "Task at index {}: missing system_prompt",
+                                                i
+                                            ))
+                                        }
+                                    };
+                                    let prompt = match task["prompt"].as_str() {
+                                        Some(p) => p.to_string(),
+                                        None => {
+                                            return Some(format!(
+                                                "Task at index {}: missing prompt",
+                                                i
+                                            ))
+                                        }
+                                    };
+                                    parsed.push(AdHocTask {
+                                        system_prompt,
+                                        prompt,
+                                        model: task["model"].as_str().map(str::to_string),
+                                        tools: task["tools"].as_array().map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|v| v.as_str().map(str::to_string))
+                                                .collect()
+                                        }),
+                                    });
+                                }
+                                parsed
+                            } else {
+                                let system_prompt = match args_owned["system_prompt"].as_str() {
+                                    Some(s) => s.to_string(),
+                                    None => {
+                                        return Some("Missing system_prompt or tasks".to_string())
+                                    }
+                                };
+                                let prompt = match args_owned["prompt"].as_str() {
+                                    Some(p) => p.to_string(),
+                                    None => return Some("Missing prompt".to_string()),
+                                };
+                                vec![AdHocTask {
+                                    system_prompt,
+                                    prompt,
+                                    model: args_owned["model"].as_str().map(str::to_string),
+                                    tools: args_owned["tools"].as_array().map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(str::to_string))
+                                            .collect()
+                                    }),
+                                }]
+                            };
+                            let agent = match self_weak.upgrade() {
+                                Some(a) => a,
+                                None => return Some("Agent is shutting down".to_string()),
+                            };
+                            let futures: Vec<_> = parsed_tasks
+                                .into_iter()
+                                .map(|task| {
+                                    let sp = task.system_prompt.clone();
+                                    let p = task.prompt.clone();
+                                    let m = task.model.clone();
+                                    let t = task.tools.clone();
+                                    let a = agent.clone();
+                                    let stack = parent_stack.clone();
+                                    Box::pin(async move {
+                                        a.run_subagent(None, &sp, &p, m.as_deref(), t, stack).await
+                                    })
+                                })
+                                .collect();
+                            let results = futures::future::join_all(futures).await;
+                            let mut output = String::from(
+                                "Spawned agents results:
+
+",
+                            );
+                            for (i, result) in results.iter().enumerate() {
+                                output.push_str(&format!(
+                                    "--- Agent {} ---
+{}
+
+",
+                                    i + 1,
+                                    result
+                                ));
+                            }
+                            Some(output)
+                        }
+                        _ => None,
+                    }
+                }) as Pin<Box<dyn Future<Output = Option<String>> + Send + 'static>>
+            }
+        };
+
         let outcome = crate::loop_runner::AgenticLoop::new(
             &self.llm,
             &self.tool_registry,
@@ -943,7 +1071,7 @@ impl Agent {
             Some(&self.langsmith),
             self.sender.as_ref() as &dyn PlatformSender,
             Box::new(make_ctx),
-            None,
+            Some(Box::new(special_handler)),
         )
         .run(
             &mut crate::loop_runner::MessageContainer::Conversation(Box::new(cmgr)),
@@ -1240,6 +1368,74 @@ impl Agent {
         all
     }
 
+    /// Handle `invoke_agent` tool args with §7.5 peer depth/cycle guards and
+    /// `via <persona>:` attribution. Shared by the main loop and nested subagent loops.
+    pub(crate) async fn handle_invoke_agent_tool(
+        &self,
+        args: &Value,
+        invoke_stack: Vec<String>,
+    ) -> String {
+        let agent_name = match args["bot"]
+            .as_str()
+            .or_else(|| args["agent"].as_str())
+            .or_else(|| args["skill"].as_str())
+        {
+            Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+            _ => return "Missing agent (or bot) name".to_string(),
+        };
+        let prompt = match args["prompt"].as_str() {
+            Some(p) => p.to_string(),
+            None => return "Missing prompt".to_string(),
+        };
+        let model_override = args["model"].as_str().map(str::to_string);
+        let tools_override = args["tools"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
+
+        if let Err(e) = crate::peer_invoke::guard_peer_invoke(&invoke_stack, &agent_name) {
+            warn!(peer_target = %agent_name, stack = ?invoke_stack, "{e}");
+            return e;
+        }
+
+        // Classify for logging / attribution label (agents → skills → bots).
+        let in_agents = self.agents.read().await.get(&agent_name).is_some();
+        let in_skills = if in_agents {
+            false
+        } else {
+            self.skills.read().await.get(&agent_name).is_some()
+        };
+        let source = crate::peer_invoke::resolve_invoke_source(
+            &agent_name,
+            in_agents,
+            in_skills,
+            &self.config.bots,
+        );
+        let via_label = match &source {
+            Some(crate::peer_invoke::InvokeSource::BotPersona { persona, .. }) => persona.clone(),
+            _ => agent_name.clone(),
+        };
+
+        info!(
+            "Invoking agent '{}' (source: {:?}, model_override: {:?}, stack: {:?})",
+            agent_name, source, model_override, invoke_stack
+        );
+
+        let child_stack = crate::peer_invoke::push_invoke_stack(&invoke_stack, &agent_name);
+        let result = self
+            .run_subagent(
+                Some(&agent_name),
+                "",
+                &prompt,
+                model_override.as_deref(),
+                tools_override,
+                child_stack,
+            )
+            .await;
+        crate::peer_invoke::format_via_attribution(&via_label, &result)
+    }
+
     /// Run a named skill/agent as an isolated subagent mini-loop.
     /// `kind` controls which registry to look up and which read tool to use in the bootstrap.
     /// Returns the subagent's final text response (or an error string).
@@ -1256,6 +1452,7 @@ impl Agent {
         user_prompt: &str,
         model_override: Option<&str>,
         tools_override: Option<Vec<String>>,
+        invoke_stack: Vec<String>,
     ) -> String {
         // --- Ad-hoc mode (no predefined skill/agent) ---
         if skill_name.is_none() {
@@ -1318,6 +1515,7 @@ impl Agent {
                     max_iter,
                     "_ad_hoc_",
                     None,
+                    invoke_stack,
                 )
                 .await;
         }
@@ -1326,8 +1524,8 @@ impl Agent {
         let skill_name = skill_name.unwrap(); // safe: we handled None above
 
         // Resolve model and tool list from registry metadata (or overrides).
-        // For invoke_agent: check agents registry first, fall back to skills registry.
-        let (resolved_model, declared_tools, max_iter) = {
+        // Order (§7.5): agents registry → skills registry → [[bots]] persona.
+        let (resolved_model, declared_tools, max_iter, bot_persona_fallback) = {
             let default_model = self.config.openrouter.model.clone();
 
             let skill_opt = {
@@ -1337,31 +1535,39 @@ impl Agent {
                 if from_agents.is_some() {
                     from_agents
                 } else {
-                    // fall back to skills registry
                     let skills = self.skills.read().await;
                     skills.get(skill_name).cloned()
                 }
             };
 
+            let bot_peer = if skill_opt.is_none() {
+                crate::peer_invoke::bot_config_for_peer(&self.config.bots, skill_name)
+            } else {
+                None
+            };
+
             let model = model_override
                 .map(str::to_string)
                 .or_else(|| skill_opt.as_ref().and_then(|s| s.model.clone()))
+                .or_else(|| bot_peer.and_then(|b| b.model.clone()))
                 .unwrap_or_else(|| default_model.clone());
-            if model == default_model && skill_opt.is_none() {
+            if model == default_model && skill_opt.is_none() && bot_peer.is_none() {
                 warn!(
-                    "Agent/skill '{}' not found in registry; using default model.",
+                    "Agent/skill/bot persona '{}' not found; using default model.",
                     skill_name
                 );
             }
             let tools = tools_override
                 .or_else(|| skill_opt.as_ref().map(|s| s.tools.clone()))
+                .or_else(|| bot_peer.and_then(|b| b.tools.clone()))
                 .unwrap_or_default();
             let max_i = skill_opt
                 .as_ref()
                 .and_then(|s| s.max_iterations)
                 .unwrap_or_else(|| self.config.max_iterations())
                 .min(self.config.max_iterations());
-            (model, tools, max_i)
+            let bot_fallback = bot_peer.map(|b| b.persona.trim().to_string());
+            (model, tools, max_i, bot_fallback)
         };
 
         let allowed_tools = effective_subagent_tools(&declared_tools);
@@ -1419,27 +1625,33 @@ impl Agent {
             .map(|s| s.skip_bootstrap)
             .unwrap_or(false);
 
-        // Strip YAML frontmatter from content if present (between --- markers)
-        let body = skill_opt.as_ref().map(|s| {
-            let content = &s.content;
-            let trimmed = content.trim_start();
-            if let Some(after_first) = trimmed.strip_prefix("---") {
-                if let Some(end_pos) = after_first.find("---") {
-                    return after_first[end_pos + 3..].trim_start().to_string();
-                }
-            }
-            content.clone()
-        });
+        // Strip YAML frontmatter from content if present
+        let body = skill_opt
+            .as_ref()
+            .map(|s| crate::persona_prompt::strip_md_frontmatter(&s.content));
 
-        let system_content = if skip_bootstrap {
+        let system_content = if let Some(ref persona) = bot_persona_fallback {
+            // §7.5 path (3): bot persona with no agents/skills pack — use resolved
+            // base prompt (system_prompt_file / AGENT.md / global) as the body.
+            let bot = crate::peer_invoke::bot_config_for_peer(&self.config.bots, skill_name)
+                .expect("bot_persona_fallback implies bot exists");
+            let (base, _) = crate::persona_prompt::resolve_bot_base_prompt(&self.config, bot);
+            format!(
+                "You are the '{persona}' bot persona (peer invoke).
+
+{base}"
+            )
+        } else if skip_bootstrap {
             let agent_body = body.as_deref().unwrap_or("");
-            format!("You are the '{}' agent.\n\n{}", skill_name, agent_body)
+            format!(
+                "You are the '{skill_name}' agent.
+
+{agent_body}"
+            )
         } else {
             format!(
-                    "You are the '{}' agent. Your first action MUST be to call \
-                     read_agent_file with agent_name='{}' and relative_path='AGENT.md' to load your instructions.",
-                    skill_name, skill_name
-                )
+                "You are the '{skill_name}' agent. Your first action MUST be to call                  read_agent_file with agent_name='{skill_name}' and relative_path='AGENT.md' to load your instructions."
+            )
         };
 
         let mut messages = vec![
@@ -1465,6 +1677,7 @@ impl Agent {
             max_iter,
             skill_name,
             None,
+            invoke_stack,
         )
         .await
     }
@@ -1483,55 +1696,29 @@ impl Agent {
         max_iter: u32,
         label: &'a str,
         cancel_token: Option<CancellationToken>,
+        invoke_stack: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
         Box::pin(async move {
-            // Build special_tool_handler for invoke_agent/spawn_agents (circular dependency
-            // prevents them from being registered in ToolRegistry).
+            // Build special_tool_handler for invoke_agent/spawn_agents (circular
+            // dependency with run_subagent). Depth/cycle + via attribution: §7.5.
             let special_handler = {
                 let self_weak = self.self_weak.clone();
+                let parent_stack = invoke_stack.clone();
                 move |name: &str, args: &Value, _user_id: &str, _chat_id: &str| {
                     let name_owned = name.to_string();
                     let args_owned = args.clone();
                     let self_weak = self_weak.clone();
+                    let parent_stack = parent_stack.clone();
                     Box::pin(async move {
                         match name_owned.as_str() {
                             "invoke_agent" => {
-                                let agent_name = match args_owned["agent"]
-                                    .as_str()
-                                    .or_else(|| args_owned["skill"].as_str())
-                                {
-                                    Some(a) => a.to_string(),
-                                    None => return Some("Missing agent".to_string()),
-                                };
-                                let prompt = match args_owned["prompt"].as_str() {
-                                    Some(p) => p.to_string(),
-                                    None => return Some("Missing prompt".to_string()),
-                                };
-                                let model_override =
-                                    args_owned["model"].as_str().map(str::to_string);
-                                let tools_override = args_owned["tools"].as_array().map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(str::to_string))
-                                        .collect::<Vec<_>>()
-                                });
-                                tracing::info!(
-                                    "Invoking agent '{}' (model_override: {:?})",
-                                    agent_name,
-                                    model_override
-                                );
                                 let agent = match self_weak.upgrade() {
                                     Some(a) => a,
                                     None => return Some("Agent is shutting down".to_string()),
                                 };
                                 Some(
                                     agent
-                                        .run_subagent(
-                                            Some(&agent_name),
-                                            "",
-                                            &prompt,
-                                            model_override.as_deref(),
-                                            tools_override,
-                                        )
+                                        .handle_invoke_agent_tool(&args_owned, parent_stack)
                                         .await,
                                 )
                             }
@@ -1610,8 +1797,10 @@ impl Agent {
                                         let m = task.model.clone();
                                         let t = task.tools.clone();
                                         let a = agent.clone();
+                                        let stack = parent_stack.clone();
                                         Box::pin(async move {
-                                            a.run_subagent(None, &sp, &p, m.as_deref(), t).await
+                                            a.run_subagent(None, &sp, &p, m.as_deref(), t, stack)
+                                                .await
                                         })
                                     })
                                     .collect();
