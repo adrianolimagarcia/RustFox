@@ -20,10 +20,11 @@ allowed_user_ids = [123456789]
 # id = "main"
 # bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 # allowed_user_ids = [123456789]
-# persona = "main"
-# # system_prompt_file = "prompts/main.md"
+# persona = "main"                 # agents/<persona>/AGENT.md + optional SOUL.md overlay
+# # system_prompt_file = "prompts/main.md"  # optional; wins over AGENT.md when set
 # # model = "moonshotai/kimi-k2.6"
 # # tools = ["read_file", "write_file", "execute_command", "invoke_agent"]
+# # USER.md stays shared under RUSTFOX_HOME (not per-bot). Portal uses default/shim persona.
 
 [openrouter]
 # Get your API key from https://openrouter.ai/keys

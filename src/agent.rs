@@ -252,12 +252,16 @@ impl Agent {
         }
     }
 
-    /// Build the system prompt, incorporating loaded skills and agents
-    async fn build_system_prompt(&self) -> String {
-        // ADR 0011 R7: effective prompt follows file > inline > builtin
-        // precedence, re-read every turn (the portal can edit the file
-        // live — no restart needed).
-        let mut prompt = self.config.resolve_system_prompt().0;
+    /// Build the system prompt for a bot identity, incorporating loaded skills
+    /// and agents. Base prompt + SOUL overlay are persona-scoped (§7.4);
+    /// USER.md stays install-wide.
+    async fn build_system_prompt(&self, bot_id: &str) -> String {
+        let bot = crate::persona_prompt::bot_for_prompt(&self.config, bot_id);
+        let persona = bot.persona.clone();
+        // §7.4: bot.system_prompt_file > agents/<persona>/AGENT.md > global
+        // openrouter resolve (ADR 0011 R7). Re-read every turn so portal edits
+        // and persona file changes apply without restart.
+        let mut prompt = crate::persona_prompt::resolve_bot_base_prompt(&self.config, bot).0;
 
         let skills = self.skills.read().await;
         let skill_context = skills.build_context();
@@ -309,9 +313,10 @@ impl Agent {
              giving your final response.",
         );
 
-        // Append ambient system context (user model, timestamp, location).
-        // `build_system_context` already includes the leading `\n\n` separators.
-        prompt.push_str(&self.build_system_context().await);
+        // Append ambient system context (persona SOUL overlay, shared USER.md,
+        // timestamp, location). `build_system_context` already includes the
+        // leading `\n\n` separators.
+        prompt.push_str(&self.build_system_context(Some(&persona)).await);
 
         // Warn if system prompt is very large (tight on context window)
         if prompt.len() > 50_000 {
@@ -324,16 +329,27 @@ impl Agent {
         prompt
     }
 
-    /// Build ambient system context (soul files, timestamp, location) shared by
-    /// the main agent and subagents. Unlike build_system_prompt, this does NOT
-    /// include skills/agents listings.
-    async fn build_system_context(&self) -> String {
+    /// Build ambient system context (soul files, timestamp, location).
+    ///
+    /// When `persona` is `Some`, SOUL/AGENTS.md prefer `agents/<persona>/`
+    /// overlays (§7.4). USER.md is always the shared home copy. Subagents pass
+    /// `None` to keep home-only soul files. Unlike build_system_prompt, this
+    /// does NOT include skills/agents listings.
+    async fn build_system_context(&self, persona: Option<&str>) -> String {
         let mut ctx = String::new();
 
         if let Some(home) = &self.config.resolved_home {
-            // Inject SOUL.md
-            let soul_path = home.join("SOUL.md");
-            let soul_content = crate::learning::read_soul_file(&soul_path).await;
+            let files = match persona {
+                Some(p) => crate::persona_prompt::resolve_persona_soul_files(
+                    home,
+                    &self.config.agents.directory,
+                    p,
+                ),
+                None => crate::persona_prompt::PersonaSoulFiles::home_only(home),
+            };
+
+            // Inject SOUL.md (persona overlay or home)
+            let soul_content = crate::learning::read_soul_file(&files.soul).await;
             if !soul_content.is_empty() {
                 let truncated = crate::learning::truncate_to(&soul_content, 8_000);
                 ctx.push_str("\n\n# My Identity\n<identity>\n");
@@ -346,9 +362,8 @@ impl Agent {
                 }
             }
 
-            // Inject AGENTS.md
-            let agents_path = home.join("AGENTS.md");
-            let agents_content = crate::learning::read_soul_file(&agents_path).await;
+            // Inject AGENTS.md (persona overlay or home)
+            let agents_content = crate::learning::read_soul_file(&files.agents_md).await;
             if !agents_content.is_empty() {
                 let truncated = crate::learning::truncate_to(&agents_content, 8_000);
                 ctx.push_str("\n\n# What I've Learned\n<agent_memory>\n");
@@ -361,9 +376,8 @@ impl Agent {
                 }
             }
 
-            // Inject USER.md
-            let user_path = home.join("USER.md");
-            let user_content = crate::learning::read_soul_file(&user_path).await;
+            // Inject USER.md — always shared home (PO lock: do not split)
+            let user_content = crate::learning::read_soul_file(&files.user).await;
             if !user_content.is_empty() {
                 let truncated = crate::learning::truncate_to(&user_content, 8_000);
                 ctx.push_str("\n\n# User Model\n<user_model>\n");
@@ -392,7 +406,7 @@ impl Agent {
     /// (timestamp, user model, location) to the agent's specific instructions.
     #[allow(dead_code)]
     async fn build_subagent_system_prompt(&self, agent_instructions: &str) -> String {
-        let mut prompt = self.build_system_context().await;
+        let mut prompt = self.build_system_context(None).await;
         prompt.push_str("\n\n");
         prompt.push_str(agent_instructions);
         prompt
@@ -735,8 +749,9 @@ impl Agent {
             .get_or_create_conversation(platform, bot_id, user_id)
             .await?;
 
-        // Always build the system prompt from the live registry.
-        let current_system_prompt = self.build_system_prompt().await;
+        // Always build the system prompt from the live registry, scoped to
+        // this bot's persona (§7.4).
+        let current_system_prompt = self.build_system_prompt(bot_id).await;
 
         // Use ConversationManager for message construction and management
         let skills = self.skills.read().await;
