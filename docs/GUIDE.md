@@ -21,6 +21,7 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 | Section | Setting | Description | Default |
 |---------|---------|-------------|---------|
 | `[telegram]` | `bot_token` | Telegram Bot API token | — |
+| | `api_base_url` | Bot API root override (teloxide + rich_sender) | `https://api.telegram.org` |
 | | `allowed_user_ids` | Comma-separated whitelist of user IDs | — |
 | `[openrouter]` | `api_key` | OpenRouter API key | — |
 | | `model` | LLM model ID | `moonshotai/kimi-k2.6` |

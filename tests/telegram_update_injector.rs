@@ -135,6 +135,30 @@ impl MockTelegramApi {
             .expect(0..)
             .mount(&self.server)
             .await;
+
+        // rich_sender uses camelCase method names against the same api_base
+        // (Bot::api_url), not teloxide's PascalCase paths.
+        let counter_rich = Arc::clone(&self.next_msg_id);
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/sendRichMessage$"))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+                let chat_id = body
+                    .get("chat_id")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                    .unwrap_or(0);
+                let text = body
+                    .pointer("/rich_message/markdown")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mid = counter_rich.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(ok_message_result(chat_id, mid, &text))
+            })
+            .expect(0..)
+            .mount(&self.server)
+            .await;
     }
 
     /// Backward-compat alias used by the startup/shutdown smoke test.
@@ -153,12 +177,44 @@ impl MockTelegramApi {
             .collect()
     }
 
-    async fn send_message_texts(&self) -> Vec<String> {
-        self.received_send_message_bodies()
+    async fn received_requests_paths(&self) -> Vec<String> {
+        self.server
+            .received_requests()
             .await
+            .unwrap_or_default()
             .into_iter()
-            .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(str::to_string))
+            .map(|r| r.url.path().to_string())
             .collect()
+    }
+
+    /// Outbound user-visible text from teloxide SendMessage (`text`) or
+    /// rich_sender sendRichMessage (`rich_message.markdown`).
+    async fn outbound_texts(&self) -> Vec<String> {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                let p = r.url.path().to_ascii_lowercase();
+                p.contains("sendmessage") || p.contains("sendrichmessage")
+            })
+            .filter_map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).ok()?;
+                body.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        body.pointer("/rich_message/markdown")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+            })
+            .collect()
+    }
+
+    fn uri(&self) -> String {
+        self.server.uri()
     }
 }
 
@@ -267,18 +323,8 @@ impl HandleMessageHarness {
             )
             .await
             .ok();
-        // Force entities path: default Auto tries sendRichMessage against
-        // hard-coded api.telegram.org (bypasses Bot::set_api_url / wiremock).
-        agent
-            .memory
-            .remember(
-                "settings",
-                &format!("message_format_{ALLOWED}"),
-                "markdown",
-                None,
-            )
-            .await
-            .ok();
+        // Leave message_format at default `auto` so sendRichMessage goes through
+        // rich_sender → bot.api_url() (wiremock). Do NOT force markdown.
 
         Self {
             _tmp: tmp,
@@ -448,7 +494,7 @@ async fn drive_handle_message_slash_start() {
         .expect("drive /start");
     assert_eq!(route, HandlerRoute::Message);
 
-    let texts = h.api.send_message_texts().await;
+    let texts = h.api.outbound_texts().await;
     assert!(
         texts
             .iter()
@@ -471,7 +517,7 @@ async fn drive_handle_message_slash_clear() {
         .await
         .expect("drive /clear");
     assert_eq!(route, HandlerRoute::Message);
-    let texts = h.api.send_message_texts().await;
+    let texts = h.api.outbound_texts().await;
     assert!(
         texts
             .iter()
@@ -489,7 +535,7 @@ async fn drive_handle_message_slash_tools() {
         .await
         .expect("drive /tools");
     assert_eq!(route, HandlerRoute::Message);
-    let texts = h.api.send_message_texts().await;
+    let texts = h.api.outbound_texts().await;
     assert!(
         texts
             .iter()
@@ -508,10 +554,54 @@ async fn drive_handle_message_chat_with_fixture_llm() {
         .expect("drive chat_hello");
     assert_eq!(route, HandlerRoute::Message);
 
-    let texts = h.api.send_message_texts().await;
+    let texts = h.api.outbound_texts().await;
     assert!(
         texts.iter().any(|t| t.contains(STUB_REPLY)),
-        "expected fixture LLM reply in outbound SendMessage; got {texts:?}"
+        "expected fixture LLM reply in outbound SendMessage/sendRichMessage; got {texts:?}"
+    );
+}
+
+/// Default `message_format=auto` must hit wiremock via injectable Bot API base
+/// (rich_sender uses `bot.api_url()`), never the hard-coded api.telegram.org.
+#[tokio::test]
+async fn drive_handle_message_chat_auto_hits_wiremock_rich() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    // Explicitly confirm harness left format at auto (no memory override).
+    let fmt = h
+        .agent
+        .memory
+        .recall("settings", &format!("message_format_{ALLOWED}"))
+        .await
+        .unwrap();
+    assert!(
+        fmt.is_none(),
+        "harness must leave message_format unset (default auto); got {fmt:?}"
+    );
+
+    let mock_base = h.api.uri();
+    assert_eq!(
+        h.bot.api_url().as_str().trim_end_matches('/'),
+        mock_base.trim_end_matches('/'),
+        "Bot must be pointed at wiremock"
+    );
+
+    let upd = UpdateInjector::parse_update_file(fixture("chat_hello.json")).unwrap();
+    injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive chat_hello auto");
+
+    let paths = h.api.received_requests_paths().await;
+    assert!(
+        paths.iter().any(|p| p.contains("sendRichMessage")),
+        "auto format must call sendRichMessage on wiremock; paths={paths:?}"
+    );
+    // Requests recorded by MockServer are definitionally against the mock URI
+    // (not api.telegram.org). Rich path must carry the stub reply.
+    let texts = h.api.outbound_texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains(STUB_REPLY)),
+        "fixture reply must arrive via wiremock rich path; got {texts:?}"
     );
 }
 
@@ -524,7 +614,7 @@ async fn drive_handle_message_rejects_off_allowlist_without_bot_calls() {
         .await
         .expect("drive rejected");
     assert_eq!(route, HandlerRoute::RejectedAllowlist);
-    let texts = h.api.send_message_texts().await;
+    let texts = h.api.outbound_texts().await;
     assert!(
         texts.is_empty(),
         "rejected update must not call SendMessage; got {texts:?}"
@@ -540,7 +630,7 @@ async fn drive_handle_message_skips_callback_without_bot_calls() {
         .await
         .expect("drive callback");
     assert_eq!(route, HandlerRoute::ModelCallback);
-    let texts = h.api.send_message_texts().await;
+    let texts = h.api.outbound_texts().await;
     assert!(
         texts.is_empty(),
         "drive_handle_message must not run callbacks; got {texts:?}"
