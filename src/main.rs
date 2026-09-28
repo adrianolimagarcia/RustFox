@@ -118,7 +118,10 @@ async fn main() -> Result<()> {
     if let Some(home) = &config.resolved_home {
         info!("  Home: {}", home.display());
     }
-    info!("  Allowed users: {:?}", config.telegram.allowed_user_ids);
+    info!("  Bots: {}", config.bots.len());
+    for b in &config.bots {
+        info!("    bot id={} allowed_users={:?}", b.id, b.allowed_user_ids);
+    }
     info!("  MCP servers: {}", config.mcp_servers.len());
     let langsmith = std::sync::Arc::new(rustfox::langsmith::LangSmithClient::new(
         config.langsmith.as_ref(),
@@ -198,10 +201,26 @@ async fn main() -> Result<()> {
     // Create scheduler as Arc so Agent can hold it and closures can reference it
     let scheduler = Arc::new(Scheduler::new().await?);
 
-    // Create Bot early so it can be passed to Agent
-    let bot = Arc::new(teloxide::Bot::new(&config.telegram.bot_token));
-
-    rustfox::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
+    // One teloxide::Bot per [[bots]] entry. Agent / scheduler / TelegramAdapter
+    // keep the shim (primary) bot for this slice; conversation bot_id isolation
+    // and per-bot scheduler identity are later slices (§7.3+).
+    let bot_runtimes: Vec<(String, Arc<teloxide::Bot>, Vec<u64>)> = config
+        .bots
+        .iter()
+        .map(|b| {
+            (
+                b.id.clone(),
+                Arc::new(teloxide::Bot::new(&b.bot_token)),
+                b.allowed_user_ids.clone(),
+            )
+        })
+        .collect();
+    let shim = Config::shim_bot(&config.bots);
+    let bot = bot_runtimes
+        .iter()
+        .find(|(id, _, _)| id == &shim.id)
+        .map(|(_, b, _)| Arc::clone(b))
+        .expect("shim bot must exist in bot_runtimes");
 
     // Channel for dispatching scheduled job work from fire closures to background runner
     let (job_tx, mut job_rx) =
@@ -462,16 +481,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Run the Telegram platform with signal-driven graceful shutdown
-    info!("Bot is starting...");
+    // Run N Telegram dispatchers (one per [[bots]] entry) with signal-driven
+    // graceful shutdown. Each run() notifies its own allowlist on startup.
+    info!("Starting {} Telegram dispatcher(s)...", bot_runtimes.len());
 
-    let dispatch_agent = Arc::clone(&agent);
-    let dispatch_user_ids = config.telegram.allowed_user_ids.clone();
-    let dispatch_bot = Arc::clone(&bot);
-
-    let mut dispatch_handle = tokio::spawn(async move {
-        platform::telegram::run(dispatch_agent, dispatch_user_ids, dispatch_bot).await
-    });
+    let shutdown_bots = bot_runtimes.clone();
+    let mut join_set = tokio::task::JoinSet::new();
+    for (bot_id, dispatch_bot, allowlist) in bot_runtimes {
+        let dispatch_agent = Arc::clone(&agent);
+        let id_for_log = bot_id.clone();
+        join_set.spawn(async move {
+            info!(bot_id = %id_for_log, "Telegram dispatcher starting");
+            let result = platform::telegram::run(dispatch_agent, allowlist, dispatch_bot).await;
+            (id_for_log, result)
+        });
+    }
 
     // Set up signal handlers (SIGINT via ctrl_c for portability, SIGTERM via unix signal)
     #[cfg(unix)]
@@ -490,14 +514,30 @@ async fn main() -> Result<()> {
         _ = terminate => {
             info!("SIGTERM received, shutting down...");
         }
-        result = &mut dispatch_handle => {
-            result??;
-            return Ok(());
+        Some(joined) = join_set.join_next() => {
+            match joined {
+                Ok((id, Ok(()))) => {
+                    warn!(bot_id = %id, "Telegram dispatcher exited unexpectedly; shutting down");
+                }
+                Ok((id, Err(e))) => {
+                    tracing::error!(bot_id = %id, error = %e, "Telegram dispatcher failed; shutting down");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Telegram dispatcher task panicked; shutting down");
+                }
+            }
         }
     };
 
-    // Send shutdown notification
-    platform::telegram::notify_shutdown(&bot, &config.telegram.allowed_user_ids).await;
+    // Per-bot shutdown notify (each bot's own allowlist)
+    for (id, dispatch_bot, allowlist) in &shutdown_bots {
+        info!(bot_id = %id, "Sending shutdown notification");
+        platform::telegram::notify_shutdown(dispatch_bot, allowlist).await;
+    }
+
+    // Abort any remaining dispatchers and wait for them to finish.
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
 
     // Brief grace period for message delivery
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
