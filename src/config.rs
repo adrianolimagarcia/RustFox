@@ -912,8 +912,12 @@ impl Config {
     /// 2. Only `[telegram]` → synthesize one bot
     ///    `{ id = "default", persona = "main", … }`.
     /// 3. Reject duplicate `id` or duplicate `bot_token`, and empty id/token.
-    /// 4. Always refresh `telegram` from the first canonical bot so existing
-    ///    `config.telegram` readers keep working.
+    /// 4. Refresh `telegram` from the shim bot so existing `config.telegram`
+    ///    readers keep working. Prefer `id = "main"`, then `"default"`, else
+    ///    the first entry (slice 1 only; slice 2 stops relying on single telegram).
+    /// 5. Empty `allowed_user_ids` is soft/warn on this parse-only slice; any
+    ///    bot (including legacy synthesize) must hard-fail at load/startup
+    ///    before or with the first multi-dispatcher (slice 2).
     pub fn normalize_bots(&mut self) -> Result<()> {
         let legacy_present = !self.telegram.bot_token.trim().is_empty();
 
@@ -924,11 +928,11 @@ impl Config {
                 );
             }
             Self::validate_bots(&self.bots)?;
-            // Shim: first bot backs legacy telegram accessors (slice 1 — no
-            // multi-dispatcher yet).
+            // Shim: prefer id=main, then default, else first entry (PO lock for #65).
+            let shim = Self::shim_bot(&self.bots);
             self.telegram = TelegramConfig {
-                bot_token: self.bots[0].bot_token.clone(),
-                allowed_user_ids: self.bots[0].allowed_user_ids.clone(),
+                bot_token: shim.bot_token.clone(),
+                allowed_user_ids: shim.allowed_user_ids.clone(),
             };
             return Ok(());
         }
@@ -951,6 +955,14 @@ impl Config {
         anyhow::bail!(
             "no bots configured: provide [[bots]] or a legacy [telegram] section with bot_token"
         );
+    }
+
+    /// Pick the bot that backs legacy `config.telegram` for slice 1.
+    fn shim_bot(bots: &[BotConfig]) -> &BotConfig {
+        bots.iter()
+            .find(|b| b.id.trim() == "main")
+            .or_else(|| bots.iter().find(|b| b.id.trim() == "default"))
+            .unwrap_or(&bots[0])
     }
 
     fn validate_bots(bots: &[BotConfig]) -> Result<()> {
@@ -1839,9 +1851,53 @@ mod tests {
             cfg.bots[1].system_prompt_file.as_deref(),
             Some(Path::new("prompts/researcher.md"))
         );
-        // First bot shims legacy telegram for single-bot callers
+        // Prefer id=main for legacy telegram shim
         assert_eq!(cfg.telegram.bot_token, "tok-main");
         assert_eq!(cfg.telegram.allowed_user_ids, vec![1]);
+    }
+
+    #[test]
+    fn shim_prefers_main_then_default_over_first_entry() {
+        let cfg = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-research"
+            allowed_user_ids = [2]
+            persona = "researcher"
+
+            [[bots]]
+            id = "main"
+            bot_token = "tok-main"
+            allowed_user_ids = [1]
+            persona = "main"
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg.bots[0].id, "researcher");
+        assert_eq!(cfg.telegram.bot_token, "tok-main");
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![1]);
+
+        let cfg2 = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-research"
+            allowed_user_ids = [2]
+
+            [[bots]]
+            id = "default"
+            bot_token = "tok-default"
+            allowed_user_ids = [9]
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg2.telegram.bot_token, "tok-default");
+        assert_eq!(cfg2.telegram.allowed_user_ids, vec![9]);
     }
 
     #[test]
