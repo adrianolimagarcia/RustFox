@@ -1107,7 +1107,7 @@ async fn handle_restart_command(bot: Bot, chat_id: ChatId) -> ResponseResult<()>
     Ok(())
 }
 
-async fn handle_message(
+pub async fn handle_message(
     bot: Bot,
     msg: Message,
     agent: Arc<Agent>,

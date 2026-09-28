@@ -1,4 +1,4 @@
-//! Telegram Update injector harness — no live Bot API / no Desktop.
+//! Telegram Update injector harness — no live Bot API / no Desktop / no OpenRouter.
 //!
 //! ```bash
 //! cargo test --test telegram_update_injector
@@ -6,33 +6,49 @@
 //!
 //! See `docs/telegram-update-injector.md`.
 
-use rustfox::platform::telegram::{notify_shutdown, notify_startup};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Weak};
+
+use rustfox::agent::Agent;
+use rustfox::cancel_registry::CancelRegistry;
+use rustfox::config::Config;
+use rustfox::langsmith::LangSmithClient;
+use rustfox::mcp::McpManager;
+use rustfox::memory::MemoryStore;
+use rustfox::platform::telegram::{notify_shutdown, notify_startup, TelegramAdapter};
 use rustfox::platform::{
-    AllowlistDecision, HandlerRoute, InjectedKind, UpdateInjector, DEFAULT_BOT_ID,
+    AllowlistDecision, FixtureLlm, HandlerRoute, InjectedKind, UpdateInjector, DEFAULT_BOT_ID,
 };
+use rustfox::scheduler::reminders::ScheduledTaskStore;
+use rustfox::scheduler::Scheduler;
+use rustfox::skills::SkillRegistry;
+use rustfox::tool_registry::ToolRegistry;
 use serde_json::json;
 use teloxide::prelude::*;
+use tempfile::TempDir;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telegram");
 const ALLOWED: u64 = 111_001;
 const TOKEN: &str = "000000000:QA-INJECTOR-MOCK-TOKEN";
+const STUB_REPLY: &str = "FIXTURE_LLM_REPLY_deterministic";
 
-fn fixture(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(FIXTURE_DIR).join(name)
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(FIXTURE_DIR).join(name)
 }
 
 fn injector() -> UpdateInjector {
     UpdateInjector::new([ALLOWED]).with_bot_id("main")
 }
 
-/// Minimal Message JSON accepted as `sendMessage` result by teloxide.
-fn ok_message_result(chat_id: i64, text: &str) -> serde_json::Value {
+/// Minimal Message JSON accepted as `sendMessage` / `editMessageText` result.
+fn ok_message_result(chat_id: i64, message_id: i32, text: &str) -> serde_json::Value {
     json!({
         "ok": true,
         "result": {
-            "message_id": 1,
+            "message_id": message_id,
             "date": 1700000000,
             "chat": { "id": chat_id, "type": "private", "first_name": "QA" },
             "text": text
@@ -44,6 +60,7 @@ fn ok_message_result(chat_id: i64, text: &str) -> serde_json::Value {
 struct MockTelegramApi {
     server: MockServer,
     token: String,
+    next_msg_id: Arc<AtomicI32>,
 }
 
 impl MockTelegramApi {
@@ -51,6 +68,7 @@ impl MockTelegramApi {
         Self {
             server: MockServer::start().await,
             token: TOKEN.to_string(),
+            next_msg_id: Arc::new(AtomicI32::new(100)),
         }
     }
 
@@ -60,11 +78,11 @@ impl MockTelegramApi {
         Bot::new(&self.token).set_api_url(url)
     }
 
-    async fn stub_send_message(&self) {
-        // teloxide posts to `/bot{token}/SendMessage` (PascalCase method name).
+    async fn stub_bot_api(&self) {
+        let counter = Arc::clone(&self.next_msg_id);
         Mock::given(method("POST"))
             .and(path_regex(r"^/bot[^/]+/SendMessage$"))
-            .respond_with(|req: &Request| {
+            .respond_with(move |req: &Request| {
                 let body: serde_json::Value =
                     serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
                 let chat_id = body
@@ -76,11 +94,52 @@ impl MockTelegramApi {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                ResponseTemplate::new(200).set_body_json(ok_message_result(chat_id, &text))
+                let mid = counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(ok_message_result(chat_id, mid, &text))
             })
-            .expect(1..)
+            .expect(0..)
             .mount(&self.server)
             .await;
+
+        let counter_edit = Arc::clone(&self.next_msg_id);
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/EditMessageText$"))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+                let chat_id = body
+                    .get("chat_id")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                    .unwrap_or(0);
+                let mid = body
+                    .get("message_id")
+                    .and_then(|v| v.as_i64().map(|i| i as i32))
+                    .unwrap_or_else(|| counter_edit.load(Ordering::SeqCst));
+                let text = body
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                ResponseTemplate::new(200).set_body_json(ok_message_result(chat_id, mid, &text))
+            })
+            .expect(0..)
+            .mount(&self.server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/DeleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(0..)
+            .mount(&self.server)
+            .await;
+    }
+
+    /// Backward-compat alias used by the startup/shutdown smoke test.
+    async fn stub_send_message(&self) {
+        self.stub_bot_api().await;
     }
 
     async fn received_send_message_bodies(&self) -> Vec<serde_json::Value> {
@@ -92,6 +151,141 @@ impl MockTelegramApi {
             .filter(|r| r.url.path().to_ascii_lowercase().contains("sendmessage"))
             .filter_map(|r| serde_json::from_slice(&r.body).ok())
             .collect()
+    }
+
+    async fn send_message_texts(&self) -> Vec<String> {
+        self.received_send_message_bodies()
+            .await
+            .into_iter()
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    }
+}
+
+/// Owns temp home/config + Agent wired to a mock Bot and [`FixtureLlm`].
+struct HandleMessageHarness {
+    _tmp: TempDir,
+    agent: Arc<Agent>,
+    bot: Bot,
+    api: MockTelegramApi,
+}
+
+impl HandleMessageHarness {
+    async fn new(stub_reply: &str) -> Self {
+        // Env beats [general].home — keep ambient clear for deterministic paths.
+        std::env::remove_var("RUSTFOX_HOME");
+
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join(".rustfox");
+        std::fs::create_dir_all(home.join("workspace")).unwrap();
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+
+        let cfg_path = tmp.path().join("config.toml");
+        let toml = format!(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "{TOKEN}"
+            allowed_user_ids = [{ALLOWED}]
+            persona = "main"
+
+            [openrouter]
+            api_key = "fixture-unused"
+            model = "fixture/stub"
+            base_url = "http://fixture.invalid/v1"
+            max_tokens = 256
+            system_prompt = "You are a QA fixture bot."
+
+            [general]
+            home = "{home}"
+
+            [agent]
+            max_iterations = 2
+            empty_response_retry_limit = 0
+            parse_retry_limit = 0
+            rate_limit_retry_limit = 0
+            "#,
+            TOKEN = TOKEN,
+            ALLOWED = ALLOWED,
+            home = home.display()
+        );
+        std::fs::write(&cfg_path, toml).unwrap();
+        let config = Config::load(&cfg_path).expect("load fixture config");
+
+        let api = MockTelegramApi::start().await;
+        api.stub_bot_api().await;
+        let bot = api.bot();
+        let bot_arc = Arc::new(bot.clone());
+
+        let registry = Arc::new(FixtureLlm::new(stub_reply).into_registry());
+        let memory = MemoryStore::open_in_memory().expect("in-memory sqlite");
+        let task_store = ScheduledTaskStore::new(memory.connection());
+        let scheduler = Arc::new(Scheduler::new().await.expect("scheduler"));
+        let (job_tx, _job_rx) =
+            tokio::sync::mpsc::unbounded_channel::<rustfox::agent::ScheduledJobRequest>();
+        let cancel_registry = Arc::new(CancelRegistry::new());
+        let sender: Arc<dyn rustfox::platform::PlatformSender> =
+            Arc::new(TelegramAdapter::new(bot.clone()));
+        let tool_registry = ToolRegistry::new();
+        let langsmith = Arc::new(LangSmithClient::new(None));
+        let restart_pending = Arc::new(AtomicBool::new(false));
+        let soul_updated = Arc::new(AtomicBool::new(false));
+
+        let agent = Arc::new_cyclic(|weak: &Weak<Agent>| {
+            Agent::new(
+                config,
+                registry,
+                McpManager::new(),
+                memory,
+                SkillRegistry::new(),
+                SkillRegistry::new(),
+                task_store,
+                scheduler,
+                weak.clone(),
+                job_tx,
+                langsmith,
+                cfg_path.clone(),
+                cancel_registry,
+                tool_registry,
+                sender,
+                bot_arc,
+                restart_pending,
+                soul_updated,
+            )
+        });
+
+        // Prefer Silent UI so chat path uses Thinking placeholder + stream,
+        // without tool-notifier edit chatter (no tools in this harness).
+        agent
+            .memory
+            .remember(
+                "settings",
+                &format!("tool_ui_mode_{ALLOWED}"),
+                "silent",
+                None,
+            )
+            .await
+            .ok();
+        // Force entities path: default Auto tries sendRichMessage against
+        // hard-coded api.telegram.org (bypasses Bot::set_api_url / wiremock).
+        agent
+            .memory
+            .remember(
+                "settings",
+                &format!("message_format_{ALLOWED}"),
+                "markdown",
+                None,
+            )
+            .await
+            .ok();
+
+        Self {
+            _tmp: tmp,
+            agent,
+            bot,
+            api,
+        }
     }
 }
 
@@ -188,6 +382,26 @@ fn default_bot_id_when_empty() {
     assert_eq!(inj.bot_id(), DEFAULT_BOT_ID);
 }
 
+#[test]
+fn fixture_slash_and_chat_shapes() {
+    for (name, expect_cmd, expect_text) in [
+        ("slash_clear.json", Some(("clear", "")), "/clear"),
+        ("slash_tools.json", Some(("tools", "")), "/tools"),
+        ("slash_verbose.json", Some(("verbose", "")), "/verbose"),
+        ("chat_hello.json", None, "hello from QA offline fixture"),
+    ] {
+        let upd = UpdateInjector::parse_update_file(fixture(name)).unwrap();
+        let inj = injector();
+        assert_eq!(inj.route(&upd), HandlerRoute::Message, "{name}");
+        let incoming = inj.extract_incoming(&upd).unwrap();
+        assert_eq!(incoming.text, expect_text, "{name}");
+        match expect_cmd {
+            Some((c, a)) => assert_eq!(incoming.command, Some((c.into(), a.into())), "{name}"),
+            None => assert!(incoming.command.is_none(), "{name}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn mock_bot_api_outbound_send_assert() {
     let api = MockTelegramApi::start().await;
@@ -221,5 +435,114 @@ async fn mock_bot_api_outbound_send_assert() {
                 .is_some_and(|t| t.contains("going offline"))
         }),
         "expected shutdown sendMessage; got {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn drive_handle_message_slash_start() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    let upd = UpdateInjector::parse_update_file(fixture("text_message.json")).unwrap();
+    let route = injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive /start");
+    assert_eq!(route, HandlerRoute::Message);
+
+    let texts = h.api.send_message_texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("AI assistant") || t.contains("Commands")),
+        "expected /start help outbound; got {texts:?}"
+    );
+    // Slash commands must not hit the fixture LLM.
+    assert!(
+        texts.iter().all(|t| !t.contains(STUB_REPLY)),
+        "stub LLM must not run for /start; got {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn drive_handle_message_slash_clear() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    let upd = UpdateInjector::parse_update_file(fixture("slash_clear.json")).unwrap();
+    let route = injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive /clear");
+    assert_eq!(route, HandlerRoute::Message);
+    let texts = h.api.send_message_texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("archived") || t.contains("Conversation")),
+        "expected /clear confirm; got {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn drive_handle_message_slash_tools() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    let upd = UpdateInjector::parse_update_file(fixture("slash_tools.json")).unwrap();
+    let route = injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive /tools");
+    assert_eq!(route, HandlerRoute::Message);
+    let texts = h.api.send_message_texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("Built-in tools") || t.contains("tools")),
+        "expected /tools listing; got {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn drive_handle_message_chat_with_fixture_llm() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    let upd = UpdateInjector::parse_update_file(fixture("chat_hello.json")).unwrap();
+    let route = injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive chat_hello");
+    assert_eq!(route, HandlerRoute::Message);
+
+    let texts = h.api.send_message_texts().await;
+    assert!(
+        texts.iter().any(|t| t.contains(STUB_REPLY)),
+        "expected fixture LLM reply in outbound SendMessage; got {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn drive_handle_message_rejects_off_allowlist_without_bot_calls() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    let upd = UpdateInjector::parse_update_file(fixture("text_message_rejected.json")).unwrap();
+    let route = injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive rejected");
+    assert_eq!(route, HandlerRoute::RejectedAllowlist);
+    let texts = h.api.send_message_texts().await;
+    assert!(
+        texts.is_empty(),
+        "rejected update must not call SendMessage; got {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn drive_handle_message_skips_callback_without_bot_calls() {
+    let h = HandleMessageHarness::new(STUB_REPLY).await;
+    let upd = UpdateInjector::parse_update_file(fixture("callback_model.json")).unwrap();
+    let route = injector()
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .expect("drive callback");
+    assert_eq!(route, HandlerRoute::ModelCallback);
+    let texts = h.api.send_message_texts().await;
+    assert!(
+        texts.is_empty(),
+        "drive_handle_message must not run callbacks; got {texts:?}"
     );
 }

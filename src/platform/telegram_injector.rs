@@ -1,7 +1,11 @@
-//! In-process Telegram **Update injector** for QA (no live Bot API / no Desktop).
+//! In-process Telegram **Update injector** for QA (no live Bot API / Desktop /
+//! OpenRouter).
 //!
 //! Feed recorded or synthetic Bot API `Update` JSON into the same allowlist +
 //! kind-routing path the live dispatcher uses in [`super::telegram::run`].
+//! [`UpdateInjector::drive_handle_message`] runs the real
+//! [`super::telegram::handle_message`] with a mock Bot; pair with
+//! [`FixtureLlm`] so chat turns need no live OpenRouter.
 //! Optional outbound asserts go through a wiremock `api.telegram.org` stand-in
 //! (see `docs/telegram-update-injector.md` and `tests/telegram_update_injector.rs`).
 
@@ -10,6 +14,15 @@ use serde_json::Value;
 use teloxide::types::{CallbackQuery, Message, Update, UpdateKind, User};
 
 use crate::platform::{normalize_bot_id, user_on_allowlist, DEFAULT_BOT_ID};
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use teloxide::Bot;
+
+use crate::agent::Agent;
+use crate::llm::{ChatCompletion, ChatMessage, MessageContent, ToolDefinition};
+use crate::provider::{Provider, ProviderConfig};
 
 /// Which dispatcher branch an Update would hit (after allowlist).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +291,134 @@ fn classify_message(msg: &Message) -> InjectedKind {
         InjectedKind::TextMessage
     } else {
         InjectedKind::Other
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Offline handle_message driver + stub/fixture LLM
+// ---------------------------------------------------------------------------
+
+/// Deterministic offline LLM for CI/QA — no OpenRouter / network.
+///
+/// Returns a fixed assistant reply (no tool calls) so `Agent::process_message`
+/// completes in one turn. Used with [`UpdateInjector::drive_handle_message`].
+pub struct FixtureLlm {
+    config: ProviderConfig,
+    reply: String,
+}
+
+impl FixtureLlm {
+    /// Build a fixture provider named `fixture` with model `stub`.
+    pub fn new(reply: impl Into<String>) -> Self {
+        Self {
+            config: ProviderConfig {
+                name: "fixture".into(),
+                provider_type: crate::config::ProviderType::OpenRouter,
+                base_url: "http://fixture.invalid/v1".into(),
+                api_key: None,
+                default_model: "stub".into(),
+                supports_vision: false,
+                max_tokens: 256,
+                discover_models: false,
+                context_window: 4096,
+                context_window_cache: Arc::new(tokio::sync::RwLock::new(None)),
+                parse_retry_limit: 0,
+                rate_limit_retry_limit: 0,
+            },
+            reply: reply.into(),
+        }
+    }
+
+    pub fn reply(&self) -> &str {
+        &self.reply
+    }
+
+    /// Wrap as a one-entry [`crate::provider::ProviderRegistry`] (default = `fixture`).
+    pub fn into_registry(self) -> crate::provider::ProviderRegistry {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("fixture".to_string(), Arc::new(self) as Arc<dyn Provider>);
+        crate::provider::ProviderRegistry::new(providers, "fixture".into())
+    }
+}
+
+#[async_trait]
+impl Provider for FixtureLlm {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+    fn default_model(&self) -> &str {
+        &self.config.default_model
+    }
+    fn supports_vision(&self) -> bool {
+        self.config.supports_vision
+    }
+    fn config(&self) -> &ProviderConfig {
+        &self.config
+    }
+
+    async fn chat_completion(
+        &self,
+        _client: &reqwest::Client,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+        model: &str,
+        _max_tokens: u32,
+    ) -> anyhow::Result<ChatCompletion> {
+        Ok(ChatCompletion {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::from_text(self.reply.clone())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            finish_reason: Some("stop".into()),
+            model: model.to_string(),
+        })
+    }
+
+    async fn list_models(&self, _client: &reqwest::Client) -> anyhow::Result<Vec<String>> {
+        Ok(vec![self.config.default_model.clone()])
+    }
+}
+
+impl UpdateInjector {
+    /// Extract the teloxide [`Message`] when this update is a message kind.
+    pub fn message_from_update(update: &Update) -> Option<&Message> {
+        match &update.kind {
+            UpdateKind::Message(m)
+            | UpdateKind::EditedMessage(m)
+            | UpdateKind::ChannelPost(m)
+            | UpdateKind::EditedChannelPost(m)
+            | UpdateKind::BusinessMessage(m)
+            | UpdateKind::EditedBusinessMessage(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Drive an Update through the real [`super::telegram::handle_message`] path
+    /// when allowlist + message route accept it.
+    ///
+    /// Non-message / rejected routes return the route without calling the handler
+    /// (same as the live dispatcher drop). Bot API calls go to whatever URL the
+    /// `Bot` is pointed at (use wiremock in tests). Pair with [`FixtureLlm`] so
+    /// chat turns need no live OpenRouter.
+    pub async fn drive_handle_message(
+        &self,
+        update: &Update,
+        bot: Bot,
+        agent: Arc<Agent>,
+    ) -> Result<HandlerRoute> {
+        let route = self.route(update);
+        if route != HandlerRoute::Message {
+            return Ok(route);
+        }
+        let msg = Self::message_from_update(update)
+            .cloned()
+            .context("message route but Update has no Message")?;
+        super::telegram::handle_message(bot, msg, agent, self.bot_id.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("handle_message failed: {e}"))?;
+        Ok(HandlerRoute::Message)
     }
 }
 
