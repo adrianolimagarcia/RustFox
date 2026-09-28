@@ -37,6 +37,9 @@ import type {
   TaskUpdateBody,
   TaskUpdateResult,
   Thread,
+  SecretClaimMeta,
+  SecretClaimResult,
+  PendingSecret,
 } from './types'
 
 /**
@@ -237,6 +240,30 @@ export const api = {
     request<TaskEnableResult>(`/tasks/${encodeURIComponent(id)}/enable`, { method: 'POST' }),
   disableTask: (id: string) =>
     request<TaskToggleResult>(`/tasks/${encodeURIComponent(id)}/disable`, { method: 'POST' }),
+
+  // ── secrets (Slice 2) ───────────────────────────────────────────────────
+  getSecretClaim: (token: string) =>
+    get<SecretClaimMeta>(`/secrets/claim/${encodeURIComponent(token)}`),
+  submitSecretClaim: (token: string, value: string) =>
+    request<SecretClaimResult>(`/secrets/claim/${encodeURIComponent(token)}`, {
+      method: 'POST',
+      body: JSON.stringify({ value }),
+    }),
+  cancelSecretClaim: (token: string) =>
+    request<{ cancelled: boolean }>(
+      `/secrets/claim/${encodeURIComponent(token)}/cancel`,
+      { method: 'POST' },
+    ),
+  listPendingSecrets: () => get<PendingSecret[]>('/secrets/pending'),
+  createPendingSecret: (name: string) =>
+    request<{
+      id: string
+      name: string
+      expiresAt: number
+      claimUrl: string
+      claimToken: string
+    }>('/secrets/pending', { method: 'POST', body: JSON.stringify({ name }) }),
 }
+
 
 export type Api = typeof api

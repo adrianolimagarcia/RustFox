@@ -49,7 +49,7 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 > Persistent home: All paths resolve relative to `~/.rustfox` by default.
 > Override with `RUSTFOX_HOME` env or `[general].home`.
 > See [docs/persistent-home-directory.md](persistent-home-directory.md).
-> **Secrets:** RustFox prefers the OS keyring (macOS Keychain / Windows Credential Manager / Linux keyutils); if unavailable, secrets fall back to an encrypted file under `~/.rustfox/secrets/`.
+> **Secrets:** Prefer the OS keyring (macOS Keychain / Windows Credential Manager / Linux keyutils). If unavailable, RustFox uses an AES-GCM vault at `~/.rustfox/secrets/vault` whose master key is a **plaintext file** `~/.rustfox/secrets/vault.key` (mode `0600`). Anyone who can read `vault.key` can decrypt the vault — treat home-directory permissions as the trust boundary and prefer the OS keyring when available. Pending secret entry uses the portal masked form + Telegram notify/link (never paste values in chat).
 
 ---
 

@@ -178,3 +178,27 @@ The `system` entry resolves to `[openrouter] system_prompt_file` (lazily, relati
 ## Static hosting
 - `GET /` → SPA `index.html` (embedded); unknown non-`/api` paths → same `index.html` (client-side routing); `/assets/*` hashed files with long cache.
 - When built without `web/dist` present, only `/api/*` is served and startup logs `WARN portal: no embedded frontend`.
+
+## Secrets (secure-store Slice 2)
+
+Pending secret claims for the portal masked form. Claim routes use the opaque one-shot token as the credential (Telegram magic link); create/list require portal auth.
+
+### POST /api/secrets/pending (auth)
+Request `{"name":"OPENROUTER_API_KEY"}` → `200 {"id","name","expiresAt","claimUrl","claimToken"}`. `claimToken` is returned **once** to the authenticated client for link construction — never put the raw token in Telegram message *text* (URL path may carry the opaque id). Invalid name → `400 invalid_secret_name`.
+
+### GET /api/secrets/pending (auth)
+→ `200 [{"id","name","expiresAt"}]` (no tokens).
+
+### DELETE /api/secrets/pending/{id} (auth)
+→ `200 {"cancelled":true}` or `404`.
+
+### GET /api/secrets/claim/{token} (public)
+→ `200 {"id","name","expiresAt","status":"pending"}`. Expired / unknown → `404`. Never returns a secret value.
+
+### POST /api/secrets/claim/{token} (public)
+Request `{"value":"..."}` → writes via `SecretStore::set`, consumes the one-shot token → `200 {"ok":true,"name","stored":true}`. Empty value → `400 empty_value`. Expired / unknown / already used → `404`.
+
+### POST /api/secrets/claim/{token}/cancel (public)
+→ `200 {"cancelled":true}` or `404`. Clears the pending claim without storing a value.
+
+SPA route: `/secrets/claim/$token` — masked password form (no portal login required).

@@ -147,6 +147,26 @@ export function fakeApi(over: Partial<Api> = {}): Api {
       nextRun: '2026-09-26T12:00:00+08:00',
     }),
     deleteTask: async (id) => ({ ok: true, id, softDeleted: true, historyPreserved: true }),
+    getSecretClaim: async (_token: string) => ({
+      id: 'pend-1',
+      name: 'DEMO_SECRET',
+      expiresAt: Math.floor(Date.now() / 1000) + 900,
+      status: 'pending',
+    }),
+    submitSecretClaim: async (_token: string, _value: string) => ({
+      ok: true,
+      name: 'DEMO_SECRET',
+      stored: true,
+    }),
+    cancelSecretClaim: async () => ({ cancelled: true }),
+    listPendingSecrets: async () => [],
+    createPendingSecret: async (name: string) => ({
+      id: 'pend-1',
+      name,
+      expiresAt: Math.floor(Date.now() / 1000) + 900,
+      claimUrl: `http://127.0.0.1:8090/secrets/claim/fake-token`,
+      claimToken: 'fake-token',
+    }),
     ...over,
   }
 }
