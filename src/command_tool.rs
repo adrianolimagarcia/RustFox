@@ -87,11 +87,34 @@ impl ToolHandler for CommandTool {
 }
 
 impl CommandTool {
+    /// Resolve `[sandbox].secret_env` via SecretBridge for child-process inject.
+    /// On missing secret returns a safe name-only error string (pending+notify
+    /// already fired inside `env_for_names` / `require`).
+    fn resolve_spawn_secret_env(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let Some(ref bridge) = self.secret_bridge else {
+            return Ok(std::collections::HashMap::new());
+        };
+        if self.secret_env_names.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        bridge
+            .env_for_names(&self.secret_env_names)
+            .map_err(|e| e.to_string())
+    }
+
     async fn exec_command(&self, arguments: &Value, ctx: &ToolContext) -> ToolResult {
         let command = arguments["command"]
             .as_str()
             .context("Missing 'command' argument")?;
         let cmd_id = format!("cmd_{}", uuid::Uuid::new_v4());
+
+        // Slice 3: inject required secrets into child env only (never log values).
+        let secret_env = match self.resolve_spawn_secret_env() {
+            Ok(map) => map,
+            Err(safe_msg) => return Ok(safe_msg),
+        };
 
         let mut cmd = TokioCommand::new(if cfg!(windows) { "cmd" } else { "sh" });
         cmd.arg(if cfg!(windows) { "/C" } else { "-c" })
@@ -99,6 +122,9 @@ impl CommandTool {
             .current_dir(&self.sandbox_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for (k, v) in &secret_env {
+            cmd.env(k, v);
+        }
         #[cfg(unix)]
         cmd.process_group(0);
         let mut child = cmd.spawn()?;
@@ -302,5 +328,165 @@ impl CommandTool {
             result
         };
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancel_registry::CancelRegistry;
+    use crate::platform::sender::{MessageFormat, PlatformMessageId, PlatformSender};
+    use crate::secret_store::{FakeSecretStore, PendingSecretRegistry, SecretBridge};
+    use crate::tool_registry::ToolUiMode;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    struct NopSender;
+
+    #[async_trait]
+    impl PlatformSender for NopSender {
+        async fn send_message(
+            &self,
+            _chat_id: &str,
+            _text: &str,
+            _format: MessageFormat,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn send_file(
+            &self,
+            _chat_id: &str,
+            _path: &Path,
+            _caption: Option<&str>,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn show_cancel_button(
+            &self,
+            _chat_id: &str,
+            _text: &str,
+            _cancel_id: &str,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &PlatformMessageId,
+            _text: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &PlatformMessageId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn notify_shutdown(&self, _chat_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ctx(sandbox: &Path) -> ToolContext {
+        ToolContext {
+            sandbox_dir: sandbox.to_path_buf(),
+            home_dir: None,
+            sender: Arc::new(NopSender),
+            cancel_registry: Arc::new(CancelRegistry::new()),
+            user_id: "u".into(),
+            chat_id: "1".into(),
+            tool_ui_mode: ToolUiMode::Silent,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_injects_secret_env_into_child() {
+        let dir = tempdir().unwrap();
+        let store = FakeSecretStore::with_secrets([("MY_SECRET", "inject-me-VALUE-zz9")]).unwrap();
+        let pending = Arc::new(PendingSecretRegistry::default());
+        let bridge = Arc::new(SecretBridge::new(Arc::new(store), pending));
+        let tool = CommandTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(CancelRegistry::new()),
+            Arc::new(NopSender),
+        )
+        .with_secrets(bridge.clone(), vec!["MY_SECRET".into()]);
+
+        // Write env value to a file so we can assert injection even after result redaction.
+        let result = tool
+            .execute(
+                "execute_command",
+                json!({ "command": "printf \'%s\' \"$MY_SECRET\" > secret_out.txt" }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(dir.path().join("secret_out.txt")).unwrap();
+        assert_eq!(written, "inject-me-VALUE-zz9");
+        // Tool result / echoes must not leak the raw value.
+        assert!(
+            !result.contains("inject-me-VALUE-zz9"),
+            "result leaked secret: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_missing_secret_safe_error_and_notify() {
+        let dir = tempdir().unwrap();
+        let store = FakeSecretStore::new();
+        let pending = Arc::new(PendingSecretRegistry::default());
+        let bridge = Arc::new(SecretBridge::new(Arc::new(store), Arc::clone(&pending)));
+        let notifies = Arc::new(AtomicUsize::new(0));
+        let names = Arc::new(Mutex::new(Vec::<String>::new()));
+        let n2 = Arc::clone(&notifies);
+        let names2 = Arc::clone(&names);
+        bridge.set_notify(Arc::new(move |name, url| {
+            n2.fetch_add(1, Ordering::SeqCst);
+            names2.lock().unwrap().push(format!("{name}|{url}"));
+        }));
+
+        let tool = CommandTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(CancelRegistry::new()),
+            Arc::new(NopSender),
+        )
+        .with_secrets(bridge, vec!["MISSING_KEY".into()]);
+
+        let result = tool
+            .execute(
+                "execute_command",
+                json!({ "command": "echo should-not-run" }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("MISSING_KEY"),
+            "safe error should name the secret: {result}"
+        );
+        assert!(
+            !result.to_lowercase().contains("sk-") && !result.contains("VALUE"),
+            "error must not leak a secret value: {result}"
+        );
+        assert_eq!(notifies.load(Ordering::SeqCst), 1);
+        assert!(!pending.list().is_empty());
+        assert!(!dir.path().join("should-not-run").exists());
+    }
+
+    #[test]
+    fn resolve_spawn_secret_env_empty_when_no_bridge() {
+        let tool = CommandTool::new(
+            PathBuf::from("."),
+            Arc::new(CancelRegistry::new()),
+            Arc::new(NopSender),
+        );
+        let map = tool.resolve_spawn_secret_env().unwrap();
+        assert!(map.is_empty());
     }
 }
