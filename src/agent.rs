@@ -159,6 +159,9 @@ pub struct Agent {
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<LoopCallbackChoice>>,
         >,
     >,
+    /// Optional supervisor for session-scoped cancel of in-flight CLI jobs.
+    /// Attached after construction (ReasoningBackend needs the Agent Arc first).
+    pub supervisor: Arc<tokio::sync::RwLock<Option<Arc<crate::supervisor::Supervisor>>>>,
 }
 
 /// A task parsed from the spawn_agents tool arguments, after validation.
@@ -320,7 +323,14 @@ impl Agent {
             pending_loop_callbacks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            supervisor: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    /// Attach the process-wide [`Supervisor`] so `/stop`, `cancel_cmd:`, and
+    /// portal cancel can reach [`Supervisor::cancel_for_session`].
+    pub async fn attach_supervisor(&self, supervisor: Arc<crate::supervisor::Supervisor>) {
+        *self.supervisor.write().await = Some(supervisor);
     }
 
     /// Build the system prompt for a bot identity, incorporating loaded skills
@@ -593,16 +603,41 @@ impl Agent {
         token
     }
 
-    /// Cancel processing for a bot+user session. Returns true if there was an active token.
+    /// Cancel in-flight supervisor tasks for `{bot_id}:{user_id}`.
+    /// Returns how many tasks were cancelled (0 if no supervisor attached).
+    pub async fn cancel_supervisor_session(&self, bot_id: &str, user_id: &str) -> usize {
+        let key = session_key(bot_id, user_id);
+        let guard = self.supervisor.read().await;
+        let Some(sup) = guard.as_ref() else {
+            return 0;
+        };
+        match sup.cancel_for_session(&key).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, session = %key, "supervisor cancel_for_session failed");
+                0
+            }
+        }
+    }
+
+    /// Cancel processing for a bot+user session.
+    ///
+    /// Cancels the agent-loop [`CancellationToken`] (if any) **and** any
+    /// cancellable supervisor tasks for the same session key. Returns true if
+    /// either the loop token or at least one supervisor task was cancelled.
     pub async fn cancel_processing(&self, bot_id: &str, user_id: &str) -> bool {
         let key = session_key(bot_id, user_id);
-        let mut map = self.cancel_token_registry.lock().await;
-        if let Some(token) = map.remove(&key) {
-            token.cancel();
-            true
-        } else {
-            false
-        }
+        let loop_cancelled = {
+            let mut map = self.cancel_token_registry.lock().await;
+            if let Some(token) = map.remove(&key) {
+                token.cancel();
+                true
+            } else {
+                false
+            }
+        };
+        let sup_n = self.cancel_supervisor_session(bot_id, user_id).await;
+        loop_cancelled || sup_n > 0
     }
 
     /// Check if a bot+user session has active processing.

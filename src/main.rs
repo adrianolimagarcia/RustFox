@@ -748,13 +748,14 @@ async fn main() -> Result<()> {
         ),
     ));
 
-    let _supervisor = Arc::new(rustfox::supervisor::Supervisor::new(
+    let supervisor = Arc::new(rustfox::supervisor::Supervisor::new(
         config.supervisor.artifacts_dir.clone(),
         memory.connection(),
         sup_registry,
         config.supervisor.risk.clone(),
     ));
-    match _supervisor.resumable_task_ids().await {
+    agent.attach_supervisor(Arc::clone(&supervisor)).await;
+    match supervisor.resumable_task_ids().await {
         Ok(ids) if !ids.is_empty() => info!(
             "  Supervisor: {} resumable task(s) found at startup",
             ids.len()

@@ -171,8 +171,9 @@ pub async fn send(
 }
 
 /// POST /api/chat/cancel — cancel the active generation via the agent's own
-/// cancellation registry (same mechanism as Telegram /stop). Cancellation
-/// takes effect at the next tool boundary inside the agent loop.
+/// cancellation registry (same mechanism as Telegram /stop) and any in-flight
+/// supervisor tasks for session `default:{user_name}`. Agent-loop cancel takes
+/// effect at the next tool boundary; supervisor cancel reaches `Backend::cancel`.
 pub async fn cancel(State(state): State<PortalState>) -> Json<serde_json::Value> {
     let cancelled = state
         .agent

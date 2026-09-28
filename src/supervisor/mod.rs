@@ -377,6 +377,22 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Cancel every cancellable task for a session (`{bot_id}:{user_id}`).
+    ///
+    /// Looks up `sup_tasks.user_id = session_key`, then calls [`Self::cancel`]
+    /// for each. Returns how many tasks were cancelled. Unknown / empty
+    /// sessions are a successful no-op (0).
+    pub async fn cancel_for_session(&self, session_key: &str) -> anyhow::Result<usize> {
+        let ids = self
+            .store
+            .list_cancellable_ids_for_session(session_key)
+            .await?;
+        for id in &ids {
+            self.cancel(id).await?;
+        }
+        Ok(ids.len())
+    }
+
     /// IDs of tasks that look resumable on startup (paused or mid-pipeline).
     pub async fn resumable_task_ids(&self) -> anyhow::Result<Vec<String>> {
         self.store.list_resumable_task_ids().await
@@ -395,6 +411,9 @@ impl Supervisor {
         &self.artifacts
     }
 
+    /// Submit a new task. `user_id` must be the session key
+    /// `{bot_id}:{user_id}` (see [`crate::agent::session_key`]); portal uses
+    /// bot id `default`.
     pub async fn submit(
         &self,
         platform: &str,
@@ -612,5 +631,58 @@ mod tests {
         sup.cancel(&task.id).await.unwrap();
         assert!(cancelled.lock().unwrap().is_empty());
         assert_eq!(sup.state(&task.id).await.unwrap(), TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_for_session_cancels_matching_session_key_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        sup.registry.register(Arc::new(RecordingCancelBackend {
+            cancelled: Arc::clone(&cancelled),
+        }));
+
+        let key_a = crate::agent::session_key("main", "42");
+        let key_b = crate::agent::session_key("main", "99");
+
+        let task_a = crate::supervisor::task::Task::new("A", "for a");
+        let task_b = crate::supervisor::task::Task::new("B", "for b");
+        sup.store
+            .create(&task_a, "telegram", &key_a, Some("c"))
+            .await
+            .unwrap();
+        sup.store
+            .create(&task_b, "telegram", &key_b, None)
+            .await
+            .unwrap();
+
+        let mut job_a = Job::new(&task_a.id, JobType::ExecutorJob, "recording_cancel", "g");
+        let job_a_id = job_a.id.clone();
+        job_a.status = JobStatus::Pending;
+        sup.store.create_job(&job_a).await.unwrap();
+
+        let mut job_b = Job::new(&task_b.id, JobType::ExecutorJob, "recording_cancel", "g");
+        job_b.status = JobStatus::Pending;
+        sup.store.create_job(&job_b).await.unwrap();
+
+        let n = sup.cancel_for_session(&key_a).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(*cancelled.lock().unwrap(), vec![job_a_id]);
+        assert_eq!(sup.state(&task_a.id).await.unwrap(), TaskStatus::Cancelled);
+        assert_ne!(sup.state(&task_b.id).await.unwrap(), TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancel_for_session_empty_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+        let n = sup
+            .cancel_for_session(&crate::agent::session_key("default", "nobody"))
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

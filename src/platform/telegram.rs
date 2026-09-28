@@ -2170,6 +2170,7 @@ async fn handle_model_callback(
     bot: Bot,
     q: CallbackQuery,
     agent: Arc<Agent>,
+    bot_id: String,
 ) -> ResponseResult<()> {
     let callback_id = q.id.clone();
     let data = match q.data {
@@ -2236,9 +2237,14 @@ async fn handle_model_callback(
         return Ok(());
     }
 
-    // Handle command cancellation via CancelRegistry
+    // Handle command cancellation via CancelRegistry + supervisor session cancel.
+    // execute_command uses CancelRegistry; supervisor CLI jobs are reached via
+    // Supervisor::cancel_for_session({bot_id}:{user_id}).
     if let Some(cmd_id) = data.strip_prefix("cancel_cmd:") {
-        let text = if agent.cancel_registry.cancel(cmd_id).await {
+        let user_id = q.from.id.to_string();
+        let cmd_cancelled = agent.cancel_registry.cancel(cmd_id).await;
+        let sup_n = agent.cancel_supervisor_session(&bot_id, &user_id).await;
+        let text = if cmd_cancelled || sup_n > 0 {
             "⛔ Command cancelled"
         } else {
             "Command already finished"
