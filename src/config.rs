@@ -291,6 +291,10 @@ pub struct SandboxConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct McpServerConfig {
     pub name: String,
+    /// When `false`, the server is skipped at connect time (Telegram `/config`
+    /// can toggle `mcp.<name>.enabled`). Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Command to run for stdio-based MCP servers (e.g. "uvx", "npx").
     /// Required for stdio servers; omit for HTTP servers.
     #[serde(default)]

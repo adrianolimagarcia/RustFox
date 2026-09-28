@@ -376,6 +376,14 @@ impl McpManager {
     /// Connect to all configured MCP servers, logging errors but not failing
     pub async fn connect_all(&mut self, configs: &[McpServerConfig]) {
         for config in configs {
+            if !config.enabled {
+                tracing::info!(
+                    "Skipping disabled MCP server '{}' (mcp.{}.enabled = false)",
+                    config.name,
+                    config.name
+                );
+                continue;
+            }
             if let Err(e) = self.connect(config).await {
                 error!("Failed to connect to MCP server '{}': {:#}", config.name, e);
             }
@@ -496,6 +504,7 @@ mod tests {
     fn base_config() -> McpServerConfig {
         McpServerConfig {
             name: "test".to_string(),
+            enabled: true,
             command: None,
             args: vec![],
             env: HashMap::new(),

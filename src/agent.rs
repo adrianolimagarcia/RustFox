@@ -442,8 +442,43 @@ impl Agent {
         }
     }
 
-    /// Change the active model and persist to config.toml.
+    /// Change the active model and persist to config.toml via the shared
+    /// validate → `.bak` → atomic write → restore-on-fail path
+    /// ([`crate::config_edit::persist_model_edit`]).
     pub async fn set_model(&self, model_id: &str) -> anyhow::Result<()> {
+        let (provider_name, actual_model) = self.validate_model_id(model_id)?;
+
+        // Disk write on blocking thread — same sync bak helpers as `/config set`.
+        let path = self.config_path.clone();
+        let provider_name_owned = provider_name.clone();
+        let actual_owned = actual_model.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::config_edit::persist_model_edit(&path, &provider_name_owned, &actual_owned)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("set_model persist task join error: {e}"))??;
+
+        self.apply_model_in_memory(model_id).await;
+        tracing::info!(model = %model_id, provider = %provider_name, "Model changed and persisted");
+        Ok(())
+    }
+
+    /// Apply a model id live in memory only (no disk write).
+    ///
+    /// Used after `/config set openrouter.model` already wrote `config.toml`
+    /// through the bak path, so we do not perform a second (redundant) write.
+    pub async fn set_model_live(&self, model_id: &str) -> anyhow::Result<()> {
+        let (provider_name, _) = self.validate_model_id(model_id)?;
+        self.apply_model_in_memory(model_id).await;
+        tracing::info!(
+            model = %model_id,
+            provider = %provider_name,
+            "Model changed live (memory only; disk already updated)"
+        );
+        Ok(())
+    }
+
+    fn validate_model_id<'a>(&'a self, model_id: &'a str) -> anyhow::Result<(String, &'a str)> {
         if model_id.is_empty() {
             anyhow::bail!("Model ID cannot be empty");
         }
@@ -453,8 +488,7 @@ impl Agent {
         if let Some((prefix, _)) = model_id.split_once('/') {
             if self.registry.get_provider(prefix).is_none() {
                 tracing::warn!(
-                    "Model '{}': prefix '{}' does not match any known provider \
-                     (falling through to default '{}')",
+                    "Model '{}': prefix '{}' does not match any known provider                      (falling through to default '{}')",
                     model_id,
                     prefix,
                     self.registry.default_provider_name()
@@ -462,45 +496,12 @@ impl Agent {
             }
         }
 
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
-        let mut doc: toml::value::Table = toml::from_str(&content)?;
+        Ok((provider.name().to_string(), actual_model))
+    }
 
-        let provider_name = provider.name().to_string();
-
-        // Try explicit [[provider]] array first
-        let mut found_in_array = false;
-        if let Some(provider_array) = doc.get_mut("provider").and_then(|v| v.as_array_mut()) {
-            for entry in provider_array.iter_mut() {
-                if let Some(table) = entry.as_table_mut() {
-                    if table.get("name").and_then(|v| v.as_str()) == Some(&provider_name) {
-                        table.insert(
-                            "model".to_string(),
-                            toml::Value::String(actual_model.to_string()),
-                        );
-                        found_in_array = true;
-                    }
-                }
-            }
-        }
-
-        // Fall back to legacy [openrouter] section if not found in [[provider]] array
-        if !found_in_array && provider_name == "openrouter" && doc.contains_key("openrouter") {
-            if let Some(table) = doc.get_mut("openrouter").and_then(|v| v.as_table_mut()) {
-                table.insert(
-                    "model".to_string(),
-                    toml::Value::String(actual_model.to_string()),
-                );
-            }
-        }
-
-        let new_content = toml::to_string_pretty(&doc)?;
-        tokio::fs::write(&self.config_path, &new_content).await?;
-
+    async fn apply_model_in_memory(&self, model_id: &str) {
         let mut current = self.current_model.write().await;
         *current = model_id.to_string();
-
-        tracing::info!(model = %model_id, provider = %provider_name, "Model changed and persisted");
-        Ok(())
     }
 
     /// Register a CancellationToken for `(bot_id, user_id)` before processing starts.

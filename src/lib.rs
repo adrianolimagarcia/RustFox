@@ -6,6 +6,7 @@ pub mod builtin_tools;
 pub mod cancel_registry;
 pub mod command_tool;
 pub mod config;
+pub mod config_edit;
 pub mod conversation;
 pub mod file_processor;
 pub mod home;

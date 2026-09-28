@@ -165,6 +165,7 @@ Be concise and helpful."""
 # Example: Git MCP server (requires uvx/npx)
 # [[mcp_servers]]
 # name = "git"
+# enabled = true                   # Telegram `/config set mcp.git.enabled false` to skip at connect
 # command = "uvx"
 # args = ["mcp-server-git"]
 
