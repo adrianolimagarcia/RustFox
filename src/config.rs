@@ -915,9 +915,8 @@ impl Config {
     /// 4. Refresh `telegram` from the shim bot so existing `config.telegram`
     ///    readers keep working. Prefer `id = "main"`, then `"default"`, else
     ///    the first entry (slice 1 only; slice 2 stops relying on single telegram).
-    /// 5. Empty `allowed_user_ids` is soft/warn on this parse-only slice; any
-    ///    bot (including legacy synthesize) must hard-fail at load/startup
-    ///    before or with the first multi-dispatcher (slice 2).
+    /// 5. Empty `allowed_user_ids` is a hard error for every bot (including
+    ///    legacy synthesize) — merge gate for multi-dispatcher (design §7.2).
     pub fn normalize_bots(&mut self) -> Result<()> {
         let legacy_present = !self.telegram.bot_token.trim().is_empty();
 
@@ -957,8 +956,10 @@ impl Config {
         );
     }
 
-    /// Pick the bot that backs legacy `config.telegram` for slice 1.
-    fn shim_bot(bots: &[BotConfig]) -> &BotConfig {
+    /// Pick the primary/shim bot for legacy `config.telegram`, Agent
+    /// scheduled sender, and TelegramAdapter (prefer `main`, then `default`,
+    /// else first). Used by multi-dispatcher startup in `main`.
+    pub fn shim_bot(bots: &[BotConfig]) -> &BotConfig {
         bots.iter()
             .find(|b| b.id.trim() == "main")
             .or_else(|| bots.iter().find(|b| b.id.trim() == "default"))
@@ -987,6 +988,11 @@ impl Config {
             }
             if !seen_tokens.insert(token.to_string()) {
                 anyhow::bail!("duplicate bots[].bot_token (bots[{i}])");
+            }
+            if bot.allowed_user_ids.is_empty() {
+                anyhow::bail!(
+                    "bots[{i}] (id=\"{id}\") must have a non-empty allowed_user_ids — empty allowlist is a hard error at config load"
+                );
             }
         }
         Ok(())
@@ -2072,5 +2078,69 @@ mod tests {
         assert_eq!(cfg.bots[0].id, "main");
         assert_eq!(cfg.telegram.bot_token, "tok-main");
         assert_eq!(cfg.telegram.allowed_user_ids, vec![5]);
+    }
+
+    #[test]
+    fn reject_empty_allowed_user_ids_on_bots() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-r"
+            allowed_user_ids = []
+            persona = "researcher"
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.normalize_bots().unwrap_err().to_string();
+        assert!(
+            err.contains("allowed_user_ids") && err.contains("researcher"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_empty_allowed_user_ids_on_legacy_telegram() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [telegram]
+            bot_token = "tok"
+            allowed_user_ids = []
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.normalize_bots().unwrap_err().to_string();
+        assert!(
+            err.contains("allowed_user_ids") && err.contains("default"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_empty_allowed_user_ids_still_ok() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "tok-a"
+            allowed_user_ids = [1]
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-b"
+            allowed_user_ids = [1, 2]
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        cfg.normalize_bots()
+            .expect("non-empty allowlists must pass");
+        assert_eq!(cfg.bots.len(), 2);
+        assert_eq!(cfg.bots[0].allowed_user_ids, vec![1]);
+        assert_eq!(cfg.bots[1].allowed_user_ids, vec![1, 2]);
     }
 }

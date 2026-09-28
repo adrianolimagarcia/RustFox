@@ -7,12 +7,14 @@ bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 # Find your user ID by messaging @userinfobot on Telegram
 allowed_user_ids = [123456789]
 
-# ── Multi-bot (optional, future) ───────────────────────────────────────
+# ── Multi-bot (optional) ───────────────────────────────────────────────
 # Prefer a single [telegram] section for one-bot installs (backward compatible).
 # When ready for N bots in one process, use [[bots]] instead — see design
 # multi-bot agent binding. If [[bots]] is non-empty it wins; [telegram] is
 # then treated as a deprecated migration alias (warned, not double-applied).
 # Legacy [telegram] alone still synthesizes one bot { id = "default", persona = "main" }.
+# Empty allowed_user_ids on any bot (including legacy synthesize) is a hard
+# error at config load — the bot will not start.
 #
 # [[bots]]
 # id = "main"
