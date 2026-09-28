@@ -717,6 +717,8 @@ const state = {
   // Additional bots collected via "Add another bot" (§7.7).
   // Each: { id, bot_token, allowed_user_id, persona }
   extra_bots: [],
+  // On-disk [[bots]] ids from load-config (full save appends only new ids).
+  existing_bot_ids: [],
   openrouter_key: '',
   model: 'moonshotai/kimi-k2.6',
   max_tokens: '4096',
@@ -1181,6 +1183,20 @@ async function saveConfig() {
   const btn = document.getElementById('btn-next');
   btn.disabled = true;
   try {
+    // Snapshot existing bot ids before save so we only append NEW bots.
+    // Server-side save-config merge-preserves untouched [[bots]] rows
+    // (tools/model/persona/allowlist) when they already exist.
+    const existingIds = new Set(state.existing_bot_ids || []);
+    try {
+      const lr = await fetch('/api/load-config');
+      if (lr.ok) {
+        const cfg = await lr.json();
+        for (const b of (cfg.bots || [])) {
+          if (b && b.id) existingIds.add(b.id);
+        }
+      }
+    } catch (_) { /* offline / first-run — treat as no existing bots */ }
+
     const res = await fetch('/api/save-config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1193,14 +1209,17 @@ async function saveConfig() {
       return;
     }
 
-    // Append each extra bot via validate → bak → atomic (materializes [telegram]
-    // into [[bots]] on the first multi-bot add).
+    // Append each *new* extra bot via validate → bak → atomic (materializes
+    // [telegram] into [[bots]] on the first multi-bot add). Skip ids that
+    // already exist so we never wipe/rebuild secondary customizations.
     const primaryUid = parseInt(String(state.allowed_user_ids).split(/[\s,]+/).filter(Boolean)[0] || '0', 10) || 0;
     for (const b of state.extra_bots) {
       if (!b.id || !b.bot_token) {
         alert('Extra bot needs both id and BotFather token — skipped incomplete rows.');
         continue;
       }
+      if (existingIds.has(b.id)) continue; // already on disk — preserve
+      if (b.bot_token === '***') continue; // redacted existing token — never re-bind
       const uid = parseInt(b.allowed_user_id || primaryUid, 10) || primaryUid;
       if (!uid) {
         alert('Extra bot `' + b.id + '` needs an allowed user id.');
@@ -1222,6 +1241,7 @@ async function saveConfig() {
         alert('Failed to add bot `' + b.id + '`: ' + (addData.error || 'unknown error'));
         return;
       }
+      existingIds.add(b.id);
     }
 
     showStep(TOTAL_STEPS);
@@ -1347,6 +1367,10 @@ async function loadExistingConfig() {
         });
       }
     }
+
+    // Remember on-disk bot ids so full save only appends NEW extras
+    // (server merge-preserves existing [[bots]] customizations).
+    state.existing_bot_ids = (cfg.bots || []).map(b => b.id).filter(Boolean);
 
     state._loaded = true;
 

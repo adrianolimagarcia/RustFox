@@ -10,6 +10,7 @@ use rustfox::peer_invoke::{
     format_via_attribution, guard_peer_invoke, resolve_invoke_source, InvokeSource, MAX_PEER_DEPTH,
 };
 use rustfox::platform::{normalize_bot_id, user_on_allowlist, DEFAULT_BOT_ID};
+use rustfox::setup::wizard::merge_wizard_save;
 use tempfile::TempDir;
 
 fn minimal_legacy_toml() -> String {
@@ -53,6 +54,67 @@ fn e2e_gate_wizard_add_another_bot_bak_and_materialize() {
     assert_eq!(cfg.bots.len(), 2, "legacy default + researcher");
     assert!(cfg.bots.iter().any(|b| b.id == "default"));
     assert!(cfg.bots.iter().any(|b| b.id == "researcher"));
+}
+
+/// Full wizard save must preserve secondary tools/model/persona/allowlist
+/// when `[[bots]]` already exists (TL HOLD #74).
+#[test]
+fn e2e_gate_wizard_full_save_preserves_secondary_bot_fields() {
+    let existing = r#"
+[[bots]]
+id = "main"
+bot_token = "111111111:AAMainTokenSecretValueXXXX"
+allowed_user_ids = [42]
+persona = "main"
+
+[[bots]]
+id = "researcher"
+bot_token = "222222222:AAResearcherTokenSecretYY"
+allowed_user_ids = [42, 99]
+persona = "researcher"
+model = "moonshotai/kimi-k2.6"
+tools = ["read_file", "list_files", "web_search", "invoke_agent"]
+
+[openrouter]
+api_key = "sk-old"
+model = "old-model"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#;
+    // generateToml-style body: [telegram] + sections, no [[bots]].
+    let wizard = r#"
+[telegram]
+bot_token = "111111111:AAMainTokenSecretValueXXXX"
+allowed_user_ids = [42]
+
+[openrouter]
+api_key = "sk-new"
+model = "new-model"
+"#;
+
+    let merged = merge_wizard_save(existing, wizard).expect("merge");
+    let mut cfg: Config = toml::from_str(&merged).unwrap();
+    cfg.normalize_bots().unwrap();
+
+    let research = cfg
+        .bots
+        .iter()
+        .find(|b| b.id == "researcher")
+        .expect("researcher must survive full wizard save");
+    assert_eq!(research.persona, "researcher");
+    assert_eq!(research.allowed_user_ids, vec![42, 99]);
+    assert_eq!(research.model.as_deref(), Some("moonshotai/kimi-k2.6"));
+    assert_eq!(
+        research.tools,
+        Some(vec![
+            "read_file".into(),
+            "list_files".into(),
+            "web_search".into(),
+            "invoke_agent".into(),
+        ])
+    );
+    assert_eq!(cfg.openrouter.api_key, "sk-new");
 }
 
 #[test]
