@@ -226,15 +226,23 @@ fn bot_ids_covering_persona(
 /// Primary invoke name is `bots[].id`. Description is copied from
 /// `agents/<persona>` when present. When `id != persona`, the persona is shown
 /// as an alias.
+///
+/// `exclude_bot_id` omits the calling bot so the model cannot self-invoke via
+/// its own Telegram bot id (peer-cycle / stuck Working).
 fn format_bots_available_lines(
     bots: &[crate::config::BotConfig],
     agents: &crate::skills::SkillRegistry,
+    exclude_bot_id: Option<&str>,
 ) -> String {
+    let exclude = exclude_bot_id.map(str::trim).filter(|s| !s.is_empty());
     let mut lines = Vec::new();
     for bot in bots {
         let id = bot.id.trim();
         let persona = bot.persona.trim();
         if id.is_empty() {
+            continue;
+        }
+        if exclude.is_some_and(|ex| ex == id) {
             continue;
         }
         let desc = agents
@@ -359,7 +367,7 @@ impl Agent {
         let agents = self.agents.read().await;
         let covered = bot_ids_covering_persona(&self.config.bots);
         let agent_lines = format_agent_lines_excluding(&agents, &covered);
-        let bot_lines = format_bots_available_lines(&self.config.bots, &agents);
+        let bot_lines = format_bots_available_lines(&self.config.bots, &agents, Some(bot_id));
         drop(agents);
 
         if let Some(section) =
@@ -1525,9 +1533,18 @@ impl Agent {
         });
 
         // Classify first (agents → skills → bots), then guard/push a *canonical*
-        // stack key: BotPersona → bot_id (persona is alias); agent/skill keep name.
-        let in_agents = self.agents.read().await.get(&agent_name).is_some();
-        let in_skills = if in_agents {
+        // stack key: BotPersona → bot_id (persona is alias); agent/skill keep name
+        // unless that name is the caller's persona/bot_id on the stack (self).
+        // bot_id ≠ agent pack without explicit map: a [[bots]].id that differs
+        // from its persona must not be looked up as agents/<bot_id> / skills.
+        let skip_pack =
+            crate::peer_invoke::bot_id_is_unmapped_pack_name(&self.config.bots, &agent_name);
+        let in_agents = if skip_pack {
+            false
+        } else {
+            self.agents.read().await.get(&agent_name).is_some()
+        };
+        let in_skills = if skip_pack || in_agents {
             false
         } else {
             self.skills.read().await.get(&agent_name).is_some()
@@ -1539,6 +1556,14 @@ impl Agent {
             &self.config.bots,
         );
         let stack_key = crate::peer_invoke::stack_key_for_invoke(&agent_name, &source);
+        // AgentRegistry/Skill pack named like the caller's persona (or bot_id)
+        // must canonicalize to the stacked bot_id and hard-reject as self.
+        let stack_key = crate::peer_invoke::canonicalize_self_stack_key(
+            &invoke_stack,
+            &agent_name,
+            &stack_key,
+            &self.config.bots,
+        );
 
         if let Err(e) = crate::peer_invoke::guard_peer_invoke(&invoke_stack, &stack_key) {
             warn!(
@@ -2604,6 +2629,24 @@ mod tests {
     }
 
     #[test]
+    fn test_format_bots_available_lines_excludes_caller_bot_id() {
+        let agents = SkillRegistry::new();
+        let bots = vec![
+            test_bot_cfg("qa", "main"),
+            test_bot_cfg("qa2", "researcher"),
+        ];
+        let lines = format_bots_available_lines(&bots, &agents, Some("qa2"));
+        assert!(
+            !lines.contains("**qa2**"),
+            "caller bot_id must be omitted: {lines}"
+        );
+        assert!(
+            lines.contains("**qa**"),
+            "peer bots must remain listed: {lines}"
+        );
+    }
+
+    #[test]
     fn test_format_bots_available_lines_lists_id_and_copies_description() {
         let mut agents = SkillRegistry::new();
         agents.register(
@@ -2618,7 +2661,7 @@ mod tests {
             test_bot_cfg("main", "main"),
             test_bot_cfg("r1", "researcher"),
         ];
-        let lines = format_bots_available_lines(&bots, &agents);
+        let lines = format_bots_available_lines(&bots, &agents, None);
         assert!(lines.contains("- **main**:"));
         assert!(lines.contains("- **r1** (persona: researcher) — Research specialist"));
         assert!(lines.contains("invoke_agent(agent=\"r1\""));
@@ -2645,7 +2688,7 @@ mod tests {
             "agents/ line for id==persona must be dropped: {agent_lines}"
         );
         assert!(agent_lines.contains("**verifier**"));
-        let bot_lines = format_bots_available_lines(&bots, &agents);
+        let bot_lines = format_bots_available_lines(&bots, &agents, None);
         assert!(bot_lines.contains("- **researcher**: Research specialist from agents/"));
         let section = format_available_agents_section("", &agent_lines, &bot_lines).expect("Some");
         assert_eq!(
