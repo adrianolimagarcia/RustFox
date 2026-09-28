@@ -38,10 +38,11 @@ impl ConversationManager {
         user_id: &str,
         system_prompt: String,
         _skills: &SkillRegistry,
-        _config: &Config,
+        config: &Config,
     ) -> Result<Self> {
+        let claim_legacy = Config::bot_claims_legacy_default(&config.bots, bot_id);
         let conversation_id = memory
-            .get_or_create_conversation(platform, bot_id, user_id)
+            .get_or_create_conversation_with_claim(platform, bot_id, user_id, claim_legacy)
             .await?;
         let history = memory
             .load_messages(&conversation_id)

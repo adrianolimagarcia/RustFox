@@ -19,16 +19,34 @@ impl MemoryStore {
     /// Empty `bot_id` is normalized to `"default"`. If all existing conversations for
     /// that triple are archived, a new one is created.
     ///
-    /// **Legacy claim/remap:** migration backfills pre-§7.3 rows to `bot_id = "default"`,
-    /// but primary Telegram bots often use `[[bots]].id = "main"`. On miss for a primary
-    /// alias (`"main"`; `"default"` is a no-op here), claim the active
-    /// `(platform, "default", user_id)` row by updating its `bot_id` so history is not
-    /// orphaned. Secondary bot ids (e.g. `"researcher"`) never claim.
+    /// **Legacy claim/remap:** migration backfills pre-§7.3 rows to `bot_id = "default"`.
+    /// Callers that know install topology should use
+    /// [`Self::get_or_create_conversation_with_claim`] with
+    /// [`crate::config::Config::bot_claims_legacy_default`]. This convenience
+    /// path claims only for `"main"` (multi-bot §7.3 default).
     pub async fn get_or_create_conversation(
         &self,
         platform: &str,
         bot_id: &str,
         user_id: &str,
+    ) -> Result<String> {
+        let claim_legacy = crate::platform::normalize_bot_id(bot_id) == "main";
+        self.get_or_create_conversation_with_claim(platform, bot_id, user_id, claim_legacy)
+            .await
+    }
+
+    /// Like [`Self::get_or_create_conversation`], but `claim_legacy` controls whether
+    /// a miss remaps the active `(platform, "default", user_id)` row onto this
+    /// `bot_id` (so upgrade history is not orphaned).
+    ///
+    /// Use [`crate::config::Config::bot_claims_legacy_default`] for the PO-locked
+    /// policy (sole custom id claims; multi-bot only `"main"`; secondary never).
+    pub async fn get_or_create_conversation_with_claim(
+        &self,
+        platform: &str,
+        bot_id: &str,
+        user_id: &str,
+        claim_legacy: bool,
     ) -> Result<String> {
         let bot_id = crate::platform::normalize_bot_id(bot_id);
         let conn = self.conn.lock().await;
@@ -49,9 +67,9 @@ impl MemoryStore {
             return Ok(id);
         }
 
-        // Primary-bot legacy claim: remap active default-row to this bot_id.
+        // Legacy claim: remap active default-row to this bot_id when allowed.
         // `"default"` looking up `"default"` already returned above if present.
-        if bot_id == "main" {
+        if claim_legacy && bot_id != crate::platform::DEFAULT_BOT_ID {
             let legacy: Option<String> = conn
                 .query_row(
                     "SELECT id FROM conversations
@@ -683,6 +701,155 @@ mod tests {
 
         assert_eq!(legacy_bot, "default");
         assert_eq!(researcher_bot, "researcher");
+    }
+
+    #[tokio::test]
+    async fn test_sole_custom_id_claims_legacy_default_conversation() {
+        // PO lock: exactly one [[bots]] with non-default id owns claim/routing.
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+
+        let legacy_id = store
+            .get_or_create_conversation("telegram", "default", "sole_custom_user")
+            .await
+            .unwrap();
+        store
+            .save_message(&legacy_id, &make_msg("user", "pre-multi-bot history"))
+            .await
+            .unwrap();
+
+        let sole_bots = [crate::config::BotConfig {
+            id: "fox".into(),
+            bot_token: "tok-fox".into(),
+            allowed_user_ids: vec![1],
+            persona: "main".into(),
+            system_prompt_file: None,
+            model: None,
+            tools: None,
+        }];
+        assert!(
+            crate::config::Config::bot_claims_legacy_default(&sole_bots, "fox"),
+            "sole custom id must be allowed to claim"
+        );
+
+        let claimed = store
+            .get_or_create_conversation_with_claim("telegram", "fox", "sole_custom_user", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed, legacy_id,
+            "sole custom id must reclaim the legacy default conversation id"
+        );
+
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let stored_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&claimed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations
+                 WHERE platform = 'telegram' AND user_id = 'sole_custom_user'
+                   AND (is_archived IS NULL OR is_archived = 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            stored_bot, "fox",
+            "bot_id column must be remapped to sole custom id"
+        );
+        assert_eq!(
+            active_count, 1,
+            "must not invent a second default / orphan blank conversation"
+        );
+
+        let messages = store.load_messages(&claimed).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .as_ref()
+                .map(|c| c.as_text())
+                .unwrap()
+                .contains("pre-multi-bot history"),
+            "legacy messages must still load after sole-custom claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_bot_secondary_still_does_not_claim_via_policy() {
+        // PO lock: two or more bots — §7.3 unchanged; secondary must not steal.
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+
+        let legacy_id = store
+            .get_or_create_conversation("telegram", "default", "multi_user")
+            .await
+            .unwrap();
+        store
+            .save_message(&legacy_id, &make_msg("user", "primary history"))
+            .await
+            .unwrap();
+
+        let multi_bots = [
+            crate::config::BotConfig {
+                id: "main".into(),
+                bot_token: "tok-main".into(),
+                allowed_user_ids: vec![1],
+                persona: "main".into(),
+                system_prompt_file: None,
+                model: None,
+                tools: None,
+            },
+            crate::config::BotConfig {
+                id: "researcher".into(),
+                bot_token: "tok-research".into(),
+                allowed_user_ids: vec![1],
+                persona: "researcher".into(),
+                system_prompt_file: None,
+                model: None,
+                tools: None,
+            },
+        ];
+        assert!(crate::config::Config::bot_claims_legacy_default(
+            &multi_bots,
+            "main"
+        ));
+        assert!(!crate::config::Config::bot_claims_legacy_default(
+            &multi_bots,
+            "researcher"
+        ));
+
+        let claim_secondary =
+            crate::config::Config::bot_claims_legacy_default(&multi_bots, "researcher");
+        let researcher = store
+            .get_or_create_conversation_with_claim(
+                "telegram",
+                "researcher",
+                "multi_user",
+                claim_secondary,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            researcher, legacy_id,
+            "multi-bot secondary must not steal default history"
+        );
+
+        let claim_main = crate::config::Config::bot_claims_legacy_default(&multi_bots, "main");
+        let claimed_main = store
+            .get_or_create_conversation_with_claim("telegram", "main", "multi_user", claim_main)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed_main, legacy_id,
+            "multi-bot main must still claim legacy default"
+        );
     }
 
     #[tokio::test]

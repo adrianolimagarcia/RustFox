@@ -1440,9 +1440,18 @@ async fn handle_message(
         let btw_format = msg_format;
         tokio::spawn(async move {
             // Load conversation context inside the spawned task
+            let claim_legacy = crate::config::Config::bot_claims_legacy_default(
+                &agent_clone.config.bots,
+                &btw_bot_id,
+            );
             let conversation_id = match agent_clone
                 .memory
-                .get_or_create_conversation("telegram", &btw_bot_id, &user_id_str)
+                .get_or_create_conversation_with_claim(
+                    "telegram",
+                    &btw_bot_id,
+                    &user_id_str,
+                    claim_legacy,
+                )
                 .await
             {
                 Ok(id) => id,
