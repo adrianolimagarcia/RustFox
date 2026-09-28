@@ -15,6 +15,7 @@ src/
 ├── file_processor/   # File/attachment processing (OCR, vision, PDF, DOCX)
 ├── memory/           # SQLite persistence, vector embeddings, RAG, summarizer
 ├── scheduler/        # Cron/one-shot task scheduler with DB persistence
+├── secret_store/     # SecretStore trait + keyring / encrypted-file / FakeSecretStore
 ├── skills/           # Skill loader, registry, embed/seeding, update engine
 ├── learning.rs       # Post-task skill extraction, user model persistence
 ├── langsmith.rs      # Optional LangSmith observability client

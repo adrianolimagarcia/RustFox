@@ -49,6 +49,7 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 > Persistent home: All paths resolve relative to `~/.rustfox` by default.
 > Override with `RUSTFOX_HOME` env or `[general].home`.
 > See [docs/persistent-home-directory.md](persistent-home-directory.md).
+> **Secrets:** RustFox prefers the OS keyring (macOS Keychain / Windows Credential Manager / Linux keyutils); if unavailable, secrets fall back to an encrypted file under `~/.rustfox/secrets/`.
 
 ---
 
@@ -430,6 +431,8 @@ Optional observability via LangSmith for LLM calls, tool runs, and chain traces.
 | [dirs](https://github.com/soc/dirs-rs) | OS home directory resolution |
 | [sha2](https://github.com/RustCrypto/hashes) | SHA-256 hashing |
 | [regex](https://github.com/rust-lang/regex) | Secret redaction |
+| [keyring](https://github.com/hwchen/keyring-rs) | OS credential store |
+| [aes-gcm](https://github.com/RustCrypto/AEADs) | Encrypted-file secret vault |
 | [serde](https://github.com/serde-rs/serde) | Serialization |
 
 > **Thanks:** Markdown-to-entities conversion inspired by [telegramify-markdown](https://github.com/sudoskys/telegramify-markdown).

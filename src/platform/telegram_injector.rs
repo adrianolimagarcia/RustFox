@@ -8,6 +8,9 @@
 //! [`FixtureLlm`] so chat turns need no live OpenRouter.
 //! Optional outbound asserts go through a wiremock `api.telegram.org` stand-in
 //! (see `docs/telegram-update-injector.md` and `tests/telegram_update_injector.rs`).
+//!
+//! For secret-store harness paths (no live keyring / BotFather), use
+//! [`crate::secret_store::FakeSecretStore`].
 
 use anyhow::{Context, Result};
 use serde_json::Value;

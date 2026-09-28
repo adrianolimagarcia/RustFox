@@ -18,6 +18,8 @@ PO approach: Update JSON injector → real `handle_message` + stub/fixture LLM +
 
 **Not covered here:** client bubble UX, real Telegram-originated taps, production identity, TDLib, live BotFather tokens, media download bytes (shape only).
 
+**Secrets (Slice 1):** use `rustfox::secret_store::FakeSecretStore` in harness tests so no live OS keyring / BotFather is required.
+
 ## Run
 
 ```bash
