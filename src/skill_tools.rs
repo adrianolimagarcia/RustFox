@@ -149,6 +149,111 @@ impl ToolHandler for SkillTools {
                     parameters: json!({ "type": "object", "properties": {} }),
                 },
             },
+            // invoke_agent / spawn_agents: definitions live here so the LLM sees
+            // them; execution is intercepted by Agent special_tool_handler
+            // (circular dependency with run_subagent — §7.5 peer invoke).
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "invoke_agent".to_string(),
+                    description: concat!(
+                        "Delegate a task to a named agent running as an isolated agentic loop. ",
+                        "Resolves agents/<name>/AGENT.md, then subagent skills, then [[bots]] ",
+                        "persona id (optional synonym: bot=\"...\"). ",
+                        "Reply stays in the caller's chat (via <persona>: attribution). ",
+                        "Nested peer depth max 2; cycles are rejected."
+                    )
+                    .to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "agent": {
+                                "type": "string",
+                                "description": "Name of the agent / bot persona to invoke (e.g. 'verifier', 'researcher')"
+                            },
+                            "bot": {
+                                "type": "string",
+                                "description": "Optional synonym for agent — targets a [[bots]] persona id"
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "The task content to pass to the agent"
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "Optional: override the agent's declared model for this invocation"
+                            },
+                            "tools": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional: override the agent's declared tool whitelist"
+                            }
+                        },
+                        "required": ["prompt"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "spawn_agents".to_string(),
+                    description: concat!(
+                        "Spawn one or more isolated ad-hoc subagents. ",
+                        "Each gets its own agentic loop with system context auto-injected. ",
+                        "When multiple tasks are provided via the 'tasks' array, they run concurrently. ",
+                        "For a single subagent, use shorthand fields (system_prompt+prompt)."
+                    )
+                    .to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "tasks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "system_prompt": {
+                                            "type": "string",
+                                            "description": "Instructions for this subagent"
+                                        },
+                                        "prompt": {
+                                            "type": "string",
+                                            "description": "The task to execute"
+                                        },
+                                        "model": {
+                                            "type": "string",
+                                            "description": "Optional model override"
+                                        },
+                                        "tools": {
+                                            "type": "array",
+                                            "items": { "type": "string" },
+                                            "description": "Optional tool whitelist"
+                                        }
+                                    },
+                                    "required": ["system_prompt", "prompt"]
+                                }
+                            },
+                            "system_prompt": {
+                                "type": "string",
+                                "description": "Shorthand: system prompt for a single subagent"
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Shorthand: task for a single subagent"
+                            },
+                            "model": {
+                                "type": "string",
+                                "description": "Shorthand: optional model override"
+                            },
+                            "tools": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Shorthand: optional tool whitelist"
+                            }
+                        }
+                    }),
+                },
+            },
         ]
     }
 
@@ -259,6 +364,12 @@ impl ToolHandler for SkillTools {
                     }
                     Err(e) => Ok(format!("Failed to reload agents: {}", e)),
                 }
+            }
+            "invoke_agent" | "spawn_agents" => {
+                // Handled by Agent::special_tool_handler (peer invoke / nested loops).
+                anyhow::bail!(
+                    "{name} must be handled by the agent special_tool_handler —                      tool registry fallback should not run"
+                )
             }
             _ => anyhow::bail!("SkillTools: unknown tool {name}"),
         }
