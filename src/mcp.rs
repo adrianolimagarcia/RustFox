@@ -115,59 +115,69 @@ pub async fn refresh_oauth_token(
 /// content.
 ///
 /// Strategy: parse the TOML into a `toml::Value`, update the matching server
-/// entry, and serialise back.  Comments are lost on round-trip, but the
-/// functional data is fully preserved.  This is acceptable for a
-/// machine-updated file.
-pub async fn update_config_tokens(
+/// entry, and serialise back via [`crate::config_edit::write_config_validated`]
+/// (validate → `.bak` → atomic write → restore-on-post-write-fail). Comments
+/// are lost on round-trip, but functional sections are fully preserved. This is
+/// acceptable for a machine-updated file.
+///
+/// Returns the backup path (`config.toml.bak`). Secrets are never logged.
+///
+/// # Errors
+///
+/// Returns an error (without touching the config file or creating `.bak`) when
+/// no `[[mcp_servers]]` entry matches `server_name`. The error message includes
+/// the server name only — never token values.
+pub fn update_config_tokens(
     config_path: &Path,
     server_name: &str,
     auth_token: &str,
     new_refresh_token: Option<&str>,
     new_expires_at: Option<i64>,
-) -> Result<()> {
-    let content = tokio::fs::read_to_string(config_path)
-        .await
+) -> Result<std::path::PathBuf> {
+    let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
     let mut doc: toml::Value = content
         .parse()
         .with_context(|| format!("Failed to parse TOML from {}", config_path.display()))?;
 
-    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|v| v.as_array_mut()) {
-        for server in servers.iter_mut() {
-            if server
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|n| n == server_name)
-                .unwrap_or(false)
-            {
-                if let toml::Value::Table(table) = server {
-                    table.insert(
-                        "auth_token".to_string(),
-                        toml::Value::String(auth_token.to_string()),
-                    );
-                    if let Some(rt) = new_refresh_token {
-                        table.insert(
-                            "refresh_token".to_string(),
-                            toml::Value::String(rt.to_string()),
-                        );
-                    }
-                    if let Some(ea) = new_expires_at {
-                        table.insert("token_expires_at".to_string(), toml::Value::Integer(ea));
-                    }
-                }
-                break;
+    let servers = doc
+        .get_mut("mcp_servers")
+        .and_then(|v| v.as_array_mut())
+        .with_context(|| format!("no [[mcp_servers]] entry named `{server_name}`"))?;
+
+    let mut found = false;
+    for server in servers.iter_mut() {
+        if server.get("name").and_then(|v| v.as_str()) != Some(server_name) {
+            continue;
+        }
+        if let toml::Value::Table(table) = server {
+            table.insert(
+                "auth_token".to_string(),
+                toml::Value::String(auth_token.to_string()),
+            );
+            if let Some(rt) = new_refresh_token {
+                table.insert(
+                    "refresh_token".to_string(),
+                    toml::Value::String(rt.to_string()),
+                );
+            }
+            if let Some(ea) = new_expires_at {
+                table.insert("token_expires_at".to_string(), toml::Value::Integer(ea));
             }
         }
+        found = true;
+        break;
+    }
+    if !found {
+        anyhow::bail!("no [[mcp_servers]] entry named `{server_name}`");
     }
 
     let new_content = toml::to_string_pretty(&doc).context("Failed to serialise updated config")?;
-    tokio::fs::write(config_path, new_content)
-        .await
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    let bak = crate::config_edit::write_config_validated(config_path, &new_content)?;
 
     debug!("Persisted refreshed token for MCP server '{server_name}'");
-    Ok(())
+    Ok(bak)
 }
 
 /// Refresh tokens for every HTTP MCP server that is near expiry, writing the
@@ -197,10 +207,8 @@ pub async fn refresh_expiring_tokens(
                     &new_token,
                     new_rt.as_deref(),
                     new_exp,
-                )
-                .await
-                {
-                    Ok(()) => {
+                ) {
+                    Ok(_bak) => {
                         cfg.auth_token = Some(new_token);
                         if new_rt.is_some() {
                             cfg.refresh_token = new_rt;
@@ -575,5 +583,239 @@ mod tests {
             + 3600;
         cfg.token_expires_at = Some(far);
         assert!(!token_needs_refresh(&cfg));
+    }
+
+    fn oauth_config_toml() -> String {
+        r#"
+[telegram]
+bot_token = "123456:ABC-SECRETTOKEN"
+allowed_user_ids = [42]
+
+[openrouter]
+api_key = "sk-or-v1-SECRETKEY000"
+model = "moonshotai/kimi-k2.6"
+
+[sandbox]
+allowed_directory = "/tmp/sandbox"
+
+[learning]
+skill_extraction_enabled = true
+
+[[mcp_servers]]
+name = "exa"
+url = "https://mcp.example.com/exa"
+auth_token = "OLD_AUTH_TOKEN_AAA"
+refresh_token = "OLD_REFRESH_TOKEN_BBB"
+token_expires_at = 1000
+token_endpoint = "https://auth.example.com/token"
+oauth_client_id = "client-id"
+
+[[mcp_servers]]
+name = "git"
+command = "uvx"
+args = ["mcp-server-git"]
+"#
+        .to_string()
+    }
+
+    fn write_cfg(dir: &tempfile::TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn update_config_tokens_writes_bak_and_updates_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains("OLD_AUTH_TOKEN_AAA"));
+
+        let bak = update_config_tokens(
+            &path,
+            "exa",
+            "NEW_AUTH_TOKEN_CCC",
+            Some("NEW_REFRESH_TOKEN_DDD"),
+            Some(9999),
+        )
+        .unwrap();
+
+        assert!(bak.exists(), "shared write path must create .bak");
+        let bak_content = std::fs::read_to_string(&bak).unwrap();
+        assert!(
+            bak_content.contains("OLD_AUTH_TOKEN_AAA"),
+            "bak must be pre-edit snapshot"
+        );
+        assert!(
+            bak_content.contains("OLD_REFRESH_TOKEN_BBB"),
+            "bak must retain old refresh token"
+        );
+
+        let new_content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            new_content.contains("NEW_AUTH_TOKEN_CCC"),
+            "auth_token not updated: {new_content}"
+        );
+        assert!(
+            new_content.contains("NEW_REFRESH_TOKEN_DDD"),
+            "refresh_token not updated: {new_content}"
+        );
+        assert!(
+            new_content.contains("9999"),
+            "token_expires_at not updated: {new_content}"
+        );
+        assert!(
+            !new_content.contains("OLD_AUTH_TOKEN_AAA"),
+            "old auth_token should be replaced"
+        );
+        crate::config_edit::validate_config_str(&new_content).unwrap();
+    }
+
+    #[test]
+    fn update_config_tokens_preserves_unrelated_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+
+        update_config_tokens(
+            &path,
+            "exa",
+            "NEW_AUTH_TOKEN_CCC",
+            Some("NEW_REFRESH_TOKEN_DDD"),
+            Some(9999),
+        )
+        .unwrap();
+
+        let new_content = std::fs::read_to_string(&path).unwrap();
+        // Unrelated sections / sibling MCP server must survive
+        assert!(
+            new_content.contains("skill_extraction_enabled"),
+            "learning section wiped: {new_content}"
+        );
+        assert!(
+            new_content.contains("mcp-server-git"),
+            "git mcp_servers entry wiped: {new_content}"
+        );
+        assert!(
+            new_content.contains(r#"name = "git""#),
+            "git server name missing: {new_content}"
+        );
+        assert!(
+            new_content.contains("123456:ABC-SECRETTOKEN"),
+            "telegram section wiped"
+        );
+        assert!(
+            new_content.contains("sk-or-v1-SECRETKEY000"),
+            "openrouter section wiped"
+        );
+        // Sibling fields on the same server preserved
+        assert!(
+            new_content.contains("https://mcp.example.com/exa"),
+            "exa url wiped"
+        );
+        assert!(new_content.contains("client-id"), "oauth_client_id wiped");
+    }
+
+    #[test]
+    fn update_config_tokens_restore_from_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+
+        let bak = update_config_tokens(
+            &path,
+            "exa",
+            "NEW_AUTH_TOKEN_CCC",
+            Some("NEW_REFRESH_TOKEN_DDD"),
+            Some(9999),
+        )
+        .unwrap();
+        assert!(bak.exists());
+
+        // Corrupt live file then restore via shared helper (same path as
+        // write_config_validated post-write failure recovery).
+        std::fs::write(&path, "[[[broken").unwrap();
+        crate::config_edit::restore_from_bak(&path).unwrap();
+        let restored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            restored.contains("OLD_AUTH_TOKEN_AAA"),
+            "restore must recover pre-edit tokens: {restored}"
+        );
+        crate::config_edit::validate_config_str(&restored).unwrap();
+    }
+
+    #[test]
+    fn update_config_tokens_rejects_invalid_without_touching_bak_path_errors_no_secret() {
+        // Missing file: error must not echo the secret we tried to write.
+        let secret = "SUPER_SECRET_TOKEN_SHOULD_NOT_LEAK_XYZ";
+        let err = update_config_tokens(
+            Path::new("/tmp/rustfox-nonexistent-config-dir/config.toml"),
+            "exa",
+            secret,
+            Some(secret),
+            Some(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains(secret), "error must not echo secrets: {err}");
+
+        // Pre-validate abort: invalid serialised content must not modify file.
+        // Covered indirectly via write_config_validated; here ensure a valid
+        // update still leaves secrets only on disk (not in Result Display).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+        let bak =
+            update_config_tokens(&path, "exa", secret, Some("NEW_REFRESH_OK"), Some(42)).unwrap();
+        // Ok path returns PathBuf — Display of PathBuf is the bak path, not token.
+        let bak_display = format!("{bak:?}");
+        assert!(!bak_display.contains(secret));
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(secret), "token must be persisted to disk");
+    }
+
+    #[test]
+    fn update_config_tokens_prevalidate_abort_leaves_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Direct shared-helper check: invalid content never touches config.
+        let err = crate::config_edit::write_config_validated(&path, "not = valid = toml [[[")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Validation failed") || err.contains("parse"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(
+            !path.with_extension("toml.bak").exists(),
+            "pre-validate abort must not create .bak"
+        );
+    }
+
+    #[test]
+    fn update_config_tokens_missing_server_errors_without_touching_file_or_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let secret = "SUPER_SECRET_MISSING_SERVER_TOKEN_XYZ";
+
+        let err = update_config_tokens(&path, "does-not-exist", secret, Some(secret), Some(42))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("no [[mcp_servers]] entry named `does-not-exist`"),
+            "expected hard-error for missing server: {err}"
+        );
+        assert!(!err.contains(secret), "error must not echo secrets: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "missing server must leave config file untouched"
+        );
+        assert!(
+            !path.with_extension("toml.bak").exists(),
+            "missing server must not create .bak"
+        );
     }
 }
