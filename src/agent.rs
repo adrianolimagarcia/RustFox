@@ -1093,6 +1093,7 @@ impl Agent {
     ) -> Result<()> {
         let incoming = crate::platform::IncomingMessage {
             platform: "scheduled_task".to_string(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
             user_id: format!("{}:{}", task.user_id, task.id),
             chat_id: task.chat_id.clone(),
             user_name: String::new(),
