@@ -281,7 +281,12 @@ The `agents/` directory contains isolated agentic mini-loops with their own mode
 agents/
   verifier/
     AGENT.md       # Zero-trust verifier (read-only sandbox)
+  researcher/
+    AGENT.md       # Research specialist (read-heavier + memory/plan/invoke)
+    SOUL.md        # Citation-first overlay
 ```
+
+`[[bots]]` entries also appear under Available Agents (list **`id`**; description from `agents/<persona>`). Per-bot `tools` / `model` apply on the main Telegram loop (bots fields → AGENT.md → install defaults).
 
 ### Update Engine
 

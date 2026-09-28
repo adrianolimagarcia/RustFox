@@ -170,13 +170,17 @@ struct AdHocTask {
     tools: Option<Vec<String>>,
 }
 
-/// Build the unified `# Available Agents` section from the two line sources
-/// (subagent-style skills and agents directory). Returns `None` when both
-/// inputs are empty so the caller can skip the section entirely. The returned
-/// string includes the leading `\n\n` separator so it can be appended
-/// directly to a prompt that already ends with content.
-fn format_available_agents_section(subagent_lines: &str, agent_lines: &str) -> Option<String> {
-    if subagent_lines.is_empty() && agent_lines.is_empty() {
+/// Build the unified `# Available Agents` section from line sources
+/// (subagent-style skills, agents directory, and `[[bots]]` ids). Returns
+/// `None` when all inputs are empty so the caller can skip the section.
+/// The returned string includes the leading `\n\n` separator so it can be
+/// appended directly to a prompt that already ends with content.
+fn format_available_agents_section(
+    subagent_lines: &str,
+    agent_lines: &str,
+    bot_lines: &str,
+) -> Option<String> {
+    if subagent_lines.is_empty() && agent_lines.is_empty() && bot_lines.is_empty() {
         return None;
     }
 
@@ -186,17 +190,84 @@ fn format_available_agents_section(subagent_lines: &str, agent_lines: &str) -> O
         "Delegate these tasks to specialized agents using `invoke_agent`:",
     ));
 
+    let mut parts: Vec<&str> = Vec::new();
     if !subagent_lines.is_empty() {
-        section.push_str(subagent_lines);
-    }
-    if !subagent_lines.is_empty() && !agent_lines.is_empty() {
-        section.push('\n');
+        parts.push(subagent_lines);
     }
     if !agent_lines.is_empty() {
-        section.push_str(agent_lines);
+        parts.push(agent_lines);
     }
+    if !bot_lines.is_empty() {
+        parts.push(bot_lines);
+    }
+    section.push_str(&parts.join("\n"));
     section.push('\n');
     Some(section)
+}
+
+/// Personas whose `agents/<name>` registry line should be omitted because a
+/// `[[bots]]` entry with `id == persona` already lists that id (§7.6: bots id
+/// always listed; agents/ description wins for copy — no duplicate line).
+fn bot_ids_covering_persona(
+    bots: &[crate::config::BotConfig],
+) -> std::collections::HashSet<String> {
+    bots.iter()
+        .filter(|b| b.id.trim() == b.persona.trim())
+        .map(|b| b.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Format `# Available Agents` lines for every `[[bots]]` entry.
+///
+/// Primary invoke name is `bots[].id`. Description is copied from
+/// `agents/<persona>` when present. When `id != persona`, the persona is shown
+/// as an alias.
+fn format_bots_available_lines(
+    bots: &[crate::config::BotConfig],
+    agents: &crate::skills::SkillRegistry,
+) -> String {
+    let mut lines = Vec::new();
+    for bot in bots {
+        let id = bot.id.trim();
+        let persona = bot.persona.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let desc = agents
+            .get(persona)
+            .map(|s| s.description.as_str())
+            .filter(|d| !d.is_empty())
+            .unwrap_or("Telegram bot persona");
+        if id == persona {
+            lines.push(format!(
+                "- **{id}**: {desc}\n  Invoke via: `invoke_agent(agent=\"{id}\", prompt=\"<task>\")`"
+            ));
+        } else {
+            lines.push(format!(
+                "- **{id}** (persona: {persona}) — {desc}\n  Invoke via: `invoke_agent(agent=\"{id}\", prompt=\"<task>\")` (persona alias: `{persona}`)"
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Agent-dir lines excluding personas already covered by a bots id (== persona).
+fn format_agent_lines_excluding(
+    agents: &crate::skills::SkillRegistry,
+    exclude: &std::collections::HashSet<String>,
+) -> String {
+    let mut lines = Vec::new();
+    for agent in agents.list() {
+        if exclude.contains(&agent.name) {
+            continue;
+        }
+        lines.push(format!(
+            "- **{}**: {}\n  Invoke via: `invoke_agent(agent=\"{}\", prompt=\"<task>\")`",
+            agent.name, agent.description, agent.name
+        ));
+    }
+    lines.join("\n")
 }
 
 impl Agent {
@@ -270,14 +341,20 @@ impl Agent {
             prompt.push_str(&skill_context);
         }
 
-        // Build unified "Available Agents" section from both subagent skills and agents/
+        // Build unified "Available Agents" section: subagent skills + agents/
+        // + [[bots]] ids (§7.6). When bots id == persona, agents/ line for that
+        // name is dropped (bots id listed; agents description used for copy).
         let subagent_skills = skills.build_subagent_lines();
         drop(skills);
         let agents = self.agents.read().await;
-        let agent_lines = agents.build_agents_context();
+        let covered = bot_ids_covering_persona(&self.config.bots);
+        let agent_lines = format_agent_lines_excluding(&agents, &covered);
+        let bot_lines = format_bots_available_lines(&self.config.bots, &agents);
         drop(agents);
 
-        if let Some(section) = format_available_agents_section(&subagent_skills, &agent_lines) {
+        if let Some(section) =
+            format_available_agents_section(&subagent_skills, &agent_lines, &bot_lines)
+        {
             prompt.push_str(&section);
         }
 
@@ -920,15 +997,29 @@ impl Agent {
             }
         };
 
+        // §7.6: main loop resolves bots[].tools/model → agents/<persona> → defaults
+        let bot_cfg = crate::persona_prompt::bot_for_prompt(&self.config, bot_id);
+        let (loop_model, loop_tools) = {
+            let agents = self.agents.read().await;
+            let persona_skill = agents.get(bot_cfg.persona.trim());
+            let persona_model = persona_skill.and_then(|s| s.model.clone());
+            let persona_tools = persona_skill.map(|s| s.tools.clone()).unwrap_or_default();
+            crate::peer_invoke::resolve_bot_loop_overrides(
+                bot_cfg,
+                persona_model.as_deref(),
+                &persona_tools,
+            )
+        };
+
         let loop_config = crate::loop_runner::LoopConfig {
             max_iterations: self.config.max_iterations(),
             empty_response_retry_limit: self.config.empty_response_retry_limit(),
             context_window,
             loop_detection_enabled: true,
             interactive_loop_callback: true,
-            allowed_tools: None,
+            allowed_tools: loop_tools,
             langsmith_project: Some(ls_project.clone()),
-            model: None,
+            model: loop_model,
             tool_event_tx,
             stream_token_tx,
             recovery_nudge: None,
@@ -2361,7 +2452,7 @@ mod tests {
 
     #[test]
     fn test_format_available_agents_section_both_empty_returns_none() {
-        let section = format_available_agents_section("", "");
+        let section = format_available_agents_section("", "", "");
         assert!(
             section.is_none(),
             "expected None when both inputs are empty"
@@ -2370,7 +2461,7 @@ mod tests {
 
     #[test]
     fn test_format_available_agents_section_only_subagent_nonempty() {
-        let section = format_available_agents_section("- sub line", "").expect("expected Some");
+        let section = format_available_agents_section("- sub line", "", "").expect("expected Some");
         assert!(section.contains("# Available Agents"));
         assert!(section.contains("- sub line"));
         assert!(section.contains("All available agents are listed below"));
@@ -2381,7 +2472,8 @@ mod tests {
 
     #[test]
     fn test_format_available_agents_section_only_agents_nonempty() {
-        let section = format_available_agents_section("", "- agent line").expect("expected Some");
+        let section =
+            format_available_agents_section("", "- agent line", "").expect("expected Some");
         assert!(section.contains("# Available Agents"));
         assert!(section.contains("- agent line"));
         assert!(section.contains("All available agents are listed below"));
@@ -2389,8 +2481,8 @@ mod tests {
 
     #[test]
     fn test_format_available_agents_section_both_nonempty_merged() {
-        let section =
-            format_available_agents_section("- sub line", "- agent line").expect("expected Some");
+        let section = format_available_agents_section("- sub line", "- agent line", "")
+            .expect("expected Some");
 
         // Header and preamble are present
         assert!(section.contains("# Available Agents"));
@@ -2418,7 +2510,7 @@ mod tests {
     #[test]
     fn test_format_available_agents_section_uses_shared_preamble() {
         // The preamble should come from `format_listed_section("agent", ...)`.
-        let section = format_available_agents_section("- sub", "- ag").expect("expected Some");
+        let section = format_available_agents_section("- sub", "- ag", "").expect("expected Some");
         let shared = format_listed_section(
             "agent",
             "Delegate these tasks to specialized agents using `invoke_agent`:",
@@ -2426,6 +2518,102 @@ mod tests {
         assert!(
             section.contains(&shared),
             "section should embed the shared preamble exactly"
+        );
+    }
+
+    #[test]
+    fn test_format_available_agents_section_includes_bot_lines() {
+        let section = format_available_agents_section(
+            "",
+            "- agent line",
+            "- **r1** (persona: researcher) — Research specialist",
+        )
+        .expect("expected Some");
+        assert!(section.contains("- **r1** (persona: researcher)"));
+        assert!(section.contains("- agent line"));
+        let agent_idx = section.find("- agent line").unwrap();
+        let bot_idx = section.find("- **r1**").unwrap();
+        assert!(agent_idx < bot_idx, "bot lines follow agent-dir lines");
+    }
+
+    fn test_bot_cfg(id: &str, persona: &str) -> crate::config::BotConfig {
+        crate::config::BotConfig {
+            id: id.to_string(),
+            bot_token: format!("tok-{id}"),
+            allowed_user_ids: vec![1],
+            persona: persona.to_string(),
+            system_prompt_file: None,
+            model: None,
+            tools: None,
+        }
+    }
+
+    fn test_agent_skill(name: &str, description: &str, tools: Vec<&str>) -> crate::skills::Skill {
+        use crate::skills::Skill;
+
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            content: String::new(),
+            tags: vec![],
+            model: None,
+            tools: tools.into_iter().map(str::to_string).collect(),
+            max_iterations: None,
+            skip_bootstrap: true,
+            supervisor_workflow: None,
+            supervisor_required_caps: vec![],
+        }
+    }
+
+    #[test]
+    fn test_format_bots_available_lines_lists_id_and_copies_description() {
+        let mut agents = SkillRegistry::new();
+        agents.register(
+            test_agent_skill(
+                "researcher",
+                "Research specialist. Web/docs digests with citations.",
+                vec!["read_file"],
+            ),
+            std::path::PathBuf::from("/tmp/researcher"),
+        );
+        let bots = vec![
+            test_bot_cfg("main", "main"),
+            test_bot_cfg("r1", "researcher"),
+        ];
+        let lines = format_bots_available_lines(&bots, &agents);
+        assert!(lines.contains("- **main**:"));
+        assert!(lines.contains("- **r1** (persona: researcher) — Research specialist"));
+        assert!(lines.contains("invoke_agent(agent=\"r1\""));
+        assert!(lines.contains("persona alias: `researcher`"));
+    }
+
+    #[test]
+    fn test_bot_id_equals_persona_skips_duplicate_agent_line() {
+        let mut agents = SkillRegistry::new();
+        agents.register(
+            test_agent_skill("researcher", "Research specialist from agents/", vec![]),
+            std::path::PathBuf::from("/tmp/researcher"),
+        );
+        agents.register(
+            test_agent_skill("verifier", "Zero-trust verifier", vec![]),
+            std::path::PathBuf::from("/tmp/verifier"),
+        );
+        let bots = vec![test_bot_cfg("researcher", "researcher")];
+        let covered = bot_ids_covering_persona(&bots);
+        assert!(covered.contains("researcher"));
+        let agent_lines = format_agent_lines_excluding(&agents, &covered);
+        assert!(
+            !agent_lines.contains("**researcher**"),
+            "agents/ line for id==persona must be dropped: {agent_lines}"
+        );
+        assert!(agent_lines.contains("**verifier**"));
+        let bot_lines = format_bots_available_lines(&bots, &agents);
+        assert!(bot_lines.contains("- **researcher**: Research specialist from agents/"));
+        let section = format_available_agents_section("", &agent_lines, &bot_lines).expect("Some");
+        assert_eq!(
+            section.matches("**researcher**").count(),
+            1,
+            "researcher must appear exactly once"
         );
     }
 

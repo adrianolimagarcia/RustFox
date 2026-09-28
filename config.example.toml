@@ -25,6 +25,20 @@ allowed_user_ids = [123456789]
 # # model = "moonshotai/kimi-k2.6"
 # # tools = ["read_file", "write_file", "execute_command", "invoke_agent"]
 # # USER.md stays shared under RUSTFOX_HOME (not per-bot). Portal uses default/shim persona.
+#
+# Second bot — bundled researcher pack (read-heavier defaults; no execute_command/write_file).
+# Main-loop tools/model precedence (§7.6): bots[] fields → agents/<persona>/AGENT.md → install defaults.
+# [[bots]]
+# id = "researcher"
+# bot_token = "YOUR_RESEARCHER_BOT_TOKEN"
+# allowed_user_ids = [123456789]
+# persona = "researcher"
+# # Optional overrides (wired on the main Telegram path):
+# # model = "moonshotai/kimi-k2.6"
+# # tools = ["read_file", "list_files",
+# #          "remember", "recall", "search_memory",
+# #          "plan_create", "plan_update", "plan_view",
+# #          "invoke_agent", "spawn_agents"]
 
 [openrouter]
 # Get your API key from https://openrouter.ai/keys
