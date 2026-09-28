@@ -220,6 +220,27 @@ pub async fn notify_shutdown(bot: &teloxide::Bot, allowed_user_ids: &[u64]) {
     }
 }
 
+/// Notify allowlisted users that a secret is needed (Slice 2).
+/// Message text contains the secret *name* and a portal claim link; never the
+/// secret value. The opaque claim id may appear only in the URL path.
+pub async fn notify_secret_request(
+    bot: &teloxide::Bot,
+    allowed_user_ids: &[u64],
+    name: &str,
+    claim_url: &str,
+) {
+    let msg = crate::secret_store::format_secret_request_notify(name, claim_url);
+    for &user_id in allowed_user_ids {
+        let chat_id = teloxide::types::ChatId(user_id as i64);
+        if let Err(e) = bot.send_message(chat_id, &msg).await {
+            warn!(
+                "Failed to send secret-request notify to user {}: {}",
+                user_id, e
+            );
+        }
+    }
+}
+
 /// Run the Telegram bot platform for a single `[[bots]]` entry.
 ///
 /// `bot_id` is the stable config id used for conversation isolation and

@@ -1,19 +1,26 @@
-//! Host-side secret store (Slice 1).
+//! Host-side secret store.
 //!
 //! Prefer the OS keyring; when Secret Service / Keychain / Credential Manager
 //! is unavailable, fall back to an encrypted file under the RustFox home.
 //! Values are never logged (`SecretValue` redacts `Debug` / `Display`).
 //!
-//! Portal UX, Telegram notify, and sandbox env injection are Slice 2+.
+//! Slice 2 adds pending claims + Telegram notify helpers + portal claim form.
+//! Sandbox/tool env injection is Slice 3.
 
 mod fake;
 mod file;
 mod keyring_backend;
+mod notify;
+mod pending;
 mod value;
 
 pub use fake::FakeSecretStore;
 pub use file::EncryptedFileSecretStore;
 pub use keyring_backend::KeyringSecretStore;
+pub use notify::{
+    format_secret_request_notify, secret_request_claim_url, secret_request_notify_text,
+};
+pub use pending::{PendingCreate, PendingSecretRegistry, PendingView, DEFAULT_CLAIM_TTL};
 pub use value::SecretValue;
 
 use anyhow::{Context, Result};
@@ -66,7 +73,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 /// Open the preferred store: OS keyring first; encrypted-file fallback.
 ///
 /// `home` is the RustFox home root (typically `~/.rustfox`). The file vault
-/// lives at `<home>/secrets/vault`.
+/// lives at `<home>/secrets/vault` with master key `<home>/secrets/vault.key`.
 pub fn open(home: &Path) -> Result<(Box<dyn SecretStore>, SecretStoreBackend)> {
     match KeyringSecretStore::try_probe_and_open() {
         Ok(store) => {
@@ -89,6 +96,11 @@ pub fn open(home: &Path) -> Result<(Box<dyn SecretStore>, SecretStoreBackend)> {
 /// Default encrypted vault path under the RustFox home.
 pub fn default_vault_path(home: &Path) -> PathBuf {
     home.join("secrets").join("vault")
+}
+
+/// Default plaintext master-key path beside the vault (file-fallback only).
+pub fn default_vault_key_path(home: &Path) -> PathBuf {
+    home.join("secrets").join("vault.key")
 }
 
 #[cfg(test)]

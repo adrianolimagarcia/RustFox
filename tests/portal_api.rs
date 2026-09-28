@@ -2171,3 +2171,176 @@ async fn settings_get_reports_system_prompt_projection() {
     assert_eq!(body["systemPrompt"]["pointer"], Value::Null);
     assert_eq!(body["systemPrompt"]["divergence"], false);
 }
+
+// ---------------------------------------------------------------------------
+// Secrets Slice 2 — pending claim → set / expire / cancel
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn secret_claim_flow_sets_via_secret_store() {
+    let f = fixture(with_token_token()).await;
+    // Create pending (auth).
+    let create = f
+        .app
+        .clone()
+        .oneshot(bearer(
+            post_json("/api/secrets/pending", json!({ "name": "SLICE2_KEY" })),
+            TEST_TOKEN,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = body_json(create).await;
+    let token = created["claimToken"].as_str().unwrap().to_string();
+    let claim_url = created["claimUrl"].as_str().unwrap();
+    assert!(claim_url.contains(&token));
+    assert!(claim_url.contains("/secrets/claim/"));
+
+    // Public peek — masked metadata only.
+    let peek = f
+        .app
+        .clone()
+        .oneshot(get(&format!("/api/secrets/claim/{token}")))
+        .await
+        .unwrap();
+    assert_eq!(peek.status(), StatusCode::OK);
+    let meta = body_json(peek).await;
+    assert_eq!(meta["name"], "SLICE2_KEY");
+    assert!(meta.get("value").is_none());
+    assert!(!meta.to_string().contains("sk-"));
+
+    // Submit → SecretStore::set
+    let submit = f
+        .app
+        .clone()
+        .oneshot(post_json(
+            &format!("/api/secrets/claim/{token}"),
+            json!({ "value": "sk-slice2-VALUE-never-echo" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+    let stored = f
+        .state
+        .secret_store
+        .get("SLICE2_KEY")
+        .unwrap()
+        .expect("secret stored");
+    assert_eq!(stored.expose(), "sk-slice2-VALUE-never-echo");
+
+    // One-shot consumed.
+    let again = f
+        .app
+        .clone()
+        .oneshot(get(&format!("/api/secrets/claim/{token}")))
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn secret_claim_cancel_clears_pending() {
+    let f = fixture(with_token_token()).await;
+    let create = f
+        .app
+        .clone()
+        .oneshot(bearer(
+            post_json("/api/secrets/pending", json!({ "name": "CANCEL_ME" })),
+            TEST_TOKEN,
+        ))
+        .await
+        .unwrap();
+    let created = body_json(create).await;
+    let token = created["claimToken"].as_str().unwrap();
+
+    let cancel = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/secrets/claim/{token}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::OK);
+
+    let peek = f
+        .app
+        .clone()
+        .oneshot(get(&format!("/api/secrets/claim/{token}")))
+        .await
+        .unwrap();
+    assert_eq!(peek.status(), StatusCode::NOT_FOUND);
+    assert!(f.state.secret_store.get("CANCEL_ME").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn secret_claim_expires() {
+    use rustfox::secret_store::PendingSecretRegistry;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let portal = with_token_token();
+    let config_path = write_config(dir.path(), portal.clone());
+    let mut config = Config::load(&config_path).unwrap();
+    config.resolved_home = Some(home.clone());
+    let memory = MemoryStore::open_in_memory().unwrap();
+    let task_store = ScheduledTaskStore::new(memory.connection());
+    let fake = Arc::new(FakeAgent::new(config));
+    let registry = Arc::new(PendingSecretRegistry::new(Duration::from_millis(40)));
+    let state = PortalState::new(
+        fake.clone(),
+        memory,
+        task_store,
+        portal,
+        config_path,
+        Some(home),
+    )
+    .with_pending_secrets(registry);
+    let app = rustfox::portal::router(state.clone());
+
+    let create = app
+        .clone()
+        .oneshot(bearer(
+            post_json("/api/secrets/pending", json!({ "name": "EXPIRING" })),
+            TEST_TOKEN,
+        ))
+        .await
+        .unwrap();
+    let token = body_json(create).await["claimToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let peek = app
+        .clone()
+        .oneshot(get(&format!("/api/secrets/claim/{token}")))
+        .await
+        .unwrap();
+    assert_eq!(peek.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn secret_notify_helpers_safe_for_telegram() {
+    use rustfox::secret_store::{
+        format_secret_request_notify, secret_request_claim_url, secret_request_notify_text,
+    };
+    let name = "NOTIFY_KEY";
+    let value = "super-secret-VALUE";
+    let token = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    let url = secret_request_claim_url("http://127.0.0.1:8090/", token);
+    let body = secret_request_notify_text(name);
+    let msg = format_secret_request_notify(name, &url);
+    assert!(body.contains(name));
+    assert!(!body.contains(value));
+    assert!(!body.contains(token));
+    assert!(msg.contains(name));
+    assert!(!msg.contains(value));
+    assert!(msg.contains(&url));
+}

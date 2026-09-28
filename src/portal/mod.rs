@@ -10,6 +10,7 @@ pub mod control;
 pub mod data;
 pub mod error;
 pub mod install;
+pub mod secrets;
 pub mod settings;
 pub mod static_serve;
 pub mod tasks_admin;
@@ -210,6 +211,11 @@ pub struct PortalState {
     /// tests — production default is the reqwest-backed fetcher.
     pub fetcher: Arc<dyn install::GitHubFetcher>,
     pub started_at: std::time::Instant,
+    /// Host secret store (Slice 1). Defaults to FakeSecretStore in tests;
+    /// production wires keyring/file via [`PortalState::with_secret_store`].
+    pub secret_store: Arc<dyn crate::secret_store::SecretStore>,
+    /// Pending one-shot secret claims (Slice 2).
+    pub pending_secrets: Arc<crate::secret_store::PendingSecretRegistry>,
 }
 
 impl PortalState {
@@ -234,7 +240,24 @@ impl PortalState {
             chat_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fetcher: Arc::new(install::ReqwestFetcher::new()),
             started_at: std::time::Instant::now(),
+            secret_store: Arc::new(crate::secret_store::FakeSecretStore::new()),
+            pending_secrets: Arc::new(crate::secret_store::PendingSecretRegistry::default()),
         }
+    }
+
+    /// Replace the default fake secret store (production / integration tests).
+    pub fn with_secret_store(mut self, store: Arc<dyn crate::secret_store::SecretStore>) -> Self {
+        self.secret_store = store;
+        self
+    }
+
+    /// Replace the pending-secrets registry (tests with custom TTL).
+    pub fn with_pending_secrets(
+        mut self,
+        registry: Arc<crate::secret_store::PendingSecretRegistry>,
+    ) -> Self {
+        self.pending_secrets = registry;
+        self
     }
 
     /// The portal user's identity in memory (ADR 0005).
@@ -254,7 +277,13 @@ pub fn router(state: PortalState) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
-        .route("/health", get(data::health));
+        .route("/health", get(data::health))
+        // Slice 2: claim by opaque one-shot token (magic link; no session).
+        .route(
+            "/secrets/claim/{token}",
+            get(secrets::get_claim).post(secrets::submit_claim),
+        )
+        .route("/secrets/claim/{token}/cancel", post(secrets::cancel_claim));
 
     let protected = Router::new()
         .route("/chat/history", get(chat::history))
@@ -303,7 +332,16 @@ pub fn router(state: PortalState) -> Router {
         .route("/settings", get(settings::get_settings))
         .route("/settings", axum::routing::patch(settings::patch_settings))
         .route("/soul", get(settings::get_soul))
-        .route("/soul", axum::routing::put(settings::put_soul));
+        .route("/soul", axum::routing::put(settings::put_soul))
+        // Slice 2: authenticated pending-secret admin.
+        .route(
+            "/secrets/pending",
+            get(secrets::list_pending).post(secrets::create_pending),
+        )
+        .route(
+            "/secrets/pending/{id}",
+            axum::routing::delete(secrets::cancel_pending_by_id),
+        );
     let protected = protected.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::require_auth,

@@ -779,7 +779,7 @@ async fn main() -> Result<()> {
     let portal_shutdown = tokio_util::sync::CancellationToken::new();
     if config.portal.enabled {
         let portal_agent: std::sync::Arc<dyn rustfox::portal::AgentOps> = agent.clone();
-        let portal_state = rustfox::portal::PortalState::new(
+        let mut portal_state = rustfox::portal::PortalState::new(
             portal_agent,
             memory.clone(),
             task_store.clone(),
@@ -787,6 +787,19 @@ async fn main() -> Result<()> {
             config_path.clone(),
             config.resolved_home().cloned(),
         );
+        if let Some(home) = config.resolved_home() {
+            match rustfox::secret_store::open(home) {
+                Ok((store, backend)) => {
+                    info!("  Secret store: {:?}", backend);
+                    portal_state = portal_state.with_secret_store(std::sync::Arc::from(store));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Secret store unavailable ({e}); portal claims will use in-memory fake"
+                    );
+                }
+            }
+        }
         rustfox::portal::auth::ensure_startup_token(&portal_state);
         if let Err(e) = rustfox::portal::serve(portal_state, portal_shutdown.clone()).await {
             // Portal is best-effort: a bind failure must not kill the bot.

@@ -453,3 +453,26 @@ export interface SoulFile {
 }
 
 export type SoulName = 'SOUL.md' | 'USER.md' | 'AGENTS.md' | 'MEMORY.md' | 'system'
+
+// ---------------------------------------------------------------------------
+// Secrets (Slice 2)
+// ---------------------------------------------------------------------------
+
+export interface SecretClaimMeta {
+  id: string
+  name: string
+  expiresAt: number
+  status: string
+}
+
+export interface SecretClaimResult {
+  ok: boolean
+  name: string
+  stored: boolean
+}
+
+export interface PendingSecret {
+  id: string
+  name: string
+  expiresAt: number
+}

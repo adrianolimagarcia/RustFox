@@ -21,6 +21,7 @@ import { Route as AuthSkillsRouteImport } from './routes/_auth/skills'
 import { Route as AuthTasksRouteImport } from './routes/_auth/tasks'
 import { Route as AuthChatIndexRouteImport } from './routes/_auth/chat.index'
 import { Route as AuthChatThreadIdRouteImport } from './routes/_auth/chat.$threadId'
+import { Route as SecretsClaimTokenRouteImport } from './routes/secrets.claim.$token'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -81,6 +82,11 @@ const AuthChatThreadIdRoute = AuthChatThreadIdRouteImport.update({
   path: '/$threadId',
   getParentRoute: () => AuthChatRoute,
 } as any)
+const SecretsClaimTokenRoute = SecretsClaimTokenRouteImport.update({
+  id: '/secrets/claim/$token',
+  path: '/secrets/claim/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -93,6 +99,7 @@ export interface FileRoutesByFullPath {
   '/skills': typeof AuthSkillsRoute
   '/tasks': typeof AuthTasksRoute
   '/chat/$threadId': typeof AuthChatThreadIdRoute
+  '/secrets/claim/$token': typeof SecretsClaimTokenRoute
   '/chat/': typeof AuthChatIndexRoute
 }
 export interface FileRoutesByTo {
@@ -105,6 +112,7 @@ export interface FileRoutesByTo {
   '/skills': typeof AuthSkillsRoute
   '/tasks': typeof AuthTasksRoute
   '/chat/$threadId': typeof AuthChatThreadIdRoute
+  '/secrets/claim/$token': typeof SecretsClaimTokenRoute
   '/chat': typeof AuthChatIndexRoute
 }
 export interface FileRoutesById {
@@ -120,6 +128,7 @@ export interface FileRoutesById {
   '/_auth/skills': typeof AuthSkillsRoute
   '/_auth/tasks': typeof AuthTasksRoute
   '/_auth/chat/$threadId': typeof AuthChatThreadIdRoute
+  '/secrets/claim/$token': typeof SecretsClaimTokenRoute
   '/_auth/chat/': typeof AuthChatIndexRoute
 }
 export interface FileRouteTypes {
@@ -135,6 +144,7 @@ export interface FileRouteTypes {
     | '/skills'
     | '/tasks'
     | '/chat/$threadId'
+    | '/secrets/claim/$token'
     | '/chat/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -147,6 +157,7 @@ export interface FileRouteTypes {
     | '/skills'
     | '/tasks'
     | '/chat/$threadId'
+    | '/secrets/claim/$token'
     | '/chat'
   id:
     | '__root__'
@@ -161,6 +172,7 @@ export interface FileRouteTypes {
     | '/_auth/skills'
     | '/_auth/tasks'
     | '/_auth/chat/$threadId'
+    | '/secrets/claim/$token'
     | '/_auth/chat/'
   fileRoutesById: FileRoutesById
 }
@@ -168,6 +180,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuthRoute: typeof AuthRouteWithChildren
   LoginRoute: typeof LoginRoute
+  SecretsClaimTokenRoute: typeof SecretsClaimTokenRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -256,6 +269,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthChatThreadIdRouteImport
       parentRoute: typeof AuthChatRoute
     }
+    '/secrets/claim/$token': {
+      id: '/secrets/claim/$token'
+      path: '/secrets/claim/$token'
+      fullPath: '/secrets/claim/$token'
+      preLoaderRoute: typeof SecretsClaimTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -299,6 +319,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuthRoute: AuthRouteWithChildren,
   LoginRoute: LoginRoute,
+  SecretsClaimTokenRoute: SecretsClaimTokenRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
