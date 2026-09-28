@@ -26,6 +26,7 @@ pub mod portal;
 pub mod provider;
 pub mod scheduler;
 pub mod scheduling_tools;
+pub mod secret_store;
 pub mod setup;
 pub mod skill_tools;
 pub mod skills;
