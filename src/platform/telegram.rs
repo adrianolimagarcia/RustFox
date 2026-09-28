@@ -775,9 +775,10 @@ async fn handle_config_command(
 
             match crate::config_edit::apply_config_edit(&agent.config_path, key, value) {
                 Ok(result) => {
-                    // Soft-apply model live when possible (no full hot-reload).
+                    // Soft-apply model live in memory only — disk already written
+                    // via apply_config_edit bak path; avoid a second write.
                     if result.key == "openrouter.model" {
-                        if let Err(e) = agent.set_model(value.trim()).await {
+                        if let Err(e) = agent.set_model_live(value.trim()).await {
                             tracing::warn!(error = %e, "Live set_model after config write failed");
                         }
                     }

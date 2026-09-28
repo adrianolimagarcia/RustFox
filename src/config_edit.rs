@@ -383,8 +383,23 @@ fn apply_editable(
     let new_content =
         toml::to_string_pretty(&doc).context("Failed to serialize config after edit")?;
 
+    let bak = write_config_validated(path, &new_content)?;
+
+    Ok(ApplyResult {
+        key: key.to_string(),
+        restart_required,
+        bak_path: bak,
+    })
+}
+
+/// Shared config.toml write path used by `/config set`, `Agent::set_model`, and
+/// other callers: validate → `.bak` → atomic write → restore-on-post-write-fail.
+///
+/// Returns the backup path (`config.toml.bak`). The bak file is only created
+/// when `path` already existed before the write.
+pub fn write_config_validated(path: &Path, new_content: &str) -> Result<PathBuf> {
     // Pre-write validate (parse + bots normalize). Abort before touching bak/disk.
-    validate_config_str(&new_content).context("Validation failed; config.toml not modified")?;
+    validate_config_str(new_content).context("Validation failed; config.toml not modified")?;
 
     let bak = backup_path(path);
     if path.exists() {
@@ -392,25 +407,63 @@ fn apply_editable(
             .with_context(|| format!("Failed to write backup {}", bak.display()))?;
     }
 
-    atomic_write(path, &new_content)
+    atomic_write(path, new_content)
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
     // Post-write validate; restore bak on failure.
     if let Err(e) = validate_config_str(&std::fs::read_to_string(path).unwrap_or_default()) {
         let _ = std::fs::copy(&bak, path);
         bail!(
-            "Post-write parse failed ({e}); restored from {}. Aborting restart.",
+            "Post-write parse failed ({e}); restored from {}. Aborting.",
             bak.display()
         );
     }
 
-    // Also try a second parse of new_content (in case read is flaky) — already done.
+    Ok(bak)
+}
 
-    Ok(ApplyResult {
-        key: key.to_string(),
-        restart_required,
-        bak_path: bak,
-    })
+/// Persist a live model change to `config.toml` via [`write_config_validated`].
+///
+/// Updates the matching `[[provider]]` entry's `model`, or falls back to the
+/// legacy `[openrouter]` section when `provider_name == "openrouter"`.
+/// Returns the `.bak` path.
+pub fn persist_model_edit(path: &Path, provider_name: &str, actual_model: &str) -> Result<PathBuf> {
+    if actual_model.is_empty() {
+        bail!("Model ID cannot be empty");
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut doc: toml::Value =
+        toml::from_str(&content).context("Failed to parse config.toml before model edit")?;
+
+    let mut found_in_array = false;
+    if let Some(provider_array) = doc.get_mut("provider").and_then(|v| v.as_array_mut()) {
+        for entry in provider_array.iter_mut() {
+            if let Some(table) = entry.as_table_mut() {
+                if table.get("name").and_then(|v| v.as_str()) == Some(provider_name) {
+                    table.insert(
+                        "model".to_string(),
+                        toml::Value::String(actual_model.to_string()),
+                    );
+                    found_in_array = true;
+                }
+            }
+        }
+    }
+
+    if !found_in_array && provider_name == "openrouter" && doc.get("openrouter").is_some() {
+        if let Some(table) = doc.get_mut("openrouter").and_then(|v| v.as_table_mut()) {
+            table.insert(
+                "model".to_string(),
+                toml::Value::String(actual_model.to_string()),
+            );
+        }
+    }
+
+    let new_content =
+        toml::to_string_pretty(&doc).context("Failed to serialize config after model edit")?;
+    write_config_validated(path, &new_content)
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -829,5 +882,86 @@ model = "m"
         let masked = mask_secret(raw);
         assert!(!masked.contains("abcdefghijklmnopqrst"));
         assert_eq!(mask_secret("short"), "••••");
+    }
+
+    #[test]
+    fn persist_model_edit_writes_bak_and_updates_model() {
+        let dir = tempdir().unwrap();
+        let path = write_cfg(&dir, &minimal_toml());
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains("moonshotai/kimi-k2.6"));
+
+        let bak = persist_model_edit(&path, "openrouter", "anthropic/claude-sonnet-4").unwrap();
+        assert!(
+            bak.exists(),
+            "set_model-equivalent persist must create .bak"
+        );
+        let bak_content = std::fs::read_to_string(&bak).unwrap();
+        assert!(
+            bak_content.contains("moonshotai/kimi-k2.6"),
+            "bak must be pre-edit snapshot"
+        );
+
+        let new_content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            new_content.contains("anthropic/claude-sonnet-4"),
+            "persisted model missing: {new_content}"
+        );
+        assert!(
+            !new_content.contains("moonshotai/kimi-k2.6"),
+            "old model should be replaced: {new_content}"
+        );
+        validate_config_str(&new_content).unwrap();
+    }
+
+    #[test]
+    fn persist_model_edit_restore_on_post_write_fail() {
+        // Bak is always the *pre-edit* snapshot. After two persists, bak holds
+        // the first persist's content; restore recovers that.
+        let dir = tempdir().unwrap();
+        let path = write_cfg(&dir, &minimal_toml());
+        persist_model_edit(&path, "openrouter", "openai/gpt-4o").unwrap();
+        let bak = persist_model_edit(&path, "openrouter", "anthropic/claude-sonnet-4").unwrap();
+        assert!(bak.exists());
+        let bak_content = std::fs::read_to_string(&bak).unwrap();
+        assert!(
+            bak_content.contains("openai/gpt-4o"),
+            "second persist bak must snapshot first persist: {bak_content}"
+        );
+
+        // Invalid content must not touch disk (pre-validate abort).
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.contains("anthropic/claude-sonnet-4"));
+        let err = write_config_validated(&path, "not = valid = toml [[[")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Validation failed") || err.contains("parse"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Corrupt live file then restore from bak (pre-second-edit = gpt-4o).
+        std::fs::write(&path, "[[[broken").unwrap();
+        restore_from_bak(&path).unwrap();
+        let restored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            restored.contains("openai/gpt-4o"),
+            "restore must recover bak (first persist): {restored}"
+        );
+        validate_config_str(&restored).unwrap();
+    }
+
+    #[test]
+    fn persist_model_edit_rejects_empty_model() {
+        let dir = tempdir().unwrap();
+        let path = write_cfg(&dir, &minimal_toml());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = persist_model_edit(&path, "openrouter", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(!path.with_extension("toml.bak").exists());
     }
 }
