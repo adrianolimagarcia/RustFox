@@ -45,14 +45,16 @@ job that posted 3 of 6 replies would post them again). Decision:
    (latest prompt wins; task definitions are edited via portal/tools).
 
 3. **Watchdog, hourly tick** (interval in main, first tick skipped like OAuth refresher):
-   - `queued AND next_eligible_at <= now` → load task row (must be live: `status='active'`,
-     not soft-deleted), rebuild `IncomingMessage` from `chat_id/prompt/platform/user_id`
-     exactly like `build_fire_closure`, set `rerun_id = Some(row.id)`, dispatch on `job_tx`,
-     bump `attempts += 1, next_eligible_at += 30m`.
+   - `queued AND attempts=0 AND next_eligible_at <= now` → load task row (must be live:
+     `status='active'`, not soft-deleted), **claim first** (`mark_dispatched`: attempts+=1,
+     next_eligible+=30m), then rebuild `IncomingMessage` / dispatch on `job_tx` with
+     `rerun_id = Some(row.id)`.
    - `awaiting_user` older than **7 days** → `abandoned` + DM one-liner (don't nag forever).
 
-4. **Runner outcome, when `req.rerun_id.is_some()`** (Q3 two-strike):
-   - success → queue row `done`; Telegram send path identical to a normal run.
+4. **Runner outcome** (Q3 two-strike):
+   - success (any scheduled run) → if `rerun_id` set, that row `done`; then
+     supersede all remaining live (`queued|awaiting_user`) rows for the task.
+     Telegram send path identical to a normal run.
    - failure → queue row `awaiting_user`; DM: task name, both failures, `[retry <id>] /
      [cancel <id>]` instructions. **No** further auto attempts.
 
@@ -64,9 +66,9 @@ job that posted 3 of 6 replies would post them again). Decision:
    - `list` → active rows (queued/awaiting_user) with id, task, attempts, age.
 
 6. **Crash safety:** boot runs `UPDATE pending_reruns SET attempts=0, next_eligible_at=… WHERE
-   state='queued' AND attempts>0` — a re-fire dispatched but not persisted would otherwise
-   strand at attempts=1 and silently upgrade to "ask on second death" for a run that never ran.
-   (Dispatch → tick persists attempts *before* send; the crash window is one tick.)
+   state='queued' AND attempts>0` — a re-fire claimed via `mark_dispatched` but never given an
+   outcome would otherwise sit outside `due()` forever (attempts>0) / look consumed. Reset
+   restores the single auto-attempt. Claim happens *before* send.
 
 7. **Retention:** `done`/`abandoned`/`superseded` rows older than 30 days deleted at watchdog
    tick (queue is control state, not history — history lives in `scheduled_task_runs`).
@@ -121,3 +123,21 @@ byte-identical.
 **Why notify-only and not auto-retry:** a max-iterations run stopped *between* tool calls, not
 before them. Unlike a turn-1 429 (zero side effects), replaying it can duplicate whatever it
 already did — exactly the Threads-duplicate hazard Q3 exists to prevent.
+
+## Amendment (2026-09-28): P0 watchdog dispatch + success supersede
+
+Two holes found after #60 merged; queue not trusted until this fixup lands.
+
+1. **Dispatch claim-before-send + `due()` attempts=0.** Watchdog now calls
+   `mark_dispatched` *before* `build_rerun_request`. `due()` only returns
+   `state='queued' AND attempts=0 AND next_eligible_at <= now`, so a claimed
+   in-flight row cannot auto re-fire when eligibility elapses mid-run, and a
+   crash between send and bump can no longer leave `attempts=0`. Human `retry()`
+   already resets `attempts=0`. `reset_inflight_on_boot` stays: queued rows with
+   `attempts>0` (claimed but no outcome) are reset to `attempts=0` so the auto
+   budget is not silently burned / stranded outside `due()`.
+
+2. **Successful cron clears live queue rows.** Any successful scheduled run
+   (cron `rerun_id=None` or re-fire) calls `supersede_live_for_task(task_id)` so
+   leftover `queued|awaiting_user` siblings cannot be stale-replayed. Re-fires
+   still `mark_done(rid)` first (row shows `done`, not `superseded`).

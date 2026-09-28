@@ -394,9 +394,10 @@ async fn main() -> Result<()> {
                                         );
                                         if let Ok(cv) = req.incoming.chat_id.parse::<i64>() {
                                             let note = format!(
-                                                "**Scheduled task stalled:** it hit the iteration cap ({}) without finishing, so I did NOT auto-retry (it may have half-done work).\n\n{}",
+                                                "**Scheduled task stalled:** it hit the iteration cap ({}) without finishing, so I did NOT auto-retry (it may have half-done work).\n\n{}\n\nReply with:\n- retry → try once more automatically\n- cancel → give up\n\n(queue id: `{}`)",
                                                 agent.config.max_iterations(),
-                                                reason
+                                                reason,
+                                                qid
                                             );
                                             let _ = rustfox::platform::telegram::send_markdown_message(
                                                 &req.bot,
@@ -435,15 +436,23 @@ async fn main() -> Result<()> {
                     {
                         tracing::warn!("Failed to update scheduled task run record: {}", e);
                     }
-                    // ADR-0013: a re-fire that succeeded closes its queue row.
-                    // Output delivery below is byte-identical to a normal run
-                    // (Kan Q4: no "♻️ delayed" marker anywhere).
+                    // ADR-0013 / P0 #2: any successful scheduled run (cron or
+                    // re-fire) must clear leftover live queue rows for this
+                    // task — otherwise the next watchdog tick can stale-replay
+                    // a queued/awaiting_user sibling. Mark the fired row done
+                    // first so it shows as `done` rather than `superseded`.
                     if let Some(rid) = &req.rerun_id {
                         if let Err(e) = queue_for_runner.mark_done(rid).await {
                             tracing::warn!("Failed to mark rerun {rid} done: {e:#}");
                         } else {
                             tracing::info!("Rerun {rid} succeeded — queue row closed");
                         }
+                    }
+                    if let Err(e) = queue_for_runner.supersede_live_for_task(&req.task_id).await {
+                        tracing::warn!(
+                            "Failed to supersede live reruns for {}: {e:#}",
+                            req.task_id
+                        );
                     }
                     r
                 }
@@ -618,6 +627,13 @@ async fn main() -> Result<()> {
                         let _ = queue.mark_abandoned(&row.id).await;
                         continue;
                     }
+                    // P0 #1: claim *before* send so a crash mid-dispatch cannot
+                    // leave attempts=0 (auto re-fire) and so due()'s attempts=0
+                    // filter excludes this row while it is in-flight.
+                    if let Err(e) = queue.mark_dispatched(&row.id).await {
+                        tracing::warn!("Rerun bump-attempts failed for {}: {e:#}", row.id);
+                        continue;
+                    }
                     if let Err(e) = rustfox::agent::Agent::build_rerun_request(
                         &tx,
                         Arc::clone(&bot2),
@@ -626,8 +642,6 @@ async fn main() -> Result<()> {
                         &row.id,
                     ) {
                         tracing::warn!("Rerun dispatch failed for {}: {e:#}", row.id);
-                    } else if let Err(e) = queue.mark_dispatched(&row.id).await {
-                        tracing::warn!("Rerun bump-attempts failed for {}: {e:#}", row.id);
                     }
                 }
                 // 2. Age out unanswered awaiting_user rows (one-line DM each).
@@ -635,6 +649,25 @@ async fn main() -> Result<()> {
                     Ok(ids) => {
                         for id in ids {
                             tracing::info!("Rerun {id} expired unanswered → abandoned");
+                            let chat_id = match queue.get(&id).await {
+                                Ok(Some(row)) => match store.get_by_id(&row.task_id).await {
+                                    Ok(Some(task)) => task.chat_id.parse::<i64>().ok(),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(cv) = chat_id {
+                                let note = format!(
+                                    "Scheduled re-run gate expired unanswered — abandoned (queue id: `{id}`)."
+                                );
+                                let _ = rustfox::platform::telegram::send_markdown_message(
+                                    &bot2,
+                                    teloxide::types::ChatId(cv),
+                                    &note,
+                                    rustfox::platform::telegram::MessageFormat::Auto,
+                                )
+                                .await;
+                            }
                         }
                     }
                     Err(e) => tracing::warn!("Rerun expiry failed: {e:#}"),
