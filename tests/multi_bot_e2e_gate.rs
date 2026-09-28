@@ -36,11 +36,13 @@ fn e2e_gate_wizard_add_another_bot_bak_and_materialize() {
     std::fs::write(&path, minimal_legacy_toml()).unwrap();
     let before = std::fs::read_to_string(&path).unwrap();
 
+    let store = rustfox::secret_store::FakeSecretStore::new();
     let r = append_bot_binding(
         &path,
         "researcher",
         "222222222:AANewTokenSecretValueYYYYYY",
         42,
+        &store,
     )
     .unwrap();
     assert_eq!(r.id, "researcher");

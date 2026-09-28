@@ -1114,7 +1114,33 @@ async fn try_handle_pending_agent_token(
         "Telegram /agents token bind attempt"
     );
 
-    match crate::agents_edit::append_bot_binding(&agent.config_path, &pending_id, token, user_id) {
+    let home = agent
+        .config
+        .resolved_home()
+        .cloned()
+        .or_else(|| agent.config_path.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let bind_store = match crate::secret_store::open(&home) {
+        Ok((s, _)) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "Secret store open failed for /agents bind");
+            let _ = send_markdown_message(
+                bot,
+                msg.chat.id,
+                &format!("❌ Could not open SecretStore for bind: {e}"),
+                msg_format,
+            )
+            .await;
+            return Ok(true);
+        }
+    };
+    match crate::agents_edit::append_bot_binding(
+        &agent.config_path,
+        &pending_id,
+        token,
+        user_id,
+        bind_store.as_ref(),
+    ) {
         Ok(result) => {
             agent.memory.forget("settings", &key).await.ok();
             let reply = format!(

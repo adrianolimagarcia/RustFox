@@ -1,7 +1,9 @@
 # RustFox Configuration
 
 [telegram]
-# Get your bot token from @BotFather on Telegram
+# Get your bot token from @BotFather on Telegram.
+# Prefer secret:NAME (canonical: secret:bot.<id>.token). Plaintext BotFather
+# tokens are migrated into SecretStore and scrubbed from config.toml on startup.
 bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 # Only these Telegram user IDs can interact with the bot
 # Find your user ID by messaging @userinfobot on Telegram
@@ -21,7 +23,7 @@ allowed_user_ids = [123456789]
 #
 # [[bots]]
 # id = "main"
-# bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+# bot_token = "secret:bot.main.token"   # or plaintext once — migrated/scrubbed on start
 # allowed_user_ids = [123456789]
 # persona = "main"                 # agents/<persona>/AGENT.md + optional SOUL.md overlay
 # # system_prompt_file = "prompts/main.md"  # optional; wins over AGENT.md when set
@@ -33,7 +35,7 @@ allowed_user_ids = [123456789]
 # Main-loop tools/model precedence (§7.6): bots[] fields → agents/<persona>/AGENT.md → install defaults.
 # [[bots]]
 # id = "researcher"
-# bot_token = "YOUR_RESEARCHER_BOT_TOKEN"
+# bot_token = "secret:bot.researcher.token"
 # allowed_user_ids = [123456789]
 # persona = "researcher"
 # # Optional overrides (wired on the main Telegram path):

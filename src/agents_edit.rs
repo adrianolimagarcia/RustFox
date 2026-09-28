@@ -191,13 +191,19 @@ pub struct BindBotResult {
 /// Append a new `[[bots]]` row (materializing legacy `[telegram]` into `[[bots]]`
 /// when needed). Uses validate → bak → atomic write.
 ///
-/// Duplicate `id` or `bot_token` is rejected. `allowed_user_ids` must be non-empty
-/// (caller id). The raw token is never returned in [`BindBotResult`].
+/// The BotFather token is written to [`crate::secret_store::SecretStore`] under
+/// `bot.<id>.token`; config holds `secret:bot.<id>.token` only (never plaintext).
+/// Existing plaintext bot tokens in the rewritten list are migrated into the store
+/// in the same write (scrub path).
+///
+/// Duplicate `id` or resolved `bot_token` is rejected. `allowed_user_ids` must be
+/// non-empty (caller id). The raw token is never returned in [`BindBotResult`].
 pub fn append_bot_binding(
     config_path: &Path,
     id: &str,
     bot_token: &str,
     caller_user_id: u64,
+    store: &dyn crate::secret_store::SecretStore,
 ) -> Result<BindBotResult> {
     validate_agent_id(id)?;
     let id = id.trim().to_string();
@@ -223,30 +229,59 @@ pub fn append_bot_binding(
     if cfg.bots.iter().any(|b| b.id.trim() == id) {
         bail!("duplicate bots[].id \"{id}\"");
     }
-    if cfg.bots.iter().any(|b| b.bot_token.trim() == token) {
-        bail!("duplicate bots[].bot_token");
+    for b in &cfg.bots {
+        match crate::secret_store::resolve_bot_token(store, &b.bot_token) {
+            Ok(existing) if existing == token => bail!("duplicate bots[].bot_token"),
+            _ => {}
+        }
     }
 
+    // Scrub any plaintext tokens already present while rewriting the list.
+    let mut bots = Vec::with_capacity(cfg.bots.len() + 1);
+    for mut b in cfg.bots {
+        let raw = b.bot_token.trim().to_string();
+        if looks_like_bot_token(&raw) {
+            b.bot_token = crate::secret_store::store_bot_token(store, &b.id, &raw)
+                .context("Failed to migrate existing bot token into SecretStore")?;
+        }
+        bots.push(b);
+    }
+
+    let secret_ref = crate::secret_store::store_bot_token(store, &id, token)
+        .context("Failed to store bot token in SecretStore")?;
     let allowed = vec![caller_user_id];
-    let new_bot = BotConfig {
+    bots.push(BotConfig {
         id: id.clone(),
-        bot_token: token.to_string(),
+        bot_token: secret_ref,
         allowed_user_ids: allowed.clone(),
         persona: id.clone(),
         system_prompt_file: None,
         model: None,
         tools: None,
-    };
-
-    // Materialize full list (includes synthesized legacy default when needed).
-    let mut bots = cfg.bots;
-    bots.push(new_bot);
+    });
 
     let mut doc: toml::Value =
         toml::from_str(&content).context("Failed to parse config.toml as Value")?;
     let bots_val = bots_to_toml_array(&bots);
     if let Some(table) = doc.as_table_mut() {
         table.insert("bots".to_string(), bots_val);
+        // Scrub legacy [telegram].bot_token if still plaintext.
+        if let Some(tg) = table.get_mut("telegram").and_then(|v| v.as_table_mut()) {
+            let scrub = tg
+                .get("bot_token")
+                .and_then(|v| v.as_str())
+                .map(looks_like_bot_token)
+                .unwrap_or(false);
+            if scrub {
+                let shim_id = Config::shim_bot(&bots).id.clone();
+                let shim_ref = bots
+                    .iter()
+                    .find(|b| b.id == shim_id)
+                    .map(|b| b.bot_token.clone())
+                    .unwrap_or_else(|| crate::secret_store::bot_token_secret_ref(&shim_id));
+                tg.insert("bot_token".to_string(), toml::Value::String(shim_ref));
+            }
+        }
     } else {
         bail!("config.toml root is not a table");
     }
@@ -267,7 +302,7 @@ pub fn append_bot_binding(
     })
 }
 
-fn bots_to_toml_array(bots: &[BotConfig]) -> toml::Value {
+pub(crate) fn bots_to_toml_array(bots: &[BotConfig]) -> toml::Value {
     let arr: Vec<toml::Value> = bots
         .iter()
         .map(|b| {
@@ -327,6 +362,7 @@ pub fn redact_possible_token(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret_store::SecretStore;
     use tempfile::TempDir;
 
     fn minimal_legacy_toml() -> String {
@@ -427,12 +463,14 @@ allowed_directory = "/tmp"
         let dir = TempDir::new().unwrap();
         let path = write_cfg(&dir, &minimal_bots_toml());
         let before = std::fs::read_to_string(&path).unwrap();
+        let store = crate::secret_store::FakeSecretStore::new();
 
         let r = append_bot_binding(
             &path,
             "researcher",
             "222222222:AANewTokenSecretValueYYYYYY",
             99,
+            &store,
         )
         .unwrap();
         assert_eq!(r.id, "researcher");
@@ -444,7 +482,13 @@ allowed_directory = "/tmp"
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("researcher"));
-        assert!(after.contains("222222222:AANewTokenSecretValueYYYYYY"));
+        assert!(after.contains("secret:bot.researcher.token"));
+        assert!(!after.contains("222222222:AANewTokenSecretValueYYYYYY"));
+        assert!(!after.contains("AAMainTokenSecretValueXXXX"));
+        assert_eq!(
+            store.get("bot.researcher.token").unwrap().unwrap().expose(),
+            "222222222:AANewTokenSecretValueYYYYYY"
+        );
         // show/list helpers still redact
         let mut cfg: Config = toml::from_str(&after).unwrap();
         cfg.normalize_bots().unwrap();
@@ -456,6 +500,7 @@ allowed_directory = "/tmp"
             "researcher",
             "333333333:AAOtherTokenSecretValueZZZZ",
             99,
+            &store,
         )
         .unwrap_err()
         .to_string();
@@ -466,9 +511,17 @@ allowed_directory = "/tmp"
     fn append_bot_rejects_duplicate_token() {
         let dir = TempDir::new().unwrap();
         let path = write_cfg(&dir, &minimal_bots_toml());
-        let err = append_bot_binding(&path, "other", "111111111:AAMainTokenSecretValueXXXX", 99)
-            .unwrap_err()
-            .to_string();
+        let store = crate::secret_store::FakeSecretStore::new();
+        // Config still has plaintext main — resolve compares plaintext equality.
+        let err = append_bot_binding(
+            &path,
+            "other",
+            "111111111:AAMainTokenSecretValueXXXX",
+            99,
+            &store,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("duplicate bots[].bot_token"), "{err}");
     }
 
@@ -476,15 +529,19 @@ allowed_directory = "/tmp"
     fn append_bot_materializes_legacy_telegram() {
         let dir = TempDir::new().unwrap();
         let path = write_cfg(&dir, &minimal_legacy_toml());
+        let store = crate::secret_store::FakeSecretStore::new();
         let r = append_bot_binding(
             &path,
             "researcher",
             "222222222:AANewTokenSecretValueYYYYYY",
             7,
+            &store,
         )
         .unwrap();
         assert_eq!(r.id, "researcher");
         let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("AALegacyTokenSecretValueXX"));
+        assert!(!after.contains("AANewTokenSecretValueYYYYYY"));
         let mut cfg: Config = toml::from_str(&after).unwrap();
         cfg.normalize_bots().unwrap();
         // legacy default + new
@@ -494,6 +551,7 @@ allowed_directory = "/tmp"
         let research = cfg.bots.iter().find(|b| b.id == "researcher").unwrap();
         assert_eq!(research.allowed_user_ids, vec![7]);
         assert_eq!(research.persona, "researcher");
+        assert_eq!(research.bot_token, "secret:bot.researcher.token");
     }
 
     #[test]

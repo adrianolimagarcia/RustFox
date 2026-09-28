@@ -50,6 +50,8 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 > Override with `RUSTFOX_HOME` env or `[general].home`.
 > See [docs/persistent-home-directory.md](persistent-home-directory.md).
 > **Secrets:** Prefer the OS keyring (macOS Keychain / Windows Credential Manager / Linux keyutils). If unavailable, RustFox uses an AES-GCM vault at `~/.rustfox/secrets/vault` whose master key is a **plaintext file** `~/.rustfox/secrets/vault.key` (mode `0600`). Anyone who can read `vault.key` can decrypt the vault — treat home-directory permissions as the trust boundary and prefer the OS keyring when available. Pending secret entry uses the portal masked form + Telegram notify/link (never paste values in chat). Required secrets for MCP env use the `secret:NAME` value form; `[sandbox].secret_env` injects named secrets into `execute_command` child processes via env only (never chat/LLM/tool args/logs).
+>
+> **Bot tokens:** `[[bots]].bot_token` / legacy `[telegram].bot_token` must be a `secret:NAME` reference (canonical name `bot.<id>.token`). `/agents` bind and wizard add-bot write the BotFather token into SecretStore and store only the ref in `config.toml`. On startup, any remaining BotFather-shaped plaintext is migrated into the store and scrubbed from disk (`.bak` via the shared config write path). `/config`, `/agents`, and restart replies never echo token values (`bot_token=***`). Manual path: `secret` store set `bot.<id>.token` then set `bot_token = "secret:bot.<id>.token"` in config.
 
 ---
 
@@ -72,13 +74,13 @@ You can also add a bot from Telegram with [`/agents create`](#agents-create-pers
 ```toml
 [[bots]]
 id = "main"
-bot_token = "…"
+bot_token = "secret:bot.main.token"   # never plaintext after bind/migrate
 allowed_user_ids = [123456789]
 persona = "main"
 
 [[bots]]
 id = "researcher"
-bot_token = "…"
+bot_token = "secret:bot.researcher.token"
 allowed_user_ids = [123456789]
 persona = "researcher"
 ```
@@ -293,7 +295,7 @@ Editable via Telegram (only users already on the bot allowlist):
 1. `/agents` — list configured bots (ids + personas; **never** raw tokens).
 2. `/agents create <id>` — writes `agents/<id>/AGENT.md` + default `SOUL.md`, then arms a **one-shot** token capture for the caller.
 3. Send the BotFather token as the next message — message is **deleted** best-effort; logs/replies show `bot_token=***` only; token is never stored in conversation memory.
-4. Appends `[[bots]] { id, bot_token, persona=<id>, allowed_user_ids=[caller] }` via validate → `config.toml.bak` → atomic write (same path as `/config`), rejects duplicate `id` or `bot_token`, then **restarts**.
+4. Stores the token in SecretStore as `bot.<id>.token`, appends `[[bots]] { id, bot_token="secret:bot.<id>.token", persona=<id>, allowed_user_ids=[caller] }` via validate → `config.toml.bak` → atomic write (same path as `/config`), rejects duplicate `id` or resolved token, then **restarts**.
 5. Delete / soft-disable and hot-add without restart are **not** in v1.
 
 ---

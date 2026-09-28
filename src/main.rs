@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     );
 
     info!("Loading configuration from: {}", config_path.display());
-    let config = Config::load(&config_path)
+    let mut config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     // Build provider registry from config
@@ -197,7 +197,26 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let _ = secret_backend;
+    // P0: one-time migrate plaintext [[bots]].bot_token → SecretStore + scrub config.
+    // Only when a durable backend is available — never scrub into an in-memory Fake.
+    if secret_backend.is_some() {
+        match rustfox::secret_store::migrate_plaintext_bot_tokens(
+            &config_path,
+            secret_bridge.store().as_ref(),
+        ) {
+            Ok(n) if n > 0 => {
+                info!("  Migrated {n} plaintext bot token(s) into SecretStore (config scrubbed)");
+                config =
+                    Config::load(&config_path).context("reload config after bot-token migrate")?;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("  Bot-token SecretStore migrate skipped: {e:#}");
+            }
+        }
+    } else {
+        warn!("  Bot-token migrate skipped (no durable SecretStore backend)");
+    }
 
     // Refresh any expiring OAuth tokens before connecting to MCP servers
     let http_client = reqwest::Client::new();
@@ -272,14 +291,22 @@ async fn main() -> Result<()> {
         info!("  Telegram Bot API base: {telegram_api_base} (from [telegram].api_base_url)");
     }
 
+    let store_for_bots = secret_bridge.store();
     let bot_runtimes: Vec<(String, Arc<teloxide::Bot>, Vec<u64>)> = config
         .bots
         .iter()
         .map(|b| {
-            let bot = teloxide::Bot::new(&b.bot_token).set_api_url(telegram_api_url.clone());
-            (b.id.clone(), Arc::new(bot), b.allowed_user_ids.clone())
+            let token =
+                rustfox::secret_store::resolve_bot_token(store_for_bots.as_ref(), &b.bot_token)
+                    .with_context(|| format!("resolve bot token for bots[].id={}", b.id))?;
+            // Seed redaction set so accidental echo in tool output is scrubbed.
+            if let Some(name) = rustfox::secret_store::parse_secret_ref(&b.bot_token) {
+                let _ = secret_bridge.get(name);
+            }
+            let bot = teloxide::Bot::new(&token).set_api_url(telegram_api_url.clone());
+            Ok::<_, anyhow::Error>((b.id.clone(), Arc::new(bot), b.allowed_user_ids.clone()))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let shim = Config::shim_bot(&config.bots);
     let bot = bot_runtimes
         .iter()
