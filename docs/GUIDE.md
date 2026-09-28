@@ -1,6 +1,7 @@
 # RustFox Guide
 
 - [Configuration](#configuration)
+- [Multi-bot](#multi-bot)
 - [MCP Server Integration](#mcp-server-integration)
 - [Built-in Tools](#built-in-tools)
 - [Bot Commands](#bot-commands)
@@ -47,6 +48,48 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 > Persistent home: All paths resolve relative to `~/.rustfox` by default.
 > Override with `RUSTFOX_HOME` env or `[general].home`.
 > See [docs/persistent-home-directory.md](persistent-home-directory.md).
+
+---
+
+## Multi-bot
+
+One RustFox process can host **N Telegram bots** (N BotFather tokens) sharing one sandbox, skills, MCP, and memory DB. Personas / allowlists are per bot; peer help is tool-mediated (not Telegram bot↔bot).
+
+### Adding a second bot (wizard)
+
+1. Run `rustfox --setup` (web) or `rustfox --setup --cli`.
+2. Configure the primary bot as usual (`[telegram]` on first save).
+3. Click **Add another bot** (or answer `y` in CLI) — enter bot id, BotFather token, and allowed user id.
+4. On save, each extra bot is appended via **validate → `config.toml.bak` → atomic write** (same path as `/config` / `/agents`). The **first** multi-bot add materializes legacy `[telegram]` into `[[bots]]` (design §6 / PO §8b).
+5. Restart (or let the service manager bring the process back) so both dispatchers start.
+
+You can also add a bot from Telegram with [`/agents create`](#agents-create-persona--bind-token) (token is one-shot, never echoed).
+
+### Config shape
+
+```toml
+[[bots]]
+id = "main"
+bot_token = "…"
+allowed_user_ids = [123456789]
+persona = "main"
+
+[[bots]]
+id = "researcher"
+bot_token = "…"
+allowed_user_ids = [123456789]
+persona = "researcher"
+```
+
+Shared sections (`[sandbox]`, `[skills]`, `[agents]`, MCP, providers) stay install-wide. See [`config.example.toml`](../config.example.toml) for the commented researcher example. Conversation history is keyed by `(platform, bot_id, user_id)`.
+
+### Peer invoke + slash commands
+
+- **`invoke_agent` / `spawn_agents`** — resolve `agents/`, subagent skills, or a `[[bots]]` persona id (`bot=` synonym). Nested peer depth max **2**; cycles rejected; user-visible peer summaries prepend `via <persona>:`. Reply stays in the **caller’s** chat. Details: [Agent Tools](#agent-tools).
+- **`/agents`** — list / show / create + bind token (`bot_token=***`). Details: [`/agents`](#agents-create-persona--bind-token).
+- **`/config`** — allowlisted `config.toml` edits with the same bak path (secrets denied). Details: [`/config` slash map](#config-slash-map-allowlist).
+
+Live E2E checklist (≥2 BotFather test bots): [`docs/multi-bot-e2e.md`](multi-bot-e2e.md). Automated gate (no Update injector): `cargo test --test multi_bot_e2e_gate`.
 
 ---
 
@@ -361,6 +404,7 @@ Optional observability via LangSmith for LLM calls, tool runs, and chain traces.
 - [x] Multi-platform service setup (`--setup` wizard, `--service` install)
 - [x] Build scripts & CI release workflow (`.tar.gz`, `.zip`, `.deb`)
 - [x] Ad-hoc parallel subagents (`spawn_agents`)
+- [x] Multi-bot (`[[bots]]`, wizard Add another bot, peer invoke)
 
 ### Planned
 

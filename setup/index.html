@@ -714,6 +714,11 @@ const state = {
   // Step 1 — Bot & LLM Setup
   telegram_token: '',
   allowed_user_ids: '',
+  // Additional bots collected via "Add another bot" (§7.7).
+  // Each: { id, bot_token, allowed_user_id, persona }
+  extra_bots: [],
+  // On-disk [[bots]] ids from load-config (full save appends only new ids).
+  existing_bot_ids: [],
   openrouter_key: '',
   model: 'moonshotai/kimi-k2.6',
   max_tokens: '4096',
@@ -854,6 +859,7 @@ function collectStep(n) {
     state.system_prompt    = document.getElementById('f-system-prompt')?.value   || state.system_prompt;
     state.supports_vision  = !!document.getElementById('f-supports-vision')?.checked;
     state.base_url         = (document.getElementById('f-base-url')?.value       || state.base_url).trim() || 'https://openrouter.ai/api/v1';
+    collectExtraBotsFromDom();
   }
   if (n === 2) {
     state.location                   = (document.getElementById('f-location')?.value              || state.location).trim();
@@ -884,6 +890,67 @@ function collectAll() {
     if (s === 4) continue; // Step 4 has no inputs of its own
     try { collectStep(s); } catch (_) { /* fields may not exist for this view */ }
   }
+}
+
+// ── Extra bots (§7.7 multi-bot wizard) ─────────────────────────────────────────
+function addExtraBotRow(prefill) {
+  const b = prefill || { id: '', bot_token: '', allowed_user_id: '', persona: '' };
+  state.extra_bots.push(b);
+  renderExtraBots();
+}
+
+function removeExtraBotRow(i) {
+  state.extra_bots.splice(i, 1);
+  renderExtraBots();
+}
+
+function collectExtraBotsFromDom() {
+  const rows = document.querySelectorAll('#extra-bots-list .extra-bot-row');
+  const out = [];
+  rows.forEach((row) => {
+    const id = (row.querySelector('.eb-id')?.value || '').trim();
+    const bot_token = (row.querySelector('.eb-token')?.value || '').trim();
+    const allowed_user_id = (row.querySelector('.eb-uid')?.value || '').trim();
+    const persona = (row.querySelector('.eb-persona')?.value || '').trim() || id;
+    if (id || bot_token) {
+      out.push({ id, bot_token, allowed_user_id, persona });
+    }
+  });
+  state.extra_bots = out;
+}
+
+function renderExtraBots() {
+  const el = document.getElementById('extra-bots-list');
+  if (!el) return;
+  if (!state.extra_bots.length) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = state.extra_bots.map((b, i) => `
+    <div class="extra-bot-row" data-i="${i}" style="border:1px solid #2d3748;border-radius:8px;padding:0.75rem;margin-bottom:0.6rem;background:#151a27">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+        <strong style="font-size:0.85rem;color:#90cdf4">Extra bot #${i + 1}</strong>
+        <button type="button" class="btn-guide" onclick="removeExtraBotRow(${i})">Remove</button>
+      </div>
+      <div class="field">
+        <label>Bot id</label>
+        <input class="eb-id" type="text" placeholder="researcher" value="${escHtml(b.id || '')}" oninput="clearFieldError(this)">
+      </div>
+      <div class="field">
+        <label>BotFather token</label>
+        <input class="eb-token" type="password" placeholder="456:BB..." value="${escHtml(b.bot_token || '')}" oninput="clearFieldError(this)">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Allowed user id</label>
+          <input class="eb-uid" type="text" placeholder="same as primary" value="${escHtml(b.allowed_user_id || '')}">
+        </div>
+        <div class="field">
+          <label>Persona <span class="hint">— default = id</span></label>
+          <input class="eb-persona" type="text" placeholder="researcher" value="${escHtml(b.persona || '')}">
+        </div>
+      </div>
+    </div>`).join('');
 }
 
 // ── TOML generation ────────────────────────────────────────────────────────────
@@ -1057,9 +1124,20 @@ function renderSummary() {
   const section = (title, body) => `<div class="summary-section"><h3>${escHtml(title)}</h3><div class="summary-list">${body}</div></div>`;
 
   let html = '';
+  collectExtraBotsFromDom();
+  const extraSummary = state.extra_bots.length
+    ? state.extra_bots.map((b, i) => row(
+        'Extra bot #' + (i + 1),
+        (b.id || '?') + ' / token ' + (b.bot_token ? maskSecret(b.bot_token) : '(missing)') +
+          ' / uid ' + (b.allowed_user_id || '(primary)') +
+          ' / persona ' + (b.persona || b.id || '?'),
+        null
+      )).join('')
+    : row('Extra bots', null, 'none (single-bot)');
   html += section('Bot & LLM', [
     row('Bot token',       state.telegram_token ? maskSecret(state.telegram_token) : null, 'missing'),
     row('Allowed user IDs', state.allowed_user_ids || null, 'missing'),
+    extraSummary,
     row('OpenRouter key',  state.openrouter_key ? maskSecret(state.openrouter_key) : null, 'missing'),
     row('Model',           state.model),
     row('Base URL',        state.base_url),
@@ -1100,22 +1178,73 @@ function maskSecret(s) {
 
 // ── Save ───────────────────────────────────────────────────────────────────────
 async function saveConfig() {
+  collectExtraBotsFromDom();
   const config = generateToml();
   const btn = document.getElementById('btn-next');
   btn.disabled = true;
   try {
+    // Snapshot existing bot ids before save so we only append NEW bots.
+    // Server-side save-config merge-preserves untouched [[bots]] rows
+    // (tools/model/persona/allowlist) when they already exist.
+    const existingIds = new Set(state.existing_bot_ids || []);
+    try {
+      const lr = await fetch('/api/load-config');
+      if (lr.ok) {
+        const cfg = await lr.json();
+        for (const b of (cfg.bots || [])) {
+          if (b && b.id) existingIds.add(b.id);
+        }
+      }
+    } catch (_) { /* offline / first-run — treat as no existing bots */ }
+
     const res = await fetch('/api/save-config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ config }),
     });
     const data = await res.json();
-    if (data.ok) {
-      showStep(TOTAL_STEPS);
-    } else {
+    if (!data.ok) {
       btn.disabled = false;
       alert('Server error saving config.');
+      return;
     }
+
+    // Append each *new* extra bot via validate → bak → atomic (materializes
+    // [telegram] into [[bots]] on the first multi-bot add). Skip ids that
+    // already exist so we never wipe/rebuild secondary customizations.
+    const primaryUid = parseInt(String(state.allowed_user_ids).split(/[\s,]+/).filter(Boolean)[0] || '0', 10) || 0;
+    for (const b of state.extra_bots) {
+      if (!b.id || !b.bot_token) {
+        alert('Extra bot needs both id and BotFather token — skipped incomplete rows.');
+        continue;
+      }
+      if (existingIds.has(b.id)) continue; // already on disk — preserve
+      if (b.bot_token === '***') continue; // redacted existing token — never re-bind
+      const uid = parseInt(b.allowed_user_id || primaryUid, 10) || primaryUid;
+      if (!uid) {
+        alert('Extra bot `' + b.id + '` needs an allowed user id.');
+        btn.disabled = false;
+        return;
+      }
+      const addRes = await fetch('/api/add-bot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: b.id,
+          bot_token: b.bot_token,
+          allowed_user_id: uid,
+        }),
+      });
+      const addData = await addRes.json();
+      if (!addData.ok) {
+        btn.disabled = false;
+        alert('Failed to add bot `' + b.id + '`: ' + (addData.error || 'unknown error'));
+        return;
+      }
+      existingIds.add(b.id);
+    }
+
+    showStep(TOTAL_STEPS);
   } catch (e) {
     btn.disabled = false;
     alert('Failed to save: ' + e.message);
@@ -1238,6 +1367,10 @@ async function loadExistingConfig() {
         });
       }
     }
+
+    // Remember on-disk bot ids so full save only appends NEW extras
+    // (server merge-preserves existing [[bots]] customizations).
+    state.existing_bot_ids = (cfg.bots || []).map(b => b.id).filter(Boolean);
 
     state._loaded = true;
 
@@ -1455,6 +1588,16 @@ function buildSteps() {
     <input type="password" id="f-openrouter-key" placeholder="sk-or-..."
            value="${escHtml(state.openrouter_key)}" oninput="clearFieldError(this)">
     <div class="error-msg">API key is required.</div>
+  </div>
+
+  <div class="field" style="margin-top:1.25rem">
+    <label>Multi-bot <span class="hint">— optional second (and further) Telegram identities in one process</span></label>
+    <p style="font-size:0.8rem;color:#a0aec0;margin:0.35rem 0 0.75rem">
+      “Add another bot” appends <code>[[bots]]</code> via validate → <code>config.toml.bak</code> → atomic write
+      (same path as Telegram <code>/agents</code>). First multi-bot add rewrites legacy <code>[telegram]</code> into <code>[[bots]]</code>.
+    </p>
+    <div id="extra-bots-list"></div>
+    <button type="button" class="btn-guide" onclick="addExtraBotRow()" style="margin-top:0.5rem">＋ Add another bot</button>
   </div>
 
   <div class="advanced-section collapsed" data-section="llm">
@@ -1851,6 +1994,7 @@ async function connectOAuth(serverName, mcpUrl, authTokenVar) {
 async function init() {
   await loadExistingConfig();
   buildSteps();
+  renderExtraBots();
   if (state._loaded) {
     document.getElementById('existing-banner').style.display = 'block';
   }

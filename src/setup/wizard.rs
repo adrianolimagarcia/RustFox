@@ -73,6 +73,25 @@ struct SaveResponse {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct AddBotRequest {
+    id: String,
+    bot_token: String,
+    /// Telegram user id used for the new bot allowlist (caller / owner).
+    allowed_user_id: u64,
+}
+
+#[derive(Serialize)]
+struct AddBotResponse {
+    ok: bool,
+    id: String,
+    persona: String,
+    bak_path: String,
+    allowed_user_ids: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Serialize, Default)]
 pub struct ExistingConfig {
     pub exists: bool,
@@ -104,6 +123,18 @@ pub struct ExistingConfig {
     pub learning_user_model_update_interval: u32,
     pub learning_user_model_cron: String,
     pub mcp_servers: Vec<ExistingMcpServer>,
+    /// Existing `[[bots]]` entries (tokens redacted in API responses).
+    #[serde(default)]
+    pub bots: Vec<ExistingBot>,
+}
+
+#[derive(Serialize, Default, Clone)]
+pub struct ExistingBot {
+    pub id: String,
+    pub persona: String,
+    pub allowed_user_ids: String,
+    /// Always redacted (`***`) — never echo raw tokens from the wizard API.
+    pub bot_token: String,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -132,6 +163,16 @@ pub struct RawConfig {
     pub agents_config: Option<RawAgentsConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<RawMcpServer>,
+    #[serde(default)]
+    pub bots: Vec<RawBot>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+pub struct RawBot {
+    pub id: Option<String>,
+    pub bot_token: Option<String>,
+    pub allowed_user_ids: Option<Vec<toml::Value>>,
+    pub persona: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -328,6 +369,7 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .route("/", get(serve_index))
         .route("/api/load-config", get(load_config))
         .route("/api/save-config", post(save_config))
+        .route("/api/add-bot", post(add_bot))
         .route("/api/install-service", post(install_service))
         .route("/api/shutdown", post(shutdown_server))
         .route("/api/oauth/start", get(oauth_start))
@@ -373,7 +415,21 @@ async fn save_config(
     State(st): State<WizardState>,
     Json(body): Json<SaveRequest>,
 ) -> Result<Json<SaveResponse>, StatusCode> {
-    tokio::fs::write(&st.config_path, &body.config)
+    // When [[bots]] already exists, merge-preserve those rows so a full wizard
+    // rewrite cannot wipe secondary tools/model/persona/allowlist (§7.7 TL HOLD).
+    let content = if st.config_path.exists() {
+        match tokio::fs::read_to_string(&st.config_path).await {
+            Ok(existing) => merge_wizard_save(&existing, &body.config).map_err(|e| {
+                eprintln!("save-config merge failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
+            Err(_) => body.config.clone(),
+        }
+    } else {
+        body.config.clone()
+    };
+
+    tokio::fs::write(&st.config_path, &content)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -381,6 +437,58 @@ async fn save_config(
     println!("\n✓ config.toml saved to {path}");
 
     Ok(Json(SaveResponse { ok: true, path }))
+}
+
+/// POST /api/add-bot — append `[[bots]]` via validate → bak → atomic
+/// ([`crate::agents_edit::append_bot_binding`]). First multi-bot add materializes
+/// legacy `[telegram]` into `[[bots]]`.
+async fn add_bot(
+    State(st): State<WizardState>,
+    Json(body): Json<AddBotRequest>,
+) -> Json<AddBotResponse> {
+    let path = st.config_path.clone();
+    let id = body.id.clone();
+    let token = body.bot_token.clone();
+    let uid = body.allowed_user_id;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::agents_edit::append_bot_binding(&path, &id, &token, uid)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(r)) => {
+            println!(
+                "✓ Added bot `{}` (persona=`{}`) → bak {}",
+                r.id,
+                r.persona,
+                r.bak_path.display()
+            );
+            Json(AddBotResponse {
+                ok: true,
+                id: r.id,
+                persona: r.persona,
+                bak_path: r.bak_path.display().to_string(),
+                allowed_user_ids: r.allowed_user_ids,
+                error: None,
+            })
+        }
+        Ok(Err(e)) => Json(AddBotResponse {
+            ok: false,
+            id: body.id,
+            persona: String::new(),
+            bak_path: String::new(),
+            allowed_user_ids: vec![],
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(AddBotResponse {
+            ok: false,
+            id: body.id,
+            persona: String::new(),
+            bak_path: String::new(),
+            allowed_user_ids: vec![],
+            error: Some(format!("Task join failed: {e}")),
+        }),
+    }
 }
 
 /// POST /api/install-service
@@ -691,6 +799,37 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     let db_path = or_default(read_line("Memory DB path [rustfox.db]: ")?, "rustfox.db");
     let location = read_line("Your location (optional, e.g. Tokyo, Japan): ")?;
 
+    // Optional additional bots (§7.7). Each is appended after the primary write
+    // via validate → bak → atomic (materializes [telegram] → [[bots]] on first add).
+    let mut extra_bots: Vec<(String, String, u64)> = Vec::new();
+    loop {
+        let ans = read_line("Add another bot? [y/N]: ")?;
+        if !(ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")) {
+            break;
+        }
+        let id = read_line("  Bot id (e.g. researcher): ")?;
+        if id.trim().is_empty() {
+            eprintln!("  Skipping — empty id.");
+            continue;
+        }
+        let token = read_line("  BotFather token: ")?;
+        let allow_raw = or_default(
+            read_line(&format!("  Allowed user id [{user_ids}]: "))?,
+            &user_ids,
+        );
+        let caller = allow_raw
+            .split([',', ' '])
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if caller == 0 {
+            eprintln!("  Skipping — need a numeric allowed user id.");
+            continue;
+        }
+        extra_bots.push((id.trim().to_string(), token.trim().to_string(), caller));
+    }
+
     let config = format_config(&ConfigParams {
         tg_token: &tg_token,
         user_ids: &user_ids,
@@ -702,10 +841,31 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     });
 
     let config_path = config_dir.join("config.toml");
-    std::fs::write(&config_path, &config)
+    // Preserve existing [[bots]] customizations on re-run (same as web save-config).
+    let to_write = if config_path.exists() {
+        let existing = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("Could not read {}", config_path.display()))?;
+        merge_wizard_save(&existing, &config)
+            .with_context(|| "Failed to merge wizard save with existing [[bots]]")?
+    } else {
+        config
+    };
+    std::fs::write(&config_path, &to_write)
         .with_context(|| format!("Could not write {}", config_path.display()))?;
 
     println!("\n✓ config.toml saved to {}", config_path.display());
+
+    for (id, token, caller) in &extra_bots {
+        match crate::agents_edit::append_bot_binding(&config_path, id, token, *caller) {
+            Ok(r) => println!(
+                "✓ Added bot `{}` (persona=`{}`) bak={}",
+                r.id,
+                r.persona,
+                r.bak_path.display()
+            ),
+            Err(e) => eprintln!("Warning: failed to add bot `{id}`: {e}"),
+        }
+    }
 
     // Offer service installation
     print!("\nInstall as a background service? [Y/n]: ");
@@ -720,6 +880,76 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Wizard save merge (preserve [[bots]]) ──────────────────────────────
+
+/// Merge a wizard-generated config with an on-disk config so untouched
+/// `[[bots]]` rows keep tools/model/persona/allowlist/system_prompt_file.
+///
+/// Rules (TL HOLD on full wizard save):
+/// - If `existing` has a non-empty `bots` array: take non-bot sections from
+///   `wizard`, restore `bots` from `existing` at the TOML Value level
+///   (verbatim field preserve), apply wizard `[telegram]` `bot_token` +
+///   `allowed_user_ids` onto the shim bot only (`main` → `default` → first),
+///   and drop `[telegram]` from the result (`[[bots]]` wins).
+/// - Otherwise return `wizard` unchanged (legacy `[telegram]` path; callers
+///   may then [`crate::agents_edit::append_bot_binding`]).
+pub fn merge_wizard_save(existing: &str, wizard: &str) -> Result<String> {
+    let existing_doc: toml::Value =
+        toml::from_str(existing).context("Failed to parse existing config.toml")?;
+    let existing_bots = existing_doc
+        .get("bots")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .cloned();
+
+    let Some(mut bots) = existing_bots else {
+        return Ok(wizard.to_string());
+    };
+
+    let mut wizard_doc: toml::Value =
+        toml::from_str(wizard).context("Failed to parse wizard-generated config")?;
+    let table = wizard_doc
+        .as_table_mut()
+        .context("wizard config root is not a table")?;
+
+    if let Some(telegram) = table.remove("telegram") {
+        apply_telegram_to_shim_bot(&mut bots, &telegram);
+    }
+
+    table.insert("bots".to_string(), toml::Value::Array(bots));
+
+    toml::to_string_pretty(&wizard_doc).context("Failed to serialize merged wizard config")
+}
+
+/// Update only shim-bot token + allowlist from wizard `[telegram]`; leave
+/// tools/model/persona/system_prompt_file (and every other bot) untouched.
+fn apply_telegram_to_shim_bot(bots: &mut [toml::Value], telegram: &toml::Value) {
+    let shim_idx = bots
+        .iter()
+        .position(|b| b.get("id").and_then(|v| v.as_str()) == Some("main"))
+        .or_else(|| {
+            bots.iter()
+                .position(|b| b.get("id").and_then(|v| v.as_str()) == Some("default"))
+        })
+        .unwrap_or(0);
+
+    let Some(shim) = bots.get_mut(shim_idx).and_then(|b| b.as_table_mut()) else {
+        return;
+    };
+
+    if let Some(token) = telegram.get("bot_token").and_then(|v| v.as_str()) {
+        if !token.trim().is_empty() {
+            shim.insert(
+                "bot_token".to_string(),
+                toml::Value::String(token.to_string()),
+            );
+        }
+    }
+    if let Some(ids) = telegram.get("allowed_user_ids") {
+        shim.insert("allowed_user_ids".to_string(), ids.clone());
+    }
 }
 
 // ── Config formatting ──────────────────────────────────────────────────
@@ -819,9 +1049,53 @@ pub fn parse_existing_config(content: &str) -> ExistingConfig {
         })
         .collect();
 
+    let bots: Vec<ExistingBot> = raw
+        .bots
+        .iter()
+        .filter_map(|b| {
+            let id = b.id.clone().filter(|s| !s.is_empty())?;
+            let persona = b
+                .persona
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| id.clone());
+            let allowed_user_ids = b
+                .allowed_user_ids
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|v| match v {
+                    toml::Value::Integer(i) => i.to_string(),
+                    toml::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(ExistingBot {
+                id,
+                persona,
+                allowed_user_ids,
+                bot_token: "***".to_string(),
+            })
+        })
+        .collect();
+
+    // Prefer primary token from [[bots]][0] when [telegram] is absent.
+    let telegram_token = tg.bot_token.unwrap_or_else(|| {
+        raw.bots
+            .first()
+            .and_then(|b| b.bot_token.clone())
+            .unwrap_or_default()
+    });
+    let allowed_user_ids = if allowed_user_ids.is_empty() && !bots.is_empty() {
+        bots[0].allowed_user_ids.clone()
+    } else {
+        allowed_user_ids
+    };
+
     let mut cfg = ExistingConfig {
         exists: true,
-        telegram_token: tg.bot_token.unwrap_or_default(),
+        telegram_token,
         allowed_user_ids,
         openrouter_key: openrouter.api_key.clone().unwrap_or_default(),
         model: openrouter.model.clone().unwrap_or_default(),
@@ -834,6 +1108,7 @@ pub fn parse_existing_config(content: &str) -> ExistingConfig {
             .unwrap_or_default(),
         db_path: mem.database_path.clone().unwrap_or_default(),
         mcp_servers,
+        bots,
         ..ExistingConfig::default()
     };
 
@@ -1076,5 +1351,242 @@ allowed_directory = "/tmp"
             !out.contains(r#"directory = "skills""#),
             "Generated config must not hardcode a CWD-relative skills directory"
         );
+    }
+
+    #[test]
+    fn test_parse_bots_array_redacts_tokens() {
+        let toml = r#"
+[[bots]]
+id = "main"
+bot_token = "111111111:AASecretMainTokenValueXXXX"
+allowed_user_ids = [42]
+persona = "main"
+
+[[bots]]
+id = "researcher"
+bot_token = "222222222:AASecretResearcherTokenYY"
+allowed_user_ids = [42, 99]
+persona = "researcher"
+
+[openrouter]
+api_key = "sk-test"
+model = "test"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#;
+        let cfg = parse_existing_config(toml);
+        assert!(cfg.exists);
+        assert_eq!(cfg.bots.len(), 2);
+        assert_eq!(cfg.bots[0].id, "main");
+        assert_eq!(cfg.bots[1].id, "researcher");
+        assert_eq!(cfg.bots[1].persona, "researcher");
+        assert_eq!(cfg.bots[1].allowed_user_ids, "42, 99");
+        for b in &cfg.bots {
+            assert_eq!(b.bot_token, "***");
+            assert!(!b.bot_token.contains("AASecret"));
+        }
+        // Primary fields fall back from bots[0] when [telegram] absent
+        assert_eq!(cfg.telegram_token, "111111111:AASecretMainTokenValueXXXX");
+        assert_eq!(cfg.allowed_user_ids, "42");
+    }
+
+    #[test]
+    fn wizard_add_another_bot_appends_via_bak() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[telegram]
+bot_token = "111111111:AALegacyTokenSecretValueXX"
+allowed_user_ids = [7]
+
+[openrouter]
+api_key = "sk-test"
+model = "test-model"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let r = crate::agents_edit::append_bot_binding(
+            &path,
+            "researcher",
+            "222222222:AANewTokenSecretValueYYYYYY",
+            7,
+        )
+        .unwrap();
+        assert_eq!(r.id, "researcher");
+        assert!(r.bak_path.exists());
+        assert_eq!(std::fs::read_to_string(&r.bak_path).unwrap(), before);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let mut cfg: crate::config::Config = toml::from_str(&after).unwrap();
+        cfg.normalize_bots().unwrap();
+        assert_eq!(cfg.bots.len(), 2);
+        assert!(cfg.bots.iter().any(|b| b.id == "default"));
+        assert!(cfg.bots.iter().any(|b| b.id == "researcher"));
+    }
+
+    /// Full wizard save must not wipe secondary bot tools/model/persona/allowlist
+    /// when `[[bots]]` already exists (TL HOLD on PR #74).
+    #[test]
+    fn wizard_full_save_preserves_secondary_bot_customizations() {
+        let existing = r#"
+[[bots]]
+id = "main"
+bot_token = "111111111:AAMainTokenSecretValueXXXX"
+allowed_user_ids = [42]
+persona = "main"
+
+[[bots]]
+id = "researcher"
+bot_token = "222222222:AAResearcherTokenSecretYY"
+allowed_user_ids = [42, 99]
+persona = "researcher"
+model = "moonshotai/kimi-k2.6"
+tools = ["read_file", "list_files", "web_search", "invoke_agent"]
+
+[openrouter]
+api_key = "sk-old"
+model = "old-model"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#;
+
+        // Mimic generateToml / format_config: writes [telegram] + other sections, no [[bots]].
+        let wizard = r#"
+[telegram]
+bot_token = "111111111:AAMainTokenSecretValueXXXX"
+allowed_user_ids = [42]
+
+[openrouter]
+api_key = "sk-new"
+model = "new-model"
+base_url = "https://openrouter.ai/api/v1"
+max_tokens = 4096
+
+[memory]
+database_path = "rustfox.db"
+
+[general]
+# location = "Your City, Country"
+"#;
+
+        let merged = merge_wizard_save(existing, wizard).unwrap();
+        let mut cfg: crate::config::Config = toml::from_str(&merged).unwrap();
+        cfg.normalize_bots().unwrap();
+
+        assert_eq!(cfg.bots.len(), 2, "both bots must survive full wizard save");
+        let research = cfg.bots.iter().find(|b| b.id == "researcher").unwrap();
+        assert_eq!(research.persona, "researcher");
+        assert_eq!(research.allowed_user_ids, vec![42, 99]);
+        assert_eq!(
+            research.model.as_deref(),
+            Some("moonshotai/kimi-k2.6"),
+            "secondary model must survive"
+        );
+        assert_eq!(
+            research.tools,
+            Some(vec![
+                "read_file".into(),
+                "list_files".into(),
+                "web_search".into(),
+                "invoke_agent".into(),
+            ]),
+            "secondary tools must survive"
+        );
+        assert_eq!(
+            research.bot_token, "222222222:AAResearcherTokenSecretYY",
+            "secondary token must survive (not redacted/wiped)"
+        );
+
+        // Wizard-edited non-bot sections apply.
+        assert_eq!(cfg.openrouter.api_key, "sk-new");
+        assert_eq!(cfg.openrouter.model, "new-model");
+
+        // No leftover [telegram] alongside preserved [[bots]] (bots win cleanly).
+        assert!(
+            !merged.contains("[telegram]"),
+            "merged output should drop [telegram] when [[bots]] preserved: {merged}"
+        );
+    }
+
+    #[test]
+    fn wizard_full_save_updates_shim_token_from_telegram_only() {
+        let existing = r#"
+[[bots]]
+id = "main"
+bot_token = "111111111:AAOldMainTokenSecretXXXXX"
+allowed_user_ids = [7]
+persona = "main"
+model = "keep-me"
+tools = ["read_file"]
+
+[[bots]]
+id = "helper"
+bot_token = "333333333:AAHelperTokenSecretValueZZ"
+allowed_user_ids = [99]
+persona = "helper"
+tools = ["web_search"]
+
+[openrouter]
+api_key = "sk-test"
+model = "test"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#;
+        let wizard = r#"
+[telegram]
+bot_token = "111111111:AANewMainTokenSecretYYYYY"
+allowed_user_ids = [7, 8]
+
+[openrouter]
+api_key = "sk-test"
+model = "test"
+"#;
+        let merged = merge_wizard_save(existing, wizard).unwrap();
+        let mut cfg: crate::config::Config = toml::from_str(&merged).unwrap();
+        cfg.normalize_bots().unwrap();
+
+        let main = cfg.bots.iter().find(|b| b.id == "main").unwrap();
+        assert_eq!(main.bot_token, "111111111:AANewMainTokenSecretYYYYY");
+        assert_eq!(main.allowed_user_ids, vec![7, 8]);
+        assert_eq!(main.model.as_deref(), Some("keep-me"));
+        assert_eq!(main.tools, Some(vec!["read_file".into()]));
+
+        let helper = cfg.bots.iter().find(|b| b.id == "helper").unwrap();
+        assert_eq!(helper.allowed_user_ids, vec![99]);
+        assert_eq!(helper.tools, Some(vec!["web_search".into()]));
+        assert_eq!(helper.bot_token, "333333333:AAHelperTokenSecretValueZZ");
+    }
+
+    #[test]
+    fn wizard_full_save_legacy_without_bots_passes_through() {
+        let existing = r#"
+[telegram]
+bot_token = "111111111:AALegacyTokenSecretValueXX"
+allowed_user_ids = [42]
+
+[openrouter]
+api_key = "sk-old"
+model = "old"
+"#;
+        let wizard = r#"
+[telegram]
+bot_token = "111111111:AALegacyTokenSecretValueXX"
+allowed_user_ids = [42]
+
+[openrouter]
+api_key = "sk-new"
+model = "new"
+"#;
+        let merged = merge_wizard_save(existing, wizard).unwrap();
+        assert_eq!(merged, wizard);
+        assert!(!merged.contains("[[bots]]") && !merged.contains("bots ="));
     }
 }

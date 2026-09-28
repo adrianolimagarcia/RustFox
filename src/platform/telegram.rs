@@ -259,7 +259,7 @@ pub async fn run(
             let allowed = allowed_user_ids.clone();
             move |msg: Message| {
                 let user = msg.from.as_ref()?;
-                if allowed.contains(&user.id.0) {
+                if crate::platform::user_on_allowlist(&allowed, user.id.0) {
                     Some(msg)
                 } else {
                     None
@@ -272,7 +272,7 @@ pub async fn run(
         .filter_map({
             let allowed = allowed_user_ids.clone();
             move |q: CallbackQuery| {
-                if allowed.contains(&q.from.id.0) {
+                if crate::platform::user_on_allowlist(&allowed, q.from.id.0) {
                     Some(q)
                 } else {
                     None
