@@ -6,6 +6,9 @@ bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 # Only these Telegram user IDs can interact with the bot
 # Find your user ID by messaging @userinfobot on Telegram
 allowed_user_ids = [123456789]
+# Optional Bot API root (default https://api.telegram.org). Trailing slash optional.
+# Used for teloxide Bot + rich_sender (sendRichMessage). Local Bot API / QA mocks.
+# api_base_url = "http://127.0.0.1:8081"
 
 # ── Multi-bot (optional) ───────────────────────────────────────────────
 # Prefer a single [telegram] section for one-bot installs (backward compatible).

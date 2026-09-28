@@ -50,12 +50,26 @@ struct EditRichMessagePayload {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
+/// Default Telegram Bot API root (no trailing slash).
+pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+
+/// Normalize a configured or `Bot::api_url()` base to the form used by
+/// [`api_url`]: scheme+host[+path], no trailing slash.
+pub fn normalize_api_base(api_base: &str) -> &str {
+    api_base.trim().trim_end_matches('/')
+}
+
 fn build_client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-fn api_url(token: &str, method: &str) -> String {
-    format!("https://api.telegram.org/bot{token}/{method}")
+/// Build `{base}/bot{token}/{method}`. `api_base` may carry a trailing slash.
+///
+/// Does not log or return the token outside the URL string itself (Telegram
+/// path shape); callers must not echo the result into user-visible logs.
+pub fn api_url(api_base: &str, token: &str, method: &str) -> String {
+    let base = normalize_api_base(api_base);
+    format!("{base}/bot{token}/{method}")
 }
 
 async fn parse_response(response: reqwest::Response) -> Result<serde_json::Value, RichSenderError> {
@@ -95,7 +109,11 @@ async fn parse_response(response: reqwest::Response) -> Result<serde_json::Value
 }
 
 /// Send a single message via `sendRichMessage`.
+///
+/// `api_base` is the Bot API root (default [`DEFAULT_API_BASE`]); pass
+/// `bot.api_url().as_str()` so wiremock / local Bot API servers work.
 pub async fn send_rich_message(
+    api_base: &str,
     token: &str,
     chat_id: i64,
     markdown: &str,
@@ -110,7 +128,7 @@ pub async fn send_rich_message(
     };
 
     let response = client
-        .post(api_url(token, "sendRichMessage"))
+        .post(api_url(api_base, token, "sendRichMessage"))
         .json(&payload)
         .send()
         .await
@@ -121,6 +139,7 @@ pub async fn send_rich_message(
 
 /// Edit an existing message via `editMessageText` with `rich_message` param.
 pub async fn edit_rich_message(
+    api_base: &str,
     token: &str,
     chat_id: i64,
     message_id: i32,
@@ -137,7 +156,7 @@ pub async fn edit_rich_message(
     };
 
     let response = client
-        .post(api_url(token, "editMessageText"))
+        .post(api_url(api_base, token, "editMessageText"))
         .json(&payload)
         .send()
         .await
@@ -149,6 +168,7 @@ pub async fn edit_rich_message(
 /// Send potentially-long markdown split at newline boundaries (max 4090 UTF-16).
 /// Returns error only if the FIRST chunk fails (subsequent errors logged only).
 pub async fn send_rich_messages(
+    api_base: &str,
     token: &str,
     chat_id: i64,
     markdown: &str,
@@ -157,7 +177,7 @@ pub async fn send_rich_messages(
 
     let total_utf16 = markdown.encode_utf16().count();
     if total_utf16 <= MAX_UTF16 {
-        return send_rich_message(token, chat_id, markdown)
+        return send_rich_message(api_base, token, chat_id, markdown)
             .await
             .map(|_| ());
     }
@@ -166,8 +186,8 @@ pub async fn send_rich_messages(
 
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 0 {
-            send_rich_message(token, chat_id, chunk).await?;
-        } else if let Err(e) = send_rich_message(token, chat_id, chunk).await {
+            send_rich_message(api_base, token, chat_id, chunk).await?;
+        } else if let Err(e) = send_rich_message(api_base, token, chat_id, chunk).await {
             warn!("send_rich_message trailing chunk {i} failed: {e}");
         }
     }
@@ -217,6 +237,7 @@ fn char_boundary_from_utf16(text: &str, utf16_offset: usize) -> usize {
 
 /// Try sending via sendRichMessage; on BadMarkdown, call `entity_sender` as fallback.
 pub async fn try_send_rich_fallback<F, Fut, E>(
+    api_base: &str,
     token: &str,
     chat_id: i64,
     markdown: &str,
@@ -228,7 +249,7 @@ where
     E: std::fmt::Display,
 {
     let processed = crate::utils::markdown_entities::preprocess_markdown(markdown);
-    match send_rich_messages(token, chat_id, &processed).await {
+    match send_rich_messages(api_base, token, chat_id, &processed).await {
         Ok(()) => Ok(()),
         Err(RichSenderError::BadMarkdown(msg)) => {
             warn!("sendRichMessage failed (bad markdown), falling back to entities: {msg}");
@@ -309,5 +330,21 @@ mod tests {
         assert!(matches!(net, RichSenderError::Network(_)));
         assert!(!matches!(bad_md, RichSenderError::Network(_)));
         assert!(!matches!(net, RichSenderError::BadMarkdown(_)));
+    }
+
+    #[test]
+    fn test_api_url_default_base() {
+        let url = api_url(DEFAULT_API_BASE, "000:TOKEN", "sendRichMessage");
+        assert_eq!(url, "https://api.telegram.org/bot000:TOKEN/sendRichMessage");
+    }
+
+    #[test]
+    fn test_api_url_custom_base_trims_slash() {
+        let url = api_url("http://127.0.0.1:9/", "000:TOKEN", "sendRichMessage");
+        assert_eq!(url, "http://127.0.0.1:9/bot000:TOKEN/sendRichMessage");
+        assert_eq!(
+            normalize_api_base("http://127.0.0.1:9/"),
+            "http://127.0.0.1:9"
+        );
     }
 }

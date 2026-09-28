@@ -357,8 +357,9 @@ pub async fn send_markdown_message(
     match format {
         MessageFormat::Rich => {
             let token = bot.token();
+            let api_base = bot.api_url();
             let processed = crate::utils::markdown_entities::preprocess_markdown(markdown);
-            rich_sender::send_rich_messages(token, chat_id.0, &processed)
+            rich_sender::send_rich_messages(api_base.as_str(), token, chat_id.0, &processed)
                 .await
                 .map_err(|e| {
                     teloxide::RequestError::Io(Arc::new(std::io::Error::other(format!("{e}"))))
@@ -368,11 +369,18 @@ pub async fn send_markdown_message(
         MessageFormat::Markdown => send_entities_message(bot, chat_id, markdown).await,
         MessageFormat::Auto => {
             let token = bot.token();
+            let api_base = bot.api_url();
 
             let entity_sender = || async { send_entities_message(bot, chat_id, markdown).await };
 
-            match rich_sender::try_send_rich_fallback(token, chat_id.0, markdown, &entity_sender)
-                .await
+            match rich_sender::try_send_rich_fallback(
+                api_base.as_str(),
+                token,
+                chat_id.0,
+                markdown,
+                &entity_sender,
+            )
+            .await
             {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -2002,13 +2010,19 @@ pub async fn handle_message(
         let entity_chunks = split_entities(&plain_text, &entities, MAX_UTF16);
         let rich_chunks = rich_sender::split_markdown_at_newlines(&processed, MAX_UTF16);
         let token = stream_bot.token();
+        let api_base = stream_bot.api_url();
 
         match stream_format {
             MessageFormat::Rich => {
                 for chunk_md in &rich_chunks {
-                    if rich_sender::send_rich_message(token, stream_chat_id.0, chunk_md)
-                        .await
-                        .is_err()
+                    if rich_sender::send_rich_message(
+                        api_base.as_str(),
+                        token,
+                        stream_chat_id.0,
+                        chunk_md,
+                    )
+                    .await
+                    .is_err()
                     {
                         // Rich-only mode: one failure stops the chain
                         tracing::warn!("stream_handle: rich send failed, aborting");
@@ -2027,8 +2041,13 @@ pub async fn handle_message(
             }
             MessageFormat::Auto => {
                 for (i, chunk_md) in rich_chunks.iter().enumerate() {
-                    let result =
-                        rich_sender::send_rich_message(token, stream_chat_id.0, chunk_md).await;
+                    let result = rich_sender::send_rich_message(
+                        api_base.as_str(),
+                        token,
+                        stream_chat_id.0,
+                        chunk_md,
+                    )
+                    .await;
                     if result.is_err() {
                         // Fallback: use entity chunk i
                         if let Some((ct, ce)) = entity_chunks.get(i) {

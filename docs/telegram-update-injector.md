@@ -12,7 +12,7 @@ PO approach: Update JSON injector → real `handle_message` + stub/fixture LLM +
 | Text message → message handler shape | fixtures + `extract_incoming` |
 | Callback (model / loop) | fixtures + `extract_callback` / `HandlerRoute` |
 | Media (photo / document) | fixtures classify + caption/file_name without download |
-| Outbound `sendMessage` | wiremock mock of Bot API (`Bot::set_api_url`) |
+| Outbound `sendMessage` / `sendRichMessage` | wiremock mock of Bot API (`Bot::set_api_url` → `bot.api_url()`) |
 | **Full `handle_message` path** | `UpdateInjector::drive_handle_message` + real Agent |
 | **Stub/fixture LLM (offline chat)** | `FixtureLlm` — deterministic reply, no OpenRouter |
 
@@ -99,6 +99,7 @@ let bot = teloxide::Bot::new("000:TOKEN")
 // Mount POST /bot{token}/SendMessage → {"ok":true,"result":{…Message…}}
 // Also DeleteMessage / EditMessageText for handle_message streaming + silent UI.
 // (teloxide uses PascalCase method names in the URL path)
+// rich_sender sendRichMessage uses camelCase against the same api_base.
 ```
 
 See `HandleMessageHarness` / `drive_handle_message_*` in `tests/telegram_update_injector.rs`.
@@ -106,9 +107,11 @@ See `HandleMessageHarness` / `drive_handle_message_*` in `tests/telegram_update_
 
 ## Offline notes (CI)
 
-- Point teloxide `Bot` at wiremock via `Bot::set_api_url`.
-- Prefer per-user `message_format=markdown` in the harness: default `auto`/`rich` uses `sendRichMessage` against hard-coded `https://api.telegram.org` (bypasses `set_api_url`). Entities path stays on the mock Bot.
+- Point teloxide `Bot` at wiremock via `Bot::set_api_url` (rich_sender reads the same URL via `bot.api_url()`).
+- Optional install-wide override: `[telegram] api_base_url = "http://…"` (applied at boot with `Bot::set_api_url`; default `https://api.telegram.org`).
+- Default `message_format=auto` is supported in the harness: wiremock stubs `sendRichMessage` (camelCase) as well as teloxide's PascalCase `SendMessage` / `EditMessageText` / `DeleteMessage`.
 - `FixtureLlm` covers chat turns; slash commands (`/start`, `/clear`, `/tools`, …) do not call the LLM.
+- Never echo bot tokens in logs or assertions (paths may include the mock token; treat as fixture-only).
 
 ## Related
 

@@ -165,6 +165,12 @@ pub struct TelegramConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
+    /// Optional Telegram Bot API root (default `https://api.telegram.org`).
+    /// Trailing slash optional. Applied to teloxide `Bot::set_api_url` at boot
+    /// and inherited by `rich_sender` via `bot.api_url()` (sendRichMessage).
+    /// Use for local Bot API servers or QA wiremock — never put secrets here.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
 }
 
 /// One Telegram bot ↔ persona binding (`[[bots]]` table array).
@@ -195,6 +201,15 @@ pub struct BotConfig {
 
 fn default_bot_persona() -> String {
     "main".to_string()
+}
+
+/// Resolve the Telegram Bot API root from config (trimmed, no trailing slash).
+pub fn telegram_api_base_url(configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| crate::utils::rich_sender::DEFAULT_API_BASE.to_string())
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -943,6 +958,8 @@ impl Config {
             self.telegram = TelegramConfig {
                 bot_token: shim.bot_token.clone(),
                 allowed_user_ids: shim.allowed_user_ids.clone(),
+                // Install-wide Bot API root — preserve across shim refresh.
+                api_base_url: self.telegram.api_base_url.clone(),
             };
             return Ok(());
         }
@@ -2213,5 +2230,47 @@ mod tests {
         assert_eq!(cfg.bots.len(), 2);
         assert_eq!(cfg.bots[0].allowed_user_ids, vec![1]);
         assert_eq!(cfg.bots[1].allowed_user_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn resolves_telegram_api_base_url() {
+        assert_eq!(
+            telegram_api_base_url(None),
+            crate::utils::rich_sender::DEFAULT_API_BASE
+        );
+        assert_eq!(
+            telegram_api_base_url(Some("http://127.0.0.1:8081/")),
+            "http://127.0.0.1:8081"
+        );
+        assert_eq!(
+            telegram_api_base_url(Some("  ")),
+            crate::utils::rich_sender::DEFAULT_API_BASE
+        );
+    }
+
+    #[test]
+    fn telegram_api_base_url_survives_bots_normalize() {
+        let cfg = parse_and_normalize(
+            r#"
+            [telegram]
+            api_base_url = "http://bot-api.local:8081/"
+            [[bots]]
+            id = "main"
+            bot_token = "tok-main"
+            allowed_user_ids = [1]
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(
+            cfg.telegram.api_base_url.as_deref(),
+            Some("http://bot-api.local:8081/")
+        );
+        assert_eq!(
+            telegram_api_base_url(cfg.telegram.api_base_url.as_deref()),
+            "http://bot-api.local:8081"
+        );
+        // Shim token refreshed from bots, but api_base_url preserved.
+        assert_eq!(cfg.telegram.bot_token, "tok-main");
     }
 }

@@ -225,15 +225,26 @@ async fn main() -> Result<()> {
     // cancel keys are isolated per bot_id (§7.3). Per-bot persona prompt is
     // resolved inside Agent::process_message (§7.4). Per-bot scheduler identity
     // remains a later slice.
+    let telegram_api_base =
+        rustfox::config::telegram_api_base_url(config.telegram.api_base_url.as_deref());
+    let telegram_api_url =
+        reqwest::Url::parse(&format!("{telegram_api_base}/")).unwrap_or_else(|_| {
+            reqwest::Url::parse(&format!(
+                "{}/",
+                rustfox::utils::rich_sender::DEFAULT_API_BASE
+            ))
+            .expect("default Telegram API base is valid")
+        });
+    if config.telegram.api_base_url.is_some() {
+        info!("  Telegram Bot API base: {telegram_api_base} (from [telegram].api_base_url)");
+    }
+
     let bot_runtimes: Vec<(String, Arc<teloxide::Bot>, Vec<u64>)> = config
         .bots
         .iter()
         .map(|b| {
-            (
-                b.id.clone(),
-                Arc::new(teloxide::Bot::new(&b.bot_token)),
-                b.allowed_user_ids.clone(),
-            )
+            let bot = teloxide::Bot::new(&b.bot_token).set_api_url(telegram_api_url.clone());
+            (b.id.clone(), Arc::new(bot), b.allowed_user_ids.clone())
         })
         .collect();
     let shim = Config::shim_bot(&config.bots);
