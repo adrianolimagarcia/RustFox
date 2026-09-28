@@ -208,6 +208,10 @@ MCP tools are namespaced as `mcp_<server-name>_<tool-name>` (e.g. `mcp_git_git_l
 | `/config keys` | Slash map: editable keys vs restart-required vs denied | Active |
 | `/config set <key> <value>` | Validate → `config.toml.bak` → atomic write | Active |
 | `/restart` | Ack, then clean process exit (systemd/launchd/shell brings it back) | Active |
+| `/agents` | List bot ids + personas (`bot_token=***`) | Active |
+| `/agents show <id>` | One bot (token redacted) | Active |
+| `/agents create <id>` | Create `agents/<id>/` then one-shot BotFather token → `[[bots]]` + restart | Active |
+| `/agents cancel` | Abort pending token bind | Active |
 | `/supervise <text>` | Submit a new supervisor task | Planned |
 | `/tasks` | List active / recent supervisor tasks | Planned |
 | `/resume <id>` | Resume a paused supervisor task | Planned |
@@ -238,6 +242,14 @@ Editable via Telegram (only users already on the bot allowlist):
 **Write path:** validate → copy `config.toml` → `config.toml.bak` → atomic write → ack. On parse failure after write, restore from `.bak` and abort restart. Secrets are never echoed in Telegram replies, logs, or `/config show`.
 
 **`/restart`:** after a successful write (or alone) reply OK, then clean process exit so the service manager or user shell brings the bot back. v1 does **not** hot-reload Telegram dispatchers in-process.
+
+### `/agents` (create persona + bind token)
+
+1. `/agents` — list configured bots (ids + personas; **never** raw tokens).
+2. `/agents create <id>` — writes `agents/<id>/AGENT.md` + default `SOUL.md`, then arms a **one-shot** token capture for the caller.
+3. Send the BotFather token as the next message — message is **deleted** best-effort; logs/replies show `bot_token=***` only; token is never stored in conversation memory.
+4. Appends `[[bots]] { id, bot_token, persona=<id>, allowed_user_ids=[caller] }` via validate → `config.toml.bak` → atomic write (same path as `/config`), rejects duplicate `id` or `bot_token`, then **restarts**.
+5. Delete / soft-disable and hot-add without restart are **not** in v1.
 
 ---
 
