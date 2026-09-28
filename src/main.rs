@@ -167,6 +167,38 @@ async fn main() -> Result<()> {
     .context("Failed to initialize memory store")?;
     info!("  Database: {}", config.memory.database_path.display());
 
+    // Slice 3: host secret bridge (store + pending) shared by MCP / tools / portal.
+    let (secret_bridge, secret_backend) = {
+        let home = config.resolved_home().cloned().unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".rustfox"))
+                .unwrap_or_else(|| std::path::PathBuf::from(".rustfox"))
+        });
+        match rustfox::secret_store::open(&home) {
+            Ok((store, backend)) => {
+                info!("  Secret store: {:?}", backend);
+                let pending =
+                    std::sync::Arc::new(rustfox::secret_store::PendingSecretRegistry::default());
+                let bridge = std::sync::Arc::new(rustfox::secret_store::SecretBridge::new(
+                    std::sync::Arc::from(store),
+                    pending,
+                ));
+                let portal_base = format!("http://127.0.0.1:{}/", config.portal.port);
+                bridge.set_portal_base(portal_base);
+                (bridge, Some(backend))
+            }
+            Err(e) => {
+                warn!("  Secret store unavailable ({e}); using in-memory FakeSecretStore");
+                let bridge = std::sync::Arc::new(rustfox::secret_store::SecretBridge::new(
+                    std::sync::Arc::new(rustfox::secret_store::FakeSecretStore::new()),
+                    std::sync::Arc::new(rustfox::secret_store::PendingSecretRegistry::default()),
+                ));
+                (bridge, None)
+            }
+        }
+    };
+    let _ = secret_backend;
+
     // Refresh any expiring OAuth tokens before connecting to MCP servers
     let http_client = reqwest::Client::new();
     let mut mcp_server_configs = config.mcp_servers.clone();
@@ -177,9 +209,10 @@ async fn main() -> Result<()> {
         info!("  Refreshed {refreshed} expiring MCP OAuth token(s) at startup");
     }
 
-    // Initialize MCP connections (using possibly-refreshed configs)
-    let mut mcp_manager = McpManager::new();
-    mcp_manager.connect_all(&mcp_server_configs).await;
+    // MCP manager ready; connect_all runs after Telegram notify callback is wired
+    // so missing `secret:NAME` env refs can notify allowlisted users (Slice 3).
+    let mut mcp_manager =
+        McpManager::new().with_secret_bridge(std::sync::Arc::clone(&secret_bridge));
 
     // Seed bundled skills/agents from embedded data into the home directory.
     if let Err(e) = rustfox::skills::embed::seed_skills(&config.skills.directory).await {
@@ -254,6 +287,25 @@ async fn main() -> Result<()> {
         .map(|(_, b, _)| Arc::clone(b))
         .expect("shim bot must exist in bot_runtimes");
 
+    // Slice 3: missing-secret Telegram notify to allowlisted users (shim bot).
+    {
+        let notify_bot = (*bot).clone();
+        let allow = shim.allowed_user_ids.clone();
+        secret_bridge.set_notify(std::sync::Arc::new(move |name, claim_url| {
+            let bot = notify_bot.clone();
+            let allow = allow.clone();
+            let name = name.to_string();
+            let claim_url = claim_url.to_string();
+            tokio::spawn(async move {
+                rustfox::platform::telegram::notify_secret_request(&bot, &allow, &name, &claim_url)
+                    .await;
+            });
+        }));
+    }
+
+    // Initialize MCP connections (after notify is live for missing-secret UX).
+    mcp_manager.connect_all(&mcp_server_configs).await;
+
     // Channel for dispatching scheduled job work from fire closures to background runner
     let (job_tx, mut job_rx) =
         tokio::sync::mpsc::unbounded_channel::<rustfox::agent::ScheduledJobRequest>();
@@ -290,11 +342,17 @@ async fn main() -> Result<()> {
         skills_rw.clone(),
         agents_rw.clone(),
     )));
-    tool_registry.register(Box::new(rustfox::command_tool::CommandTool::new(
-        config.sandbox.allowed_directory.clone(),
-        cancel_registry.clone(),
-        sender.clone(),
-    )));
+    tool_registry.register(Box::new(
+        rustfox::command_tool::CommandTool::new(
+            config.sandbox.allowed_directory.clone(),
+            cancel_registry.clone(),
+            sender.clone(),
+        )
+        .with_secrets(
+            std::sync::Arc::clone(&secret_bridge),
+            config.sandbox.secret_env.clone(),
+        ),
+    ));
 
     // Arc::new_cyclic so Agent can store Weak<Self> for job closure captures (breaks Arc cycle)
     let agent = Arc::new_cyclic(|weak| {
@@ -779,27 +837,16 @@ async fn main() -> Result<()> {
     let portal_shutdown = tokio_util::sync::CancellationToken::new();
     if config.portal.enabled {
         let portal_agent: std::sync::Arc<dyn rustfox::portal::AgentOps> = agent.clone();
-        let mut portal_state = rustfox::portal::PortalState::new(
+        let portal_state = rustfox::portal::PortalState::new(
             portal_agent,
             memory.clone(),
             task_store.clone(),
             config.portal.clone(),
             config_path.clone(),
             config.resolved_home().cloned(),
-        );
-        if let Some(home) = config.resolved_home() {
-            match rustfox::secret_store::open(home) {
-                Ok((store, backend)) => {
-                    info!("  Secret store: {:?}", backend);
-                    portal_state = portal_state.with_secret_store(std::sync::Arc::from(store));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Secret store unavailable ({e}); portal claims will use in-memory fake"
-                    );
-                }
-            }
-        }
+        )
+        .with_secret_store(secret_bridge.store())
+        .with_pending_secrets(secret_bridge.pending());
         rustfox::portal::auth::ensure_startup_token(&portal_state);
         if let Err(e) = rustfox::portal::serve(portal_state, portal_shutdown.clone()).await {
             // Portal is best-effort: a bind failure must not kill the bot.

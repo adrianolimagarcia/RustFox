@@ -301,6 +301,10 @@ pub struct OcrConfig {
 pub struct SandboxConfig {
     #[serde(default)]
     pub allowed_directory: PathBuf,
+    /// Named secrets from SecretStore injected into `execute_command` child env
+    /// (Slice 3). Missing names create a pending claim + Telegram notify.
+    #[serde(default)]
+    pub secret_env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

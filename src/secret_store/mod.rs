@@ -4,9 +4,10 @@
 //! is unavailable, fall back to an encrypted file under the RustFox home.
 //! Values are never logged (`SecretValue` redacts `Debug` / `Display`).
 //!
-//! Slice 2 adds pending claims + Telegram notify helpers + portal claim form.
-//! Sandbox/tool env injection is Slice 3.
+//! Slice 2: pending claims + Telegram notify + portal claim form.
+//! Slice 3: missing→notify, sandbox/tool env inject, redaction hooks.
 
+mod bridge;
 mod fake;
 mod file;
 mod keyring_backend;
@@ -14,6 +15,9 @@ mod notify;
 mod pending;
 mod value;
 
+pub use bridge::{
+    MissingSecret, MissingSecretError, SecretBridge, SecretNotifyFn, SECRET_REF_PREFIX,
+};
 pub use fake::FakeSecretStore;
 pub use file::EncryptedFileSecretStore;
 pub use keyring_backend::KeyringSecretStore;

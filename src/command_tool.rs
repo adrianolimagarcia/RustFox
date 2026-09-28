@@ -27,6 +27,9 @@ pub struct CommandTool {
     sandbox_dir: PathBuf,
     cancel_registry: Arc<CancelRegistry>,
     sender: Arc<dyn PlatformSender>,
+    /// Optional Slice 3 bridge: inject `secret_env` names into child env.
+    secret_bridge: Option<Arc<crate::secret_store::SecretBridge>>,
+    secret_env_names: Vec<String>,
 }
 
 impl CommandTool {
@@ -39,7 +42,20 @@ impl CommandTool {
             sandbox_dir,
             cancel_registry,
             sender,
+            secret_bridge: None,
+            secret_env_names: Vec::new(),
         }
+    }
+
+    /// Attach SecretBridge + names to inject into spawn env (Slice 3).
+    pub fn with_secrets(
+        mut self,
+        bridge: Arc<crate::secret_store::SecretBridge>,
+        names: Vec<String>,
+    ) -> Self {
+        self.secret_bridge = Some(bridge);
+        self.secret_env_names = names;
+        self
     }
 }
 
@@ -203,6 +219,9 @@ impl CommandTool {
         if output_buffer.chars().count() > MAX_BUFFER_CHARS {
             output_buffer = crate::utils::strings::truncate_tail(&output_buffer, MAX_BUFFER_CHARS);
         }
+        if let Some(ref bridge) = self.secret_bridge {
+            output_buffer = bridge.redact(&output_buffer);
+        }
 
         fn format_body(buf: &str, no_output_msg: &str) -> Option<String> {
             if buf.is_empty() {
@@ -276,6 +295,12 @@ impl CommandTool {
         };
 
         self.cancel_registry.unregister(&cmd_id).await;
+        // Slice 3: never return raw secret values to LLM / tool echoes.
+        let result = if let Some(ref bridge) = self.secret_bridge {
+            bridge.redact(&result)
+        } else {
+            result
+        };
         Ok(result)
     }
 }

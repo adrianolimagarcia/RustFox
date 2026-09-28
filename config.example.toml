@@ -109,6 +109,9 @@ Be concise and helpful."""
 #   RUSTFOX_HOME="$HOME/.rustfox-work" cargo run
 
 [sandbox]
+# Named SecretStore entries injected into execute_command env (Slice 3).
+# Missing names create a portal pending claim + Telegram notify/link.
+# secret_env = ["OPENROUTER_API_KEY"]
 # The LLM's persistent workspace (file/command tools are confined here).
 # Leave unset to use <home>/workspace. Set an absolute path to override.
 # allowed_directory = "/absolute/path/to/workspace"
@@ -179,6 +182,8 @@ Be concise and helpful."""
 # Each [[mcp_servers]] block defines an MCP server to connect to
 # The bot will discover and register tools from each server
 
+# Env values may use secret:NAME to resolve from SecretStore (Slice 3),
+# e.g. GITHUB_TOKEN = "secret:GH_TOKEN" — missing → Telegram pending link.
 # Example: Git MCP server (requires uvx/npx)
 # [[mcp_servers]]
 # name = "git"
