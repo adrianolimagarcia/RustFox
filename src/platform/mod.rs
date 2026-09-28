@@ -37,6 +37,14 @@ pub fn normalize_bot_id(bot_id: &str) -> &str {
     }
 }
 
+/// Per-bot Telegram allowlist check (design §3 / §7.7 E2E).
+///
+/// Each dispatcher filters with its own `allowed_user_ids`; rejection on bot A
+/// does not affect bot B.
+pub fn user_on_allowlist(allowed_user_ids: &[u64], user_id: u64) -> bool {
+    allowed_user_ids.contains(&user_id)
+}
+
 /// A message received from any platform
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -56,4 +64,31 @@ pub struct IncomingMessage {
     pub text: String,
     /// Attached files, if any
     pub attachments: Vec<Attachment>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_isolation_per_bot() {
+        let main_allow = vec![111u64];
+        let researcher_allow = vec![222u64];
+        // Owner of main is rejected on researcher and vice versa
+        assert!(user_on_allowlist(&main_allow, 111));
+        assert!(!user_on_allowlist(&main_allow, 222));
+        assert!(user_on_allowlist(&researcher_allow, 222));
+        assert!(!user_on_allowlist(&researcher_allow, 111));
+        // Shared owner on both is fine
+        let shared = vec![42u64];
+        assert!(user_on_allowlist(&shared, 42));
+        assert!(user_on_allowlist(&shared, 42));
+    }
+
+    #[test]
+    fn normalize_bot_id_empty_to_default() {
+        assert_eq!(normalize_bot_id(""), DEFAULT_BOT_ID);
+        assert_eq!(normalize_bot_id("  "), DEFAULT_BOT_ID);
+        assert_eq!(normalize_bot_id("researcher"), "researcher");
+    }
 }

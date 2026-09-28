@@ -73,6 +73,25 @@ struct SaveResponse {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct AddBotRequest {
+    id: String,
+    bot_token: String,
+    /// Telegram user id used for the new bot allowlist (caller / owner).
+    allowed_user_id: u64,
+}
+
+#[derive(Serialize)]
+struct AddBotResponse {
+    ok: bool,
+    id: String,
+    persona: String,
+    bak_path: String,
+    allowed_user_ids: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Serialize, Default)]
 pub struct ExistingConfig {
     pub exists: bool,
@@ -104,6 +123,18 @@ pub struct ExistingConfig {
     pub learning_user_model_update_interval: u32,
     pub learning_user_model_cron: String,
     pub mcp_servers: Vec<ExistingMcpServer>,
+    /// Existing `[[bots]]` entries (tokens redacted in API responses).
+    #[serde(default)]
+    pub bots: Vec<ExistingBot>,
+}
+
+#[derive(Serialize, Default, Clone)]
+pub struct ExistingBot {
+    pub id: String,
+    pub persona: String,
+    pub allowed_user_ids: String,
+    /// Always redacted (`***`) — never echo raw tokens from the wizard API.
+    pub bot_token: String,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -132,6 +163,16 @@ pub struct RawConfig {
     pub agents_config: Option<RawAgentsConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<RawMcpServer>,
+    #[serde(default)]
+    pub bots: Vec<RawBot>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+pub struct RawBot {
+    pub id: Option<String>,
+    pub bot_token: Option<String>,
+    pub allowed_user_ids: Option<Vec<toml::Value>>,
+    pub persona: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -328,6 +369,7 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .route("/", get(serve_index))
         .route("/api/load-config", get(load_config))
         .route("/api/save-config", post(save_config))
+        .route("/api/add-bot", post(add_bot))
         .route("/api/install-service", post(install_service))
         .route("/api/shutdown", post(shutdown_server))
         .route("/api/oauth/start", get(oauth_start))
@@ -381,6 +423,58 @@ async fn save_config(
     println!("\n✓ config.toml saved to {path}");
 
     Ok(Json(SaveResponse { ok: true, path }))
+}
+
+/// POST /api/add-bot — append `[[bots]]` via validate → bak → atomic
+/// ([`crate::agents_edit::append_bot_binding`]). First multi-bot add materializes
+/// legacy `[telegram]` into `[[bots]]`.
+async fn add_bot(
+    State(st): State<WizardState>,
+    Json(body): Json<AddBotRequest>,
+) -> Json<AddBotResponse> {
+    let path = st.config_path.clone();
+    let id = body.id.clone();
+    let token = body.bot_token.clone();
+    let uid = body.allowed_user_id;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::agents_edit::append_bot_binding(&path, &id, &token, uid)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(r)) => {
+            println!(
+                "✓ Added bot `{}` (persona=`{}`) → bak {}",
+                r.id,
+                r.persona,
+                r.bak_path.display()
+            );
+            Json(AddBotResponse {
+                ok: true,
+                id: r.id,
+                persona: r.persona,
+                bak_path: r.bak_path.display().to_string(),
+                allowed_user_ids: r.allowed_user_ids,
+                error: None,
+            })
+        }
+        Ok(Err(e)) => Json(AddBotResponse {
+            ok: false,
+            id: body.id,
+            persona: String::new(),
+            bak_path: String::new(),
+            allowed_user_ids: vec![],
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(AddBotResponse {
+            ok: false,
+            id: body.id,
+            persona: String::new(),
+            bak_path: String::new(),
+            allowed_user_ids: vec![],
+            error: Some(format!("Task join failed: {e}")),
+        }),
+    }
 }
 
 /// POST /api/install-service
@@ -691,6 +785,37 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     let db_path = or_default(read_line("Memory DB path [rustfox.db]: ")?, "rustfox.db");
     let location = read_line("Your location (optional, e.g. Tokyo, Japan): ")?;
 
+    // Optional additional bots (§7.7). Each is appended after the primary write
+    // via validate → bak → atomic (materializes [telegram] → [[bots]] on first add).
+    let mut extra_bots: Vec<(String, String, u64)> = Vec::new();
+    loop {
+        let ans = read_line("Add another bot? [y/N]: ")?;
+        if !(ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")) {
+            break;
+        }
+        let id = read_line("  Bot id (e.g. researcher): ")?;
+        if id.trim().is_empty() {
+            eprintln!("  Skipping — empty id.");
+            continue;
+        }
+        let token = read_line("  BotFather token: ")?;
+        let allow_raw = or_default(
+            read_line(&format!("  Allowed user id [{user_ids}]: "))?,
+            &user_ids,
+        );
+        let caller = allow_raw
+            .split([',', ' '])
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if caller == 0 {
+            eprintln!("  Skipping — need a numeric allowed user id.");
+            continue;
+        }
+        extra_bots.push((id.trim().to_string(), token.trim().to_string(), caller));
+    }
+
     let config = format_config(&ConfigParams {
         tg_token: &tg_token,
         user_ids: &user_ids,
@@ -706,6 +831,18 @@ fn run_cli(config_dir: &Path) -> Result<()> {
         .with_context(|| format!("Could not write {}", config_path.display()))?;
 
     println!("\n✓ config.toml saved to {}", config_path.display());
+
+    for (id, token, caller) in &extra_bots {
+        match crate::agents_edit::append_bot_binding(&config_path, id, token, *caller) {
+            Ok(r) => println!(
+                "✓ Added bot `{}` (persona=`{}`) bak={}",
+                r.id,
+                r.persona,
+                r.bak_path.display()
+            ),
+            Err(e) => eprintln!("Warning: failed to add bot `{id}`: {e}"),
+        }
+    }
 
     // Offer service installation
     print!("\nInstall as a background service? [Y/n]: ");
@@ -819,9 +956,53 @@ pub fn parse_existing_config(content: &str) -> ExistingConfig {
         })
         .collect();
 
+    let bots: Vec<ExistingBot> = raw
+        .bots
+        .iter()
+        .filter_map(|b| {
+            let id = b.id.clone().filter(|s| !s.is_empty())?;
+            let persona = b
+                .persona
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| id.clone());
+            let allowed_user_ids = b
+                .allowed_user_ids
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|v| match v {
+                    toml::Value::Integer(i) => i.to_string(),
+                    toml::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(ExistingBot {
+                id,
+                persona,
+                allowed_user_ids,
+                bot_token: "***".to_string(),
+            })
+        })
+        .collect();
+
+    // Prefer primary token from [[bots]][0] when [telegram] is absent.
+    let telegram_token = tg.bot_token.unwrap_or_else(|| {
+        raw.bots
+            .first()
+            .and_then(|b| b.bot_token.clone())
+            .unwrap_or_default()
+    });
+    let allowed_user_ids = if allowed_user_ids.is_empty() && !bots.is_empty() {
+        bots[0].allowed_user_ids.clone()
+    } else {
+        allowed_user_ids
+    };
+
     let mut cfg = ExistingConfig {
         exists: true,
-        telegram_token: tg.bot_token.unwrap_or_default(),
+        telegram_token,
         allowed_user_ids,
         openrouter_key: openrouter.api_key.clone().unwrap_or_default(),
         model: openrouter.model.clone().unwrap_or_default(),
@@ -834,6 +1015,7 @@ pub fn parse_existing_config(content: &str) -> ExistingConfig {
             .unwrap_or_default(),
         db_path: mem.database_path.clone().unwrap_or_default(),
         mcp_servers,
+        bots,
         ..ExistingConfig::default()
     };
 
@@ -1076,5 +1258,82 @@ allowed_directory = "/tmp"
             !out.contains(r#"directory = "skills""#),
             "Generated config must not hardcode a CWD-relative skills directory"
         );
+    }
+
+    #[test]
+    fn test_parse_bots_array_redacts_tokens() {
+        let toml = r#"
+[[bots]]
+id = "main"
+bot_token = "111111111:AASecretMainTokenValueXXXX"
+allowed_user_ids = [42]
+persona = "main"
+
+[[bots]]
+id = "researcher"
+bot_token = "222222222:AASecretResearcherTokenYY"
+allowed_user_ids = [42, 99]
+persona = "researcher"
+
+[openrouter]
+api_key = "sk-test"
+model = "test"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#;
+        let cfg = parse_existing_config(toml);
+        assert!(cfg.exists);
+        assert_eq!(cfg.bots.len(), 2);
+        assert_eq!(cfg.bots[0].id, "main");
+        assert_eq!(cfg.bots[1].id, "researcher");
+        assert_eq!(cfg.bots[1].persona, "researcher");
+        assert_eq!(cfg.bots[1].allowed_user_ids, "42, 99");
+        for b in &cfg.bots {
+            assert_eq!(b.bot_token, "***");
+            assert!(!b.bot_token.contains("AASecret"));
+        }
+        // Primary fields fall back from bots[0] when [telegram] absent
+        assert_eq!(cfg.telegram_token, "111111111:AASecretMainTokenValueXXXX");
+        assert_eq!(cfg.allowed_user_ids, "42");
+    }
+
+    #[test]
+    fn wizard_add_another_bot_appends_via_bak() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[telegram]
+bot_token = "111111111:AALegacyTokenSecretValueXX"
+allowed_user_ids = [7]
+
+[openrouter]
+api_key = "sk-test"
+model = "test-model"
+
+[sandbox]
+allowed_directory = "/tmp"
+"#,
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let r = crate::agents_edit::append_bot_binding(
+            &path,
+            "researcher",
+            "222222222:AANewTokenSecretValueYYYYYY",
+            7,
+        )
+        .unwrap();
+        assert_eq!(r.id, "researcher");
+        assert!(r.bak_path.exists());
+        assert_eq!(std::fs::read_to_string(&r.bak_path).unwrap(), before);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let mut cfg: crate::config::Config = toml::from_str(&after).unwrap();
+        cfg.normalize_bots().unwrap();
+        assert_eq!(cfg.bots.len(), 2);
+        assert!(cfg.bots.iter().any(|b| b.id == "default"));
+        assert!(cfg.bots.iter().any(|b| b.id == "researcher"));
     }
 }
