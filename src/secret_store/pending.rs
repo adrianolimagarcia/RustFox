@@ -113,7 +113,10 @@ impl PendingSecretRegistry {
         })
     }
 
-    /// Submit value via `SecretStore::set` and consume the one-shot token.
+    /// Submit value via `SecretStore::set`, then consume the one-shot token.
+    ///
+    /// The pending entry is only removed after a successful `set`. On store
+    /// failure the claim stays usable (token restored).
     pub fn submit(&self, claim_token: &str, value: &str, store: &dyn SecretStore) -> Result<()> {
         if value.is_empty() {
             bail!("secret value must not be empty");
@@ -125,9 +128,15 @@ impl PendingSecretRegistry {
             .ok_or_else(|| anyhow::anyhow!("pending claim not found or expired"))?;
         // Drop the lock before touching the store (backends may block).
         drop(map);
-        store
-            .set(&entry.name, value)
-            .with_context(|| format!("SecretStore::set for pending '{}'", entry.name))?;
+        if let Err(e) = store.set(&entry.name, value) {
+            // Restore so the one-shot claim remains usable after a store failure.
+            self.by_token
+                .lock()
+                .expect("pending secret registry lock")
+                .insert(claim_token.to_string(), entry);
+            return Err(e)
+                .with_context(|| "SecretStore::set for pending (token restored)".to_string());
+        }
         Ok(())
     }
 
@@ -184,7 +193,7 @@ fn system_unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret_store::FakeSecretStore;
+    use crate::secret_store::{FakeSecretStore, SecretValue};
     use std::thread;
     use std::time::Duration;
 
@@ -234,5 +243,40 @@ mod tests {
         let created2 = reg.request("TO_CANCEL_BY_ID").unwrap();
         assert!(reg.cancel_by_id(&created2.id));
         assert!(reg.peek(&created2.claim_token).is_err());
+    }
+
+    #[test]
+    fn submit_restores_pending_when_set_fails() {
+        struct FailStore;
+        impl SecretStore for FailStore {
+            fn get(&self, _name: &str) -> Result<Option<SecretValue>> {
+                Ok(None)
+            }
+            fn set(&self, _name: &str, _value: &str) -> Result<()> {
+                bail!("simulated store failure");
+            }
+            fn delete(&self, _name: &str) -> Result<()> {
+                Ok(())
+            }
+            fn exists(&self, _name: &str) -> Result<bool> {
+                Ok(false)
+            }
+        }
+        let reg = PendingSecretRegistry::new(Duration::from_secs(60));
+        let created = reg.request("FAIL_SET").unwrap();
+        let err = reg
+            .submit(&created.claim_token, "value-should-not-stick", &FailStore)
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated") || err.to_string().contains("restored"));
+        // Token still valid — peek works; nothing stored.
+        let view = reg.peek(&created.claim_token).unwrap();
+        assert_eq!(view.name, "FAIL_SET");
+        let ok_store = FakeSecretStore::new();
+        reg.submit(&created.claim_token, "after-restore-VALUE", &ok_store)
+            .unwrap();
+        assert_eq!(
+            ok_store.get("FAIL_SET").unwrap().unwrap().expose(),
+            "after-restore-VALUE"
+        );
     }
 }

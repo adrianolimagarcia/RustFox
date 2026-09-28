@@ -243,6 +243,8 @@ pub struct McpConnection {
 /// Manages multiple MCP server connections
 pub struct McpManager {
     connections: HashMap<String, McpConnection>,
+    /// Slice 3: resolve `secret:NAME` env refs + redact tool results.
+    secret_bridge: Option<std::sync::Arc<crate::secret_store::SecretBridge>>,
 }
 
 impl Default for McpManager {
@@ -255,6 +257,27 @@ impl McpManager {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
+            secret_bridge: None,
+        }
+    }
+
+    /// Attach SecretBridge before `connect_all` (Slice 3).
+    pub fn with_secret_bridge(
+        mut self,
+        bridge: std::sync::Arc<crate::secret_store::SecretBridge>,
+    ) -> Self {
+        self.secret_bridge = Some(bridge);
+        self
+    }
+
+    pub fn set_secret_bridge(&mut self, bridge: std::sync::Arc<crate::secret_store::SecretBridge>) {
+        self.secret_bridge = Some(bridge);
+    }
+
+    fn redact_tool_text(&self, text: &str) -> String {
+        match &self.secret_bridge {
+            Some(b) => b.redact(text),
+            None => text.to_string(),
         }
     }
 
@@ -321,7 +344,16 @@ impl McpManager {
         );
 
         let args = config.args.clone();
-        let env = config.env.clone();
+        let env = if let Some(ref bridge) = self.secret_bridge {
+            bridge.resolve_env_map(&config.env).map_err(|e| {
+                anyhow::anyhow!(
+                    "MCP '{}': required secret missing or invalid ({e})",
+                    config.name
+                )
+            })?
+        } else {
+            config.env.clone()
+        };
         let cmd = command_str.to_string();
 
         let transport = TokioChildProcess::new(Command::new(&cmd).configure(move |c| {
@@ -476,9 +508,9 @@ impl McpManager {
                         .collect();
 
                     if text_parts.is_empty() {
-                        return Ok(format!("{:?}", result.content));
+                        return Ok(self.redact_tool_text(&format!("{:?}", result.content)));
                     }
-                    return Ok(text_parts.join("\n"));
+                    return Ok(self.redact_tool_text(&text_parts.join("\n")));
                 }
             }
         }
