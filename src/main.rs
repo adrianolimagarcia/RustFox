@@ -222,8 +222,9 @@ async fn main() -> Result<()> {
 
     // One teloxide::Bot per [[bots]] entry. Agent / scheduler / TelegramAdapter
     // keep the shim (primary) bot for send/schedule; conversation history and
-    // cancel keys are isolated per bot_id (§7.3). Per-bot scheduler identity
-    // and persona binding are later slices.
+    // cancel keys are isolated per bot_id (§7.3). Per-bot persona prompt is
+    // resolved inside Agent::process_message (§7.4). Per-bot scheduler identity
+    // remains a later slice.
     let bot_runtimes: Vec<(String, Arc<teloxide::Bot>, Vec<u64>)> = config
         .bots
         .iter()
