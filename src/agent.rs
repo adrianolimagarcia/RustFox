@@ -61,6 +61,13 @@ pub enum LoopCallbackChoice {
     AddInstruction,
 }
 
+/// Composite key for cancel / injection / loop / mid-run maps so the same
+/// human on two bots does not cross-cancel. Format: `{bot_id}:{user_id}`.
+pub fn session_key(bot_id: &str, user_id: &str) -> String {
+    let bot_id = crate::platform::normalize_bot_id(bot_id);
+    format!("{bot_id}:{user_id}")
+}
+
 /// A request dispatched from a fire closure to the background job runner.
 pub struct ScheduledJobRequest {
     pub incoming: IncomingMessage,
@@ -481,21 +488,23 @@ impl Agent {
         Ok(())
     }
 
-    /// Register a CancellationToken for the given user_id before processing starts.
+    /// Register a CancellationToken for `(bot_id, user_id)` before processing starts.
     /// Called at the start of process_message. Returns the token for cancellation checks.
-    pub async fn register_cancel_token(&self, user_id: &str) -> CancellationToken {
+    pub async fn register_cancel_token(&self, bot_id: &str, user_id: &str) -> CancellationToken {
+        let key = session_key(bot_id, user_id);
         let token = CancellationToken::new();
         self.cancel_token_registry
             .lock()
             .await
-            .insert(user_id.to_string(), token.clone());
+            .insert(key, token.clone());
         token
     }
 
-    /// Cancel processing for a user. Returns true if there was an active token.
-    pub async fn cancel_processing(&self, user_id: &str) -> bool {
+    /// Cancel processing for a bot+user session. Returns true if there was an active token.
+    pub async fn cancel_processing(&self, bot_id: &str, user_id: &str) -> bool {
+        let key = session_key(bot_id, user_id);
         let mut map = self.cancel_token_registry.lock().await;
-        if let Some(token) = map.remove(user_id) {
+        if let Some(token) = map.remove(&key) {
             token.cancel();
             true
         } else {
@@ -503,19 +512,18 @@ impl Agent {
         }
     }
 
-    /// Check if a user has active processing.
-    pub async fn is_processing(&self, user_id: &str) -> bool {
-        self.cancel_token_registry
-            .lock()
-            .await
-            .contains_key(user_id)
+    /// Check if a bot+user session has active processing.
+    pub async fn is_processing(&self, bot_id: &str, user_id: &str) -> bool {
+        let key = session_key(bot_id, user_id);
+        self.cancel_token_registry.lock().await.contains_key(&key)
     }
 
-    /// Queue an injection message for a user. Returns false if queue is full (max 10).
-    pub async fn queue_injection(&self, user_id: &str, text: &str) -> bool {
+    /// Queue an injection message for a bot+user session. Returns false if queue is full (max 10).
+    pub async fn queue_injection(&self, bot_id: &str, user_id: &str, text: &str) -> bool {
         const MAX_INJECTIONS: usize = 10;
+        let key = session_key(bot_id, user_id);
         let mut map = self.pending_injections.lock().await;
-        let queue = map.entry(user_id.to_string()).or_default();
+        let queue = map.entry(key).or_default();
         if queue.len() >= MAX_INJECTIONS {
             false
         } else {
@@ -524,10 +532,11 @@ impl Agent {
         }
     }
 
-    /// Drain all pending injection messages for a user.
-    pub async fn drain_injections(&self, user_id: &str) -> Vec<String> {
+    /// Drain all pending injection messages for a bot+user session.
+    pub async fn drain_injections(&self, bot_id: &str, user_id: &str) -> Vec<String> {
+        let key = session_key(bot_id, user_id);
         let mut map = self.pending_injections.lock().await;
-        map.remove(user_id).unwrap_or_default()
+        map.remove(&key).unwrap_or_default()
     }
 
     /// Drain pending steer/queue injections for the given user and push them
@@ -541,12 +550,13 @@ impl Agent {
     /// so it survives a process_message boundary.
     pub async fn drain_and_inject_steer(
         &self,
+        bot_id: &str,
         user_id: &str,
         conversation_id: &str,
         messages: &mut Vec<ChatMessage>,
     ) {
-        let inject_mode = self.get_mid_run_mode(user_id).await;
-        let injections = self.drain_injections(user_id).await;
+        let inject_mode = self.get_mid_run_mode(bot_id, user_id).await;
+        let injections = self.drain_injections(bot_id, user_id).await;
         for text in &injections {
             let label = if inject_mode == MidRunMode::Steer {
                 "**[Steer]:** "
@@ -573,25 +583,29 @@ impl Agent {
     /// in practice since one user has one active process_message).
     pub async fn register_loop_callback(
         &self,
+        bot_id: &str,
         user_id: &str,
         sender: tokio::sync::oneshot::Sender<LoopCallbackChoice>,
     ) -> Option<tokio::sync::oneshot::Sender<LoopCallbackChoice>> {
+        let key = session_key(bot_id, user_id);
         let mut map = self.pending_loop_callbacks.lock().await;
-        map.insert(user_id.to_string(), sender)
+        map.insert(key, sender)
     }
 
-    /// Take the loop callback sender for a user, if any.
+    /// Take the loop callback sender for a bot+user session, if any.
     pub async fn take_loop_callback(
         &self,
+        bot_id: &str,
         user_id: &str,
     ) -> Option<tokio::sync::oneshot::Sender<LoopCallbackChoice>> {
+        let key = session_key(bot_id, user_id);
         let mut map = self.pending_loop_callbacks.lock().await;
-        map.remove(user_id)
+        map.remove(&key)
     }
 
-    /// Get the current MidRunMode for a user. Defaults to Steer.
-    pub async fn get_mid_run_mode(&self, user_id: &str) -> MidRunMode {
-        let key = format!("mid_run_mode_{}", user_id);
+    /// Get the current MidRunMode for a bot+user session. Defaults to Steer.
+    pub async fn get_mid_run_mode(&self, bot_id: &str, user_id: &str) -> MidRunMode {
+        let key = format!("mid_run_mode_{}", session_key(bot_id, user_id));
         self.memory
             .recall("settings", &key)
             .await
@@ -601,9 +615,9 @@ impl Agent {
             .unwrap_or(MidRunMode::Steer)
     }
 
-    /// Set the MidRunMode for a user.
-    pub async fn set_mid_run_mode(&self, user_id: &str, mode: MidRunMode) {
-        let key = format!("mid_run_mode_{}", user_id);
+    /// Set the MidRunMode for a bot+user session.
+    pub async fn set_mid_run_mode(&self, bot_id: &str, user_id: &str, mode: MidRunMode) {
+        let key = format!("mid_run_mode_{}", session_key(bot_id, user_id));
         self.memory
             .remember("settings", &key, mode.as_str(), None)
             .await
@@ -611,14 +625,15 @@ impl Agent {
     }
 
     /// Delete the MidRunMode for a user (resets to default).
-    pub async fn delete_mid_run_mode(&self, user_id: &str) {
-        let key = format!("mid_run_mode_{}", user_id);
+    pub async fn delete_mid_run_mode(&self, bot_id: &str, user_id: &str) {
+        let key = format!("mid_run_mode_{}", session_key(bot_id, user_id));
         self.memory.forget("settings", &key).await.ok();
     }
 
     /// Remove cancel token for a user (called on process_message exit).
-    pub async fn clear_cancel_token(&self, user_id: &str) {
-        self.cancel_token_registry.lock().await.remove(user_id);
+    pub async fn clear_cancel_token(&self, bot_id: &str, user_id: &str) {
+        let key = session_key(bot_id, user_id);
+        self.cancel_token_registry.lock().await.remove(&key);
     }
 
     /// Fetch the context window size for the current model from the
@@ -706,6 +721,7 @@ impl Agent {
         tool_ui_mode: crate::tool_registry::ToolUiMode,
     ) -> Result<RunOutcome> {
         let platform = &incoming.platform;
+        let bot_id = crate::platform::normalize_bot_id(&incoming.bot_id);
         let user_id = &incoming.user_id;
         let _parsed_chat_id: ChatId = incoming
             .chat_id
@@ -713,10 +729,10 @@ impl Agent {
             .map(ChatId)
             .unwrap_or(ChatId(0));
 
-        // Get or create persistent conversation
+        // Get or create persistent conversation (isolated by bot_id)
         let conversation_id = self
             .memory
-            .get_or_create_conversation(platform, user_id)
+            .get_or_create_conversation(platform, bot_id, user_id)
             .await?;
 
         // Always build the system prompt from the live registry.
@@ -727,6 +743,7 @@ impl Agent {
         let mut cmgr = crate::conversation::ConversationManager::new(
             &self.memory,
             platform,
+            bot_id,
             user_id,
             current_system_prompt.clone(),
             &skills,
@@ -866,7 +883,7 @@ impl Agent {
             .store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Register cancel token for /stop support
-        let cancel_token = self.register_cancel_token(user_id).await;
+        let cancel_token = self.register_cancel_token(bot_id, user_id).await;
 
         // Build make_ctx closure for ToolContext construction
         let make_ctx = {
@@ -943,7 +960,7 @@ impl Agent {
                     end_time: Self::now_iso8601_static(),
                 });
 
-                self.clear_cancel_token(user_id).await;
+                self.clear_cancel_token(bot_id, user_id).await;
 
                 // Post-loop soul reflection: if the agent didn't update SOUL.md during the
                 // conversation but the soul_updated flag was set by a tool, fire a reflection
@@ -969,7 +986,7 @@ impl Agent {
                     error: Some("Cancelled by user".to_string()),
                     end_time: Self::now_iso8601_static(),
                 });
-                self.clear_cancel_token(user_id).await;
+                self.clear_cancel_token(bot_id, user_id).await;
                 Ok(RunOutcome {
                     text: "Processing was cancelled.".to_string(),
                     stop: RunStop::Cancelled,
@@ -990,7 +1007,7 @@ impl Agent {
                     )),
                     end_time: Self::now_iso8601_static(),
                 });
-                self.clear_cancel_token(user_id).await;
+                self.clear_cancel_token(bot_id, user_id).await;
                 Ok(RunOutcome {
                     text: "I've reached the maximum number of tool call iterations. Please try rephrasing your request.".to_string(),
                     stop: RunStop::MaxIterations,
@@ -1003,7 +1020,7 @@ impl Agent {
                     error: Some(format!("{:#}", e)),
                     end_time: Self::now_iso8601_static(),
                 });
-                self.clear_cancel_token(user_id).await;
+                self.clear_cancel_token(bot_id, user_id).await;
                 Err(e)
             }
         }
@@ -1039,6 +1056,7 @@ impl Agent {
             Box::pin(async move {
                 let incoming = crate::platform::IncomingMessage {
                     platform: "scheduled_task".to_string(),
+                    bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
                     user_id: format!("{uid}:{tid}"),
                     chat_id: cid,
                     user_name: String::new(),
@@ -1183,11 +1201,18 @@ impl Agent {
         }
     }
 
-    /// Clear conversation history for a user
-    pub async fn clear_conversation(&self, platform: &str, user_id: &str) -> Result<()> {
-        self.memory.clear_conversation(platform, user_id).await?;
+    /// Clear conversation history for a bot+user session
+    pub async fn clear_conversation(
+        &self,
+        platform: &str,
+        bot_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        self.memory
+            .clear_conversation(platform, bot_id, user_id)
+            .await?;
         // Reset mid-run mode to default (Steer)
-        self.delete_mid_run_mode(user_id).await;
+        self.delete_mid_run_mode(bot_id, user_id).await;
         Ok(())
     }
 
@@ -2351,6 +2376,72 @@ mod tests {
         assert!(
             q.due().await.unwrap().is_empty(),
             "a stalled run must never be auto-dispatched, even when overdue"
+        );
+    }
+
+    #[test]
+    fn test_session_key_isolates_bots_for_same_user() {
+        assert_eq!(session_key("main", "42"), "main:42");
+        assert_eq!(
+            session_key("", "42"),
+            format!("{}:42", crate::platform::DEFAULT_BOT_ID)
+        );
+        assert_ne!(
+            session_key("bot_a", "user1"),
+            session_key("bot_b", "user1"),
+            "/stop on bot A must not share a key with bot B"
+        );
+    }
+
+    /// Cancel-registry keying: cancelling bot_a must not cancel bot_b for the
+    /// same Telegram user. Mirrors Agent::{register_cancel_token,cancel_processing}.
+    #[tokio::test]
+    async fn test_cancel_token_for_bot_a_does_not_cancel_bot_b() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        let registry: Arc<Mutex<HashMap<String, CancellationToken>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let register =
+            |bot_id: &'static str,
+             user_id: &'static str,
+             reg: Arc<Mutex<HashMap<String, CancellationToken>>>| async move {
+                let token = CancellationToken::new();
+                let key = session_key(bot_id, user_id);
+                reg.lock().await.insert(key, token.clone());
+                token
+            };
+        let cancel = |bot_id: &'static str,
+                      user_id: &'static str,
+                      reg: Arc<Mutex<HashMap<String, CancellationToken>>>| async move {
+            let key = session_key(bot_id, user_id);
+            let mut map = reg.lock().await;
+            if let Some(token) = map.remove(&key) {
+                token.cancel();
+                true
+            } else {
+                false
+            }
+        };
+
+        let token_a = register("bot_a", "user1", registry.clone()).await;
+        let token_b = register("bot_b", "user1", registry.clone()).await;
+
+        assert!(cancel("bot_a", "user1", registry.clone()).await);
+        assert!(token_a.is_cancelled());
+        assert!(
+            !token_b.is_cancelled(),
+            "cancelling bot_a must leave bot_b's token intact"
+        );
+        assert!(
+            registry
+                .lock()
+                .await
+                .contains_key(&session_key("bot_b", "user1")),
+            "bot_b session must still be registered"
         );
     }
 }

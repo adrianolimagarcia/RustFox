@@ -24,12 +24,28 @@ pub struct Attachment {
     pub file_name: Option<String>,
 }
 
+/// Default bot id for single-bot / portal / legacy conversations (design §6.3).
+pub const DEFAULT_BOT_ID: &str = "default";
+
+/// Normalize empty/whitespace bot ids to [`DEFAULT_BOT_ID`].
+pub fn normalize_bot_id(bot_id: &str) -> &str {
+    let trimmed = bot_id.trim();
+    if trimmed.is_empty() {
+        DEFAULT_BOT_ID
+    } else {
+        trimmed
+    }
+}
+
 /// A message received from any platform
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct IncomingMessage {
     /// Platform identifier (e.g., "telegram", "discord")
     pub platform: String,
+    /// Bot identity within the install (`[[bots]].id`). Portal/web and tests
+    /// use [`DEFAULT_BOT_ID`]. Isolates conversation history and cancel keys.
+    pub bot_id: String,
     /// Platform-specific user ID as string
     pub user_id: String,
     /// Platform-specific chat/channel ID as string

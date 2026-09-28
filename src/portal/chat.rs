@@ -72,6 +72,7 @@ pub async fn send(
     let user = state.config.user_name.clone();
     let incoming = IncomingMessage {
         platform: "web".to_string(),
+        bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
         user_id: user.clone(),
         chat_id: user.clone(),
         user_name: user.clone(),
@@ -187,7 +188,7 @@ pub async fn history(
     let user = state.config.user_name.clone();
     let conv_id = state
         .memory
-        .get_or_create_conversation("web", &user)
+        .get_or_create_conversation("web", crate::platform::DEFAULT_BOT_ID, &user)
         .await
         .map_err(PortalError::from)?;
     let messages = state
@@ -226,7 +227,7 @@ pub async fn threads(
     let user = state.config.user_name.clone();
     let conv_id = state
         .memory
-        .get_or_create_conversation("web", &user)
+        .get_or_create_conversation("web", crate::platform::DEFAULT_BOT_ID, &user)
         .await
         .map_err(PortalError::from)?;
     let messages = state

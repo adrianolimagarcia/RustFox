@@ -114,6 +114,7 @@ impl MemoryStore {
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 platform TEXT NOT NULL,
+                bot_id TEXT NOT NULL DEFAULT 'default',
                 user_id TEXT NOT NULL,
                 started_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -135,7 +136,7 @@ impl MemoryStore {
                 ON messages(conversation_id, created_at);
 
             CREATE INDEX IF NOT EXISTS idx_conversations_user
-                ON conversations(platform, user_id, updated_at);
+                ON conversations(platform, bot_id, user_id, updated_at);
 
             -- Knowledge table
             CREATE TABLE IF NOT EXISTS knowledge (
@@ -339,6 +340,25 @@ impl MemoryStore {
 
         conn.execute_batch("ALTER TABLE conversations ADD COLUMN is_archived INTEGER DEFAULT 0;")
             .ok(); // safe no-op: ALTER TABLE fails with "duplicate column" on re-run
+
+        // Migration (§7.3): per-bot conversation isolation. Add nullable-then-backfilled
+        // bot_id; existing rows become "default" so single-bot installs keep working.
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN bot_id TEXT;")
+            .ok(); // safe no-op on re-run
+        conn.execute_batch(
+            "UPDATE conversations SET bot_id = 'default' WHERE bot_id IS NULL OR bot_id = '';",
+        )
+        .context("backfill conversations.bot_id")?;
+        // Recreate user index to include bot_id (DROP is idempotent; CREATE IF NOT EXISTS
+        // would leave the old 3-column index in place if it already existed).
+        conn.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_conversations_user;
+            CREATE INDEX IF NOT EXISTS idx_conversations_user
+                ON conversations(platform, bot_id, user_id, updated_at);
+            ",
+        )
+        .context("recreate idx_conversations_user")?;
 
         // Migration: soft-delete marker for scheduled tasks (T3 / ADR-0011a R6).
         // A portal DELETE disarms + stamps deleted_at; the row and ALL its

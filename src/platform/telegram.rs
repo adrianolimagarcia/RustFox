@@ -206,15 +206,19 @@ pub async fn notify_shutdown(bot: &teloxide::Bot, allowed_user_ids: &[u64]) {
     }
 }
 
-/// Run the Telegram bot platform
+/// Run the Telegram bot platform for a single `[[bots]]` entry.
+///
+/// `bot_id` is the stable config id used for conversation isolation and
+/// cancel/injection session keys (design §7.3).
 pub async fn run(
     agent: Arc<Agent>,
     allowed_user_ids: Vec<u64>,
     bot: Arc<teloxide::Bot>,
+    bot_id: String,
 ) -> Result<()> {
     let bot = (*bot).clone();
 
-    info!("Starting Telegram platform...");
+    info!(bot_id = %bot_id, "Starting Telegram platform...");
 
     // Send startup notifications (best-effort) — before agent is moved into dptree
     notify_startup(
@@ -282,7 +286,7 @@ pub async fn run(
         .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![agent])
+        .dependencies(dptree::deps![agent, bot_id])
         // Commands (like /btw) bypass per-chat serialization for true concurrency.
         // Regular messages keep per-chat ordering to avoid race conditions.
         .distribution_function(|upd: &Update| {
@@ -662,7 +666,12 @@ async fn set_model_and_reply(
     Ok(())
 }
 
-async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseResult<()> {
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    agent: Arc<Agent>,
+    bot_id: String,
+) -> ResponseResult<()> {
     let user = match msg.from.as_ref() {
         Some(user) => user,
         None => return Ok(()),
@@ -759,7 +768,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
     // Handle commands
     if text == "/clear" {
         if let Err(e) = agent
-            .clear_conversation("telegram", &user_id.to_string())
+            .clear_conversation("telegram", &bot_id, &user_id.to_string())
             .await
         {
             error!("Failed to clear conversation: {}", e);
@@ -972,12 +981,13 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
         let bot_clone = bot.clone();
         let chat_id = msg.chat.id;
         let user_id_str = user_id.to_string();
+        let btw_bot_id = bot_id.clone();
         let btw_format = msg_format;
         tokio::spawn(async move {
             // Load conversation context inside the spawned task
             let conversation_id = match agent_clone
                 .memory
-                .get_or_create_conversation("telegram", &user_id_str)
+                .get_or_create_conversation("telegram", &btw_bot_id, &user_id_str)
                 .await
             {
                 Ok(id) => id,
@@ -1244,7 +1254,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
         let sub = parts.get(1).copied().unwrap_or("");
         if sub == "steer" {
             agent
-                .set_mid_run_mode(&user_id.to_string(), MidRunMode::Steer)
+                .set_mid_run_mode(&bot_id, &user_id.to_string(), MidRunMode::Steer)
                 .await;
             return send_markdown_message(
                 &bot, msg.chat.id,
@@ -1253,7 +1263,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
             ).await;
         } else if sub == "queue" {
             agent
-                .set_mid_run_mode(&user_id.to_string(), MidRunMode::Queue)
+                .set_mid_run_mode(&bot_id, &user_id.to_string(), MidRunMode::Queue)
                 .await;
             return send_markdown_message(
                 &bot,
@@ -1263,7 +1273,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
             )
             .await;
         } else if sub.is_empty() {
-            let current = agent.get_mid_run_mode(&user_id.to_string()).await;
+            let current = agent.get_mid_run_mode(&bot_id, &user_id.to_string()).await;
             let mode_str = current.as_str();
             return send_markdown_message(
                 &bot,
@@ -1288,7 +1298,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
 
     // Handle /stop command
     if text == "/stop" {
-        if agent.cancel_processing(&user_id.to_string()).await {
+        if agent.cancel_processing(&bot_id, &user_id.to_string()).await {
             return send_markdown_message(
                 &bot,
                 msg.chat.id,
@@ -1308,9 +1318,11 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
     }
 
     // CHECK: if user is currently being processed, queue non-command messages as injection
-    if !text.starts_with('/') && agent.is_processing(&user_id.to_string()).await {
-        let current_mode = agent.get_mid_run_mode(&user_id.to_string()).await;
-        let maxed = !agent.queue_injection(&user_id.to_string(), &text).await;
+    if !text.starts_with('/') && agent.is_processing(&bot_id, &user_id.to_string()).await {
+        let current_mode = agent.get_mid_run_mode(&bot_id, &user_id.to_string()).await;
+        let maxed = !agent
+            .queue_injection(&bot_id, &user_id.to_string(), &text)
+            .await;
         if maxed {
             return send_markdown_message(
                 &bot,
@@ -1561,6 +1573,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
     // Build platform-agnostic message
     let incoming = IncomingMessage {
         platform: "telegram".to_string(),
+        bot_id: bot_id.clone(),
         user_id: user_id.to_string(),
         chat_id: msg.chat.id.0.to_string(),
         user_name,
@@ -1649,7 +1662,12 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
 
 /// Handle callback query from loop detection inline keyboard.
 /// Resolves the oneshot sender so the suspended agent loop can continue.
-async fn handle_loop_callback(bot: Bot, q: CallbackQuery, agent: Arc<Agent>) -> ResponseResult<()> {
+async fn handle_loop_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    agent: Arc<Agent>,
+    bot_id: String,
+) -> ResponseResult<()> {
     let user_id = q.from.id.to_string();
     let data = match q.data {
         Some(ref d) => d.clone(),
@@ -1674,7 +1692,7 @@ async fn handle_loop_callback(bot: Bot, q: CallbackQuery, agent: Arc<Agent>) -> 
     };
 
     // Send the choice to the waiting agent loop (if any)
-    if let Some(sender) = agent.take_loop_callback(&user_id).await {
+    if let Some(sender) = agent.take_loop_callback(&bot_id, &user_id).await {
         let _ = sender.send(choice);
     }
 
