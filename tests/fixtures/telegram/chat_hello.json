@@ -1,0 +1,21 @@
+{
+  "update_id": 900012,
+  "message": {
+    "message_id": 22,
+    "date": 1700000202,
+    "from": {
+      "id": 111001,
+      "is_bot": false,
+      "first_name": "QA",
+      "username": "qa_sandbox",
+      "language_code": "en"
+    },
+    "chat": {
+      "id": 111001,
+      "type": "private",
+      "first_name": "QA",
+      "username": "qa_sandbox"
+    },
+    "text": "hello from QA offline fixture"
+  }
+}

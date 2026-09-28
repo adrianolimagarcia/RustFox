@@ -5,7 +5,7 @@ pub mod tool_notifier;
 
 pub use sender::{PlatformMessageId, PlatformSender};
 pub use telegram_injector::{
-    AllowlistDecision, HandlerRoute, InjectedCallback, InjectedIncoming, InjectedKind,
+    AllowlistDecision, FixtureLlm, HandlerRoute, InjectedCallback, InjectedIncoming, InjectedKind,
     UpdateInjector,
 };
 
