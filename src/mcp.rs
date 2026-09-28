@@ -121,6 +121,12 @@ pub async fn refresh_oauth_token(
 /// acceptable for a machine-updated file.
 ///
 /// Returns the backup path (`config.toml.bak`). Secrets are never logged.
+///
+/// # Errors
+///
+/// Returns an error (without touching the config file or creating `.bak`) when
+/// no `[[mcp_servers]]` entry matches `server_name`. The error message includes
+/// the server name only — never token values.
 pub fn update_config_tokens(
     config_path: &Path,
     server_name: &str,
@@ -135,32 +141,36 @@ pub fn update_config_tokens(
         .parse()
         .with_context(|| format!("Failed to parse TOML from {}", config_path.display()))?;
 
-    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|v| v.as_array_mut()) {
-        for server in servers.iter_mut() {
-            if server
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|n| n == server_name)
-                .unwrap_or(false)
-            {
-                if let toml::Value::Table(table) = server {
-                    table.insert(
-                        "auth_token".to_string(),
-                        toml::Value::String(auth_token.to_string()),
-                    );
-                    if let Some(rt) = new_refresh_token {
-                        table.insert(
-                            "refresh_token".to_string(),
-                            toml::Value::String(rt.to_string()),
-                        );
-                    }
-                    if let Some(ea) = new_expires_at {
-                        table.insert("token_expires_at".to_string(), toml::Value::Integer(ea));
-                    }
-                }
-                break;
+    let servers = doc
+        .get_mut("mcp_servers")
+        .and_then(|v| v.as_array_mut())
+        .with_context(|| format!("no [[mcp_servers]] entry named `{server_name}`"))?;
+
+    let mut found = false;
+    for server in servers.iter_mut() {
+        if server.get("name").and_then(|v| v.as_str()) != Some(server_name) {
+            continue;
+        }
+        if let toml::Value::Table(table) = server {
+            table.insert(
+                "auth_token".to_string(),
+                toml::Value::String(auth_token.to_string()),
+            );
+            if let Some(rt) = new_refresh_token {
+                table.insert(
+                    "refresh_token".to_string(),
+                    toml::Value::String(rt.to_string()),
+                );
+            }
+            if let Some(ea) = new_expires_at {
+                table.insert("token_expires_at".to_string(), toml::Value::Integer(ea));
             }
         }
+        found = true;
+        break;
+    }
+    if !found {
+        anyhow::bail!("no [[mcp_servers]] entry named `{server_name}`");
     }
 
     let new_content = toml::to_string_pretty(&doc).context("Failed to serialise updated config")?;
@@ -779,6 +789,33 @@ args = ["mcp-server-git"]
         assert!(
             !path.with_extension("toml.bak").exists(),
             "pre-validate abort must not create .bak"
+        );
+    }
+
+    #[test]
+    fn update_config_tokens_missing_server_errors_without_touching_file_or_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(&dir, &oauth_config_toml());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let secret = "SUPER_SECRET_MISSING_SERVER_TOKEN_XYZ";
+
+        let err = update_config_tokens(&path, "does-not-exist", secret, Some(secret), Some(42))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("no [[mcp_servers]] entry named `does-not-exist`"),
+            "expected hard-error for missing server: {err}"
+        );
+        assert!(!err.contains(secret), "error must not echo secrets: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "missing server must leave config file untouched"
+        );
+        assert!(
+            !path.with_extension("toml.bak").exists(),
+            "missing server must not create .bak"
         );
     }
 }
