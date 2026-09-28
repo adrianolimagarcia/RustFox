@@ -258,8 +258,7 @@ pub async fn run(
         .filter_map({
             let allowed = allowed_user_ids.clone();
             move |msg: Message| {
-                let user = msg.from.as_ref()?;
-                if crate::platform::user_on_allowlist(&allowed, user.id.0) {
+                if crate::platform::telegram_injector::message_passes_allowlist(&allowed, &msg) {
                     Some(msg)
                 } else {
                     None
@@ -272,7 +271,7 @@ pub async fn run(
         .filter_map({
             let allowed = allowed_user_ids.clone();
             move |q: CallbackQuery| {
-                if crate::platform::user_on_allowlist(&allowed, q.from.id.0) {
+                if crate::platform::telegram_injector::callback_passes_allowlist(&allowed, &q) {
                     Some(q)
                 } else {
                     None
@@ -283,10 +282,7 @@ pub async fn run(
 
     let loop_callback_handler = Update::filter_callback_query()
         .filter_map(|q: CallbackQuery| {
-            if q.data
-                .as_deref()
-                .is_some_and(|d| d.contains(r#""type":"loop""#))
-            {
+            if crate::platform::telegram_injector::is_loop_callback(&q) {
                 Some(q)
             } else {
                 None

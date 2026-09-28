@@ -1,8 +1,13 @@
 pub mod sender;
 pub mod telegram;
+pub mod telegram_injector;
 pub mod tool_notifier;
 
 pub use sender::{PlatformMessageId, PlatformSender};
+pub use telegram_injector::{
+    AllowlistDecision, HandlerRoute, InjectedCallback, InjectedIncoming, InjectedKind,
+    UpdateInjector,
+};
 
 /// What kind of attachment was received
 #[derive(Debug, Clone, PartialEq)]
