@@ -4,7 +4,17 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    /// Legacy single-bot Telegram section. Optional in TOML when `[[bots]]`
+    /// is used; after [`Self::normalize_bots`] always populated from either
+    /// `[telegram]` or the first `[[bots]]` entry so existing callers
+    /// (`main.rs`, portal) keep working without a dispatcher rewrite.
+    #[serde(default)]
     pub telegram: TelegramConfig,
+    /// Canonical bot list (multi-bot design §2 / §6). Populated by
+    /// [`Self::normalize_bots`] from `[[bots]]` or a synthesized default from
+    /// `[telegram]`. Prefer this over `telegram` for new multi-bot code.
+    #[serde(default)]
+    pub bots: Vec<BotConfig>,
     pub openrouter: OpenRouterConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -145,10 +155,46 @@ impl Default for PortalConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// Legacy `[telegram]` section (single-bot installs).
+///
+/// Prefer [`BotConfig`] / `Config::bots` for multi-bot; this type remains the
+/// shim surface for existing single-bot callers.
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct TelegramConfig {
+    #[serde(default)]
     pub bot_token: String,
+    #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
+}
+
+/// One Telegram bot ↔ persona binding (`[[bots]]` table array).
+///
+/// Shared install-wide sections (`sandbox`, `skills`, `mcp_servers`, …) stay
+/// top-level on [`Config`] — not per-bot.
+#[derive(Debug, Deserialize, Clone)]
+pub struct BotConfig {
+    /// Stable key for memory / invoke target (unique across `bots`).
+    pub id: String,
+    /// BotFather token (unique across `bots`).
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<u64>,
+    /// Maps to `agents/<persona>/` or soul profile. Defaults to `"main"`.
+    #[serde(default = "default_bot_persona")]
+    pub persona: String,
+    /// Optional per-bot system prompt file (relative paths resolve under home).
+    #[serde(default)]
+    pub system_prompt_file: Option<PathBuf>,
+    /// Optional per-bot default model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional per-bot tool whitelist.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+fn default_bot_persona() -> String {
+    "main".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -843,6 +889,10 @@ impl Config {
         let mut config: Config =
             toml::from_str(&content).with_context(|| "Failed to parse config file")?;
 
+        config
+            .normalize_bots()
+            .with_context(|| "Invalid [[bots]] / [telegram] configuration")?;
+
         let warnings = config
             .resolve()
             .with_context(|| "Failed to resolve home directory paths")?;
@@ -851,6 +901,95 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Resolve `[[bots]]` vs legacy `[telegram]` into a canonical `bots` list
+    /// and keep `telegram` shimmed for single-bot callers (design §2 / §6).
+    ///
+    /// Rules:
+    /// 1. Non-empty `[[bots]]` → use it; if `[telegram]` is also present, warn
+    ///    (migration) and do not double-apply.
+    /// 2. Only `[telegram]` → synthesize one bot
+    ///    `{ id = "default", persona = "main", … }`.
+    /// 3. Reject duplicate `id` or duplicate `bot_token`, and empty id/token.
+    /// 4. Refresh `telegram` from the shim bot so existing `config.telegram`
+    ///    readers keep working. Prefer `id = "main"`, then `"default"`, else
+    ///    the first entry (slice 1 only; slice 2 stops relying on single telegram).
+    /// 5. Empty `allowed_user_ids` is soft/warn on this parse-only slice; any
+    ///    bot (including legacy synthesize) must hard-fail at load/startup
+    ///    before or with the first multi-dispatcher (slice 2).
+    pub fn normalize_bots(&mut self) -> Result<()> {
+        let legacy_present = !self.telegram.bot_token.trim().is_empty();
+
+        if !self.bots.is_empty() {
+            if legacy_present {
+                tracing::warn!(
+                    "[telegram] is set alongside non-empty [[bots]] — using [[bots]] only;                      [telegram] is deprecated (migration). Remove [telegram] after switching."
+                );
+            }
+            Self::validate_bots(&self.bots)?;
+            // Shim: prefer id=main, then default, else first entry (PO lock for #65).
+            let shim = Self::shim_bot(&self.bots);
+            self.telegram = TelegramConfig {
+                bot_token: shim.bot_token.clone(),
+                allowed_user_ids: shim.allowed_user_ids.clone(),
+            };
+            return Ok(());
+        }
+
+        if legacy_present {
+            let synthesized = BotConfig {
+                id: "default".to_string(),
+                bot_token: self.telegram.bot_token.clone(),
+                allowed_user_ids: self.telegram.allowed_user_ids.clone(),
+                persona: default_bot_persona(),
+                system_prompt_file: None,
+                model: None,
+                tools: None,
+            };
+            Self::validate_bots(std::slice::from_ref(&synthesized))?;
+            self.bots = vec![synthesized];
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "no bots configured: provide [[bots]] or a legacy [telegram] section with bot_token"
+        );
+    }
+
+    /// Pick the bot that backs legacy `config.telegram` for slice 1.
+    fn shim_bot(bots: &[BotConfig]) -> &BotConfig {
+        bots.iter()
+            .find(|b| b.id.trim() == "main")
+            .or_else(|| bots.iter().find(|b| b.id.trim() == "default"))
+            .unwrap_or(&bots[0])
+    }
+
+    fn validate_bots(bots: &[BotConfig]) -> Result<()> {
+        if bots.is_empty() {
+            anyhow::bail!("[[bots]] must contain at least one entry");
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_tokens = std::collections::HashSet::new();
+
+        for (i, bot) in bots.iter().enumerate() {
+            let id = bot.id.trim();
+            if id.is_empty() {
+                anyhow::bail!("bots[{i}].id must be a non-empty string");
+            }
+            let token = bot.bot_token.trim();
+            if token.is_empty() {
+                anyhow::bail!("bots[{i}].bot_token must be a non-empty string");
+            }
+            if !seen_ids.insert(id.to_string()) {
+                anyhow::bail!("duplicate bots[].id \"{id}\"");
+            }
+            if !seen_tokens.insert(token.to_string()) {
+                anyhow::bail!("duplicate bots[].bot_token (bots[{i}])");
+            }
+        }
+        Ok(())
     }
 
     /// Build the provider list from config, handling legacy [openrouter] backward compat.
@@ -1642,5 +1781,296 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.fallback.chain.is_empty());
+    }
+
+    // ---- Multi-bot [[bots]] + legacy [telegram] shim (design §2 / §6 / §7.1) ----
+
+    fn parse_and_normalize(toml: &str) -> Config {
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.normalize_bots().unwrap();
+        cfg
+    }
+
+    #[test]
+    fn legacy_telegram_synthesizes_default_bot() {
+        let cfg = parse_and_normalize(
+            r#"
+            [telegram]
+            bot_token = "tok"
+            allowed_user_ids = [42, 99]
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg.bots.len(), 1);
+        let bot = &cfg.bots[0];
+        assert_eq!(bot.id, "default");
+        assert_eq!(bot.bot_token, "tok");
+        assert_eq!(bot.allowed_user_ids, vec![42, 99]);
+        assert_eq!(bot.persona, "main");
+        assert!(bot.system_prompt_file.is_none());
+        assert!(bot.model.is_none());
+        assert!(bot.tools.is_none());
+        // Shim: telegram unchanged / still readable
+        assert_eq!(cfg.telegram.bot_token, "tok");
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![42, 99]);
+    }
+
+    #[test]
+    fn bots_array_parses_and_shims_telegram() {
+        let cfg = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "tok-main"
+            allowed_user_ids = [1]
+            persona = "main"
+
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-research"
+            allowed_user_ids = [1, 2]
+            persona = "researcher"
+            model = "moonshotai/kimi-k2.6"
+            tools = ["read_file", "invoke_agent"]
+            system_prompt_file = "prompts/researcher.md"
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg.bots.len(), 2);
+        assert_eq!(cfg.bots[0].id, "main");
+        assert_eq!(cfg.bots[1].id, "researcher");
+        assert_eq!(cfg.bots[1].model.as_deref(), Some("moonshotai/kimi-k2.6"));
+        assert_eq!(
+            cfg.bots[1].tools.as_deref(),
+            Some(["read_file".to_string(), "invoke_agent".to_string()].as_slice())
+        );
+        assert_eq!(
+            cfg.bots[1].system_prompt_file.as_deref(),
+            Some(Path::new("prompts/researcher.md"))
+        );
+        // Prefer id=main for legacy telegram shim
+        assert_eq!(cfg.telegram.bot_token, "tok-main");
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![1]);
+    }
+
+    #[test]
+    fn shim_prefers_main_then_default_over_first_entry() {
+        let cfg = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-research"
+            allowed_user_ids = [2]
+            persona = "researcher"
+
+            [[bots]]
+            id = "main"
+            bot_token = "tok-main"
+            allowed_user_ids = [1]
+            persona = "main"
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg.bots[0].id, "researcher");
+        assert_eq!(cfg.telegram.bot_token, "tok-main");
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![1]);
+
+        let cfg2 = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-research"
+            allowed_user_ids = [2]
+
+            [[bots]]
+            id = "default"
+            bot_token = "tok-default"
+            allowed_user_ids = [9]
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg2.telegram.bot_token, "tok-default");
+        assert_eq!(cfg2.telegram.allowed_user_ids, vec![9]);
+    }
+
+    #[test]
+    fn bots_persona_defaults_to_main() {
+        let cfg = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "only"
+            bot_token = "tok"
+            allowed_user_ids = [7]
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg.bots[0].persona, "main");
+    }
+
+    #[test]
+    fn bots_wins_over_legacy_telegram() {
+        let cfg = parse_and_normalize(
+            r#"
+            [telegram]
+            bot_token = "legacy-tok"
+            allowed_user_ids = [999]
+
+            [[bots]]
+            id = "main"
+            bot_token = "bots-tok"
+            allowed_user_ids = [1]
+            persona = "main"
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert_eq!(cfg.bots.len(), 1);
+        assert_eq!(cfg.bots[0].bot_token, "bots-tok");
+        assert_eq!(cfg.bots[0].allowed_user_ids, vec![1]);
+        // Do not double-apply legacy allowlist onto bots
+        assert_eq!(cfg.telegram.bot_token, "bots-tok");
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![1]);
+    }
+
+    #[test]
+    fn reject_duplicate_bot_id() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "tok-a"
+            allowed_user_ids = [1]
+            [[bots]]
+            id = "main"
+            bot_token = "tok-b"
+            allowed_user_ids = [1]
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.normalize_bots().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate bots[].id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_bot_token() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[bots]]
+            id = "a"
+            bot_token = "same-tok"
+            allowed_user_ids = [1]
+            [[bots]]
+            id = "b"
+            bot_token = "same-tok"
+            allowed_user_ids = [1]
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.normalize_bots().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate bots[].bot_token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_empty_bot_id() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[bots]]
+            id = "  "
+            bot_token = "tok"
+            allowed_user_ids = [1]
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.normalize_bots().unwrap_err().to_string();
+        assert!(err.contains("id must be a non-empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn reject_missing_bots_and_telegram() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [openrouter]
+            api_key = "key"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.normalize_bots().unwrap_err().to_string();
+        assert!(
+            err.contains("no bots configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_normalizes_legacy_telegram() {
+        let _env = isolate_home_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".rustfox");
+        let cfg_path = tmp.path().join("config.toml");
+        let toml = format!(
+            r#"
+            [telegram]
+            bot_token = "tok"
+            allowed_user_ids = [1]
+            [openrouter]
+            api_key = "key"
+            [general]
+            home = "{}"
+            "#,
+            home.display()
+        );
+        std::fs::write(&cfg_path, toml).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        assert_eq!(cfg.bots.len(), 1);
+        assert_eq!(cfg.bots[0].id, "default");
+        assert_eq!(cfg.bots[0].persona, "main");
+    }
+
+    #[test]
+    fn load_normalizes_bots_only_config() {
+        let _env = isolate_home_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".rustfox");
+        let cfg_path = tmp.path().join("config.toml");
+        let toml = format!(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "tok-main"
+            allowed_user_ids = [5]
+            persona = "main"
+            [openrouter]
+            api_key = "key"
+            [general]
+            home = "{}"
+            "#,
+            home.display()
+        );
+        std::fs::write(&cfg_path, toml).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        assert_eq!(cfg.bots[0].id, "main");
+        assert_eq!(cfg.telegram.bot_token, "tok-main");
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![5]);
     }
 }
