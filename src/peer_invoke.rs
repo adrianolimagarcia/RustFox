@@ -113,6 +113,35 @@ pub fn bot_config_for_peer<'a>(bots: &'a [BotConfig], name: &str) -> Option<&'a 
         .or_else(|| bots.iter().find(|b| b.persona.trim() == name))
 }
 
+/// Resolve main-loop model + tools for a bot turn (design §7.6).
+///
+/// Precedence:
+/// 1. Explicit `bots[].model` / `bots[].tools` if set
+/// 2. Else persona `agents/<persona>/AGENT.md` frontmatter (`persona_model` /
+///    `persona_tools` from the agents registry)
+/// 3. Else `None` — caller uses install defaults (full tool registry +
+///    `[openrouter].model` / current model)
+///
+/// Empty `persona_tools` means "no AGENT.md whitelist" (not an empty allowlist).
+pub fn resolve_bot_loop_overrides(
+    bot: &BotConfig,
+    persona_model: Option<&str>,
+    persona_tools: &[String],
+) -> (Option<String>, Option<Vec<String>>) {
+    let model = bot
+        .model
+        .clone()
+        .or_else(|| persona_model.map(str::to_string));
+    let tools = bot.tools.clone().or_else(|| {
+        if persona_tools.is_empty() {
+            None
+        } else {
+            Some(persona_tools.to_vec())
+        }
+    });
+    (model, tools)
+}
+
 /// Push a canonical `target` onto a cloned stack (caller must have already guarded).
 pub fn push_invoke_stack(stack: &[String], target: &str) -> Vec<String> {
     let mut next = stack.to_vec();
@@ -257,5 +286,33 @@ mod tests {
         let key_id = stack_key_for_invoke("r1", &source_id);
         let err_id = guard_peer_invoke(&stack, &key_id).unwrap_err();
         assert!(err_id.contains("cycle"), "unexpected: {err_id}");
+    }
+
+    #[test]
+    fn resolve_bot_loop_overrides_bots_fields_win() {
+        let mut b = bot("r1", "researcher");
+        b.model = Some("bots/model".into());
+        b.tools = Some(vec!["read_file".into()]);
+        let (m, t) = resolve_bot_loop_overrides(&b, Some("persona/model"), &["list_files".into()]);
+        assert_eq!(m.as_deref(), Some("bots/model"));
+        assert_eq!(t.as_deref(), Some(["read_file".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn resolve_bot_loop_overrides_falls_back_to_persona_agent_md() {
+        let b = bot("r1", "researcher");
+        let persona_tools = vec!["read_file".into(), "list_files".into()];
+        let (m, t) = resolve_bot_loop_overrides(&b, Some("persona/model"), &persona_tools);
+        assert_eq!(m.as_deref(), Some("persona/model"));
+        assert_eq!(t.as_ref().map(|v| v.len()), Some(2));
+        assert!(t.unwrap().contains(&"list_files".to_string()));
+    }
+
+    #[test]
+    fn resolve_bot_loop_overrides_empty_persona_tools_means_install_default() {
+        let b = bot("main", "main");
+        let (m, t) = resolve_bot_loop_overrides(&b, None, &[]);
+        assert!(m.is_none());
+        assert!(t.is_none());
     }
 }
