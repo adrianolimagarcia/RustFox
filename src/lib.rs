@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod agent_prompt;
+pub mod agents_edit;
 pub mod builtin_tools;
 pub mod cancel_registry;
 pub mod command_tool;

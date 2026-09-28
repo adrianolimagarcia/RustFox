@@ -162,6 +162,10 @@ pub(crate) fn supported_commands() -> Vec<teloxide::types::BotCommand> {
             "Show or set allowlisted config.toml keys (secrets redacted)",
         ),
         BotCommand::new(
+            "agents",
+            "List/create agent personas and bind a BotFather token",
+        ),
+        BotCommand::new(
             "restart",
             "Clean process exit so the service/shell brings the bot back",
         ),
@@ -823,6 +827,271 @@ async fn handle_config_command(
     }
 }
 
+/// `/agents` — list / show / create persona + guided one-shot BotFather token bind.
+///
+/// Auth is the dispatcher allowlist. Tokens are never echoed (`bot_token=***`);
+/// the one-shot token message is deleted best-effort and never stored in memory.
+async fn handle_agents_command(
+    bot: Bot,
+    chat_id: ChatId,
+    agent: &Arc<Agent>,
+    arg: &str,
+    user_id: u64,
+    msg_format: MessageFormat,
+) -> ResponseResult<()> {
+    let arg = arg.trim();
+    let (sub, rest) = match arg.split_once(char::is_whitespace) {
+        Some((a, b)) => (a, b.trim()),
+        None => (arg, ""),
+    };
+
+    match sub {
+        "" | "list" => {
+            let disk_cfg = crate::config::Config::load(&agent.config_path).ok();
+            let cfg = disk_cfg.as_ref().unwrap_or(&agent.config);
+            let reply = crate::agents_edit::format_agents_list(cfg);
+            return send_markdown_message(&bot, chat_id, &reply, msg_format).await;
+        }
+        "help" | "keys" => {
+            return send_markdown_message(
+                &bot,
+                chat_id,
+                &crate::agents_edit::slash_help_markdown(),
+                msg_format,
+            )
+            .await;
+        }
+        "show" => {
+            if rest.is_empty() {
+                return send_markdown_message(
+                    &bot,
+                    chat_id,
+                    "Usage: `/agents show <id>`",
+                    msg_format,
+                )
+                .await;
+            }
+            let disk_cfg = crate::config::Config::load(&agent.config_path).ok();
+            let cfg = disk_cfg.as_ref().unwrap_or(&agent.config);
+            match crate::agents_edit::format_agent_show(cfg, rest) {
+                Ok(reply) => {
+                    return send_markdown_message(&bot, chat_id, &reply, msg_format).await;
+                }
+                Err(e) => {
+                    return send_markdown_message(&bot, chat_id, &format!("❌ {e}"), msg_format)
+                        .await;
+                }
+            }
+        }
+        "cancel" => {
+            let key = crate::agents_edit::token_pending_key(user_id);
+            agent.memory.forget("settings", &key).await.ok();
+            return send_markdown_message(
+                &bot,
+                chat_id,
+                "✅ Cancelled pending bot-token bind.",
+                msg_format,
+            )
+            .await;
+        }
+        "create" => {
+            if rest.is_empty() {
+                return send_markdown_message(
+                    &bot,
+                    chat_id,
+                    "Usage: `/agents create <id>`\nThen send the BotFather token as your next message.",
+                    msg_format,
+                )
+                .await;
+            }
+            if let Err(e) = crate::agents_edit::validate_agent_id(rest) {
+                return send_markdown_message(&bot, chat_id, &format!("❌ {e}"), msg_format).await;
+            }
+            let id = rest.trim();
+
+            // Reject if bot id already configured (disk preferred).
+            let disk_cfg = crate::config::Config::load(&agent.config_path).ok();
+            let cfg = disk_cfg.as_ref().unwrap_or(&agent.config);
+            if cfg.bots.iter().any(|b| b.id.trim() == id) {
+                return send_markdown_message(
+                    &bot,
+                    chat_id,
+                    &format!("❌ Bot id `{id}` already exists in `[[bots]]`."),
+                    msg_format,
+                )
+                .await;
+            }
+
+            let agents_dir = &agent.config.agents.directory;
+            let persona_dir = agents_dir.join(id);
+            let created_fresh = if persona_dir.join("AGENT.md").exists() || persona_dir.exists() {
+                // Re-arm token capture for an existing unbound persona pack.
+                false
+            } else {
+                match crate::agents_edit::create_persona_pack(agents_dir, id) {
+                    Ok(created) => {
+                        tracing::info!(
+                            agent_id = %created.id,
+                            path = %created.dir.display(),
+                            "Telegram /agents create persona pack"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Telegram /agents create failed");
+                        return send_markdown_message(
+                            &bot,
+                            chat_id,
+                            &format!("❌ Create failed: {e}"),
+                            msg_format,
+                        )
+                        .await;
+                    }
+                }
+            };
+
+            let key = crate::agents_edit::token_pending_key(user_id);
+            if let Err(e) = agent.memory.remember("settings", &key, id, None).await {
+                tracing::warn!(error = %e, "Failed to store agents token-pending state");
+                return send_markdown_message(
+                    &bot,
+                    chat_id,
+                    &format!("❌ Failed to arm token capture: {e}"),
+                    msg_format,
+                )
+                .await;
+            }
+            let head = if created_fresh {
+                format!("✅ Created persona pack `agents/{id}/` (`AGENT.md` + `SOUL.md`).")
+            } else {
+                format!(
+                    "✅ Persona pack `agents/{id}/` already on disk (no `[[bots]]` id yet) — re-armed token capture."
+                )
+            };
+            let reply = format!(
+                "{head}
+
+                 Now send the **BotFather token** as your **next** message (one-shot).
+                 It will be deleted and never logged. Cancel with `/agents cancel`.
+
+                 Bind will append `[[bots]]` `{{ id={id}, persona={id}, allowed_user_ids=[{user_id}], bot_token=*** }}` then restart."
+            );
+            return send_markdown_message(&bot, chat_id, &reply, msg_format).await;
+        }
+        _ => {
+            return send_markdown_message(
+                &bot,
+                chat_id,
+                &format!(
+                    "Unknown `/agents` subcommand `{sub}`.\n\n{}",
+                    crate::agents_edit::slash_help_markdown()
+                ),
+                msg_format,
+            )
+            .await;
+        }
+    }
+}
+
+/// If the user has a pending `/agents create` token capture, consume the next
+/// non-slash text message as the BotFather token (never log/store raw token).
+///
+/// Returns `true` when the message was handled as a token bind attempt.
+async fn try_handle_pending_agent_token(
+    bot: &Bot,
+    msg: &Message,
+    agent: &Arc<Agent>,
+    user_id: u64,
+    text: &str,
+    msg_format: MessageFormat,
+) -> ResponseResult<bool> {
+    if text.is_empty() || text.starts_with('/') {
+        return Ok(false);
+    }
+    let key = crate::agents_edit::token_pending_key(user_id);
+    let pending_id = match agent.memory.recall("settings", &key).await {
+        Ok(Some(id)) if !id.trim().is_empty() => id,
+        _ => return Ok(false),
+    };
+
+    let token = text.trim();
+
+    // Non-token chatter while armed: keep pending, do not delete, nudge.
+    if !crate::agents_edit::looks_like_bot_token(token) {
+        let _ = send_markdown_message(
+            bot,
+            msg.chat.id,
+            &format!(
+                "⏳ Waiting for BotFather token for `{pending_id}` (one-shot).
+                 Send the token as the next message, or `/agents cancel`."
+            ),
+            msg_format,
+        )
+        .await;
+        return Ok(true);
+    }
+
+    // Best-effort delete of the token message (hygiene). Never log raw text.
+    if let Err(e) = bot.delete_message(msg.chat.id, msg.id).await {
+        tracing::warn!(
+            error = %e,
+            "Failed to delete bot-token message (redact in replies/logs anyway)"
+        );
+    }
+
+    tracing::info!(
+        agent_id = %pending_id,
+        token = "bot_token=***",
+        "Telegram /agents token bind attempt"
+    );
+
+    match crate::agents_edit::append_bot_binding(&agent.config_path, &pending_id, token, user_id) {
+        Ok(result) => {
+            agent.memory.forget("settings", &key).await.ok();
+            let reply = format!(
+                "✅ Bound bot `{id}` → persona=`{persona}` allowlist={allow:?} bot_token=***
+                 Backup: `{bak}`
+
+                 Restarting so the new dispatcher comes up…",
+                id = result.id,
+                persona = result.persona,
+                allow = result.allowed_user_ids,
+                bak = result.bak_path.display()
+            );
+            let _ = send_markdown_message(bot, msg.chat.id, &reply, msg_format).await;
+            // Reuse /restart clean-exit path (TL: write + restart).
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Err(e) = crate::learning::restart_bot() {
+                    tracing::error!(error = %e, "Telegram /agents bind restart failed");
+                }
+            });
+            Ok(true)
+        }
+        Err(e) => {
+            // Keep pending so the user can resend a corrected token (persona dir already exists).
+            tracing::warn!(
+                agent_id = %pending_id,
+                error = %e,
+                "Telegram /agents token bind failed"
+            );
+            let _ = send_markdown_message(
+                bot,
+                msg.chat.id,
+                &format!(
+                    "❌ Token bind failed for `{pending_id}`: {e}
+
+                     Pending is still armed — send another token, or `/agents cancel`.
+                     Persona pack `agents/{pending_id}/` was kept."
+                ),
+                msg_format,
+            )
+            .await;
+            Ok(true)
+        }
+    }
+}
+
 /// `/restart` — ack, then clean process exit so the supervisor brings us back.
 ///
 /// v1: no in-process Telegram dispatcher hot-reload (TL lock).
@@ -933,11 +1202,22 @@ async fn handle_message(
         return handle_model_search(bot, msg.chat.id, &agent, &text, &user_id.to_string()).await;
     }
 
+    // Pending /agents token capture — handle before any log that would echo text.
+    if try_handle_pending_agent_token(&bot, &msg, &agent, user_id, &text, msg_format).await? {
+        return Ok(());
+    }
+
     info!(
         "Telegram message from {} ({}): {} [attachments: {}]",
         user_name,
         user_id,
-        if text.is_empty() { "(no text)" } else { &text },
+        if text.is_empty() {
+            "(no text)"
+        } else if crate::agents_edit::looks_like_bot_token(&text) {
+            "bot_token=***"
+        } else {
+            &text
+        },
         attachments.len()
     );
 
@@ -974,6 +1254,7 @@ async fn handle_message(
              **/btw** — Ask a parallel question while the bot is busy\n\
              **/portal** — Portal URLs (web UI) for this network
              **/config** — Show/set allowlisted config keys (secrets redacted)
+             **/agents** — List/create personas and bind a BotFather token
              **/restart** — Clean restart (exit; service/shell brings it back)";
         return send_markdown_message(&bot, msg.chat.id, help, msg_format).await;
     }
@@ -1361,6 +1642,10 @@ async fn handle_message(
             }
             "config" => {
                 return handle_config_command(bot, msg.chat.id, &agent, &arg, msg_format).await;
+            }
+            "agents" => {
+                return handle_agents_command(bot, msg.chat.id, &agent, &arg, user_id, msg_format)
+                    .await;
             }
             "restart" => {
                 return handle_restart_command(bot, msg.chat.id).await;
@@ -2424,6 +2709,7 @@ mod tests {
             "verbose",
             "queryrewrite",
             "config",
+            "agents",
             "restart",
         ] {
             assert!(
