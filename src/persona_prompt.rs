@@ -1,8 +1,10 @@
 //! Per-bot persona prompt binding (design §7.4).
 //!
-//! Each `[[bots]]` entry resolves its own base system prompt and SOUL/AGENTS
-//! overlay from `agents/<persona>/`, while **USER.md stays install-wide**
-//! (PO lock). Portal / scheduler keep the shim/default persona in v1.
+//! Each `[[bots]]` entry resolves its own base system prompt and SOUL overlay
+//! from `agents/<persona>/` (AGENT.md + SOUL.md). **AGENTS.md (learned memory)
+//! and USER.md stay install-wide / process-wide** (PO/TL lock) — never read
+//! `agents/<persona>/AGENTS.md`. Portal / scheduler keep the shim/default
+//! persona in v1.
 
 use std::path::{Path, PathBuf};
 
@@ -21,15 +23,14 @@ pub enum BotPromptSource {
 
 /// Resolved soul-file paths for a bot persona.
 ///
-/// `user` is **always** the shared home `USER.md`. SOUL / AGENTS.md prefer a
-/// persona overlay under `agents/<persona>/` when the file exists.
+/// `agents_md` and `user` are **always** the shared home copies (PO/TL lock).
+/// SOUL prefers a persona overlay under `agents/<persona>/` when the file exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersonaSoulFiles {
     pub soul: PathBuf,
     pub agents_md: PathBuf,
     pub user: PathBuf,
     pub soul_from_persona: bool,
-    pub agents_md_from_persona: bool,
 }
 
 impl PersonaSoulFiles {
@@ -40,7 +41,6 @@ impl PersonaSoulFiles {
             agents_md: home.join("AGENTS.md"),
             user: home.join("USER.md"),
             soul_from_persona: false,
-            agents_md_from_persona: false,
         }
     }
 }
@@ -147,8 +147,9 @@ pub fn resolve_bot_base_prompt(config: &Config, bot: &BotConfig) -> (String, Bot
 
 /// Resolve SOUL / AGENTS.md / USER.md paths for a persona.
 ///
-/// USER.md is always `home/USER.md` (shared). SOUL and AGENTS.md use
-/// `agents/<persona>/…` when present, else the home copies.
+/// AGENTS.md and USER.md are always `home/…` (shared learned memory / user
+/// model — PO/TL lock). SOUL uses `agents/<persona>/SOUL.md` when present,
+/// else the home copy. Persona bind (§7.4) is AGENT.md + SOUL only.
 pub fn resolve_persona_soul_files(
     home: &Path,
     agents_dir: &Path,
@@ -164,19 +165,11 @@ pub fn resolve_persona_soul_files(
         (home.join("SOUL.md"), false)
     };
 
-    let persona_agents = persona_dir.join("AGENTS.md");
-    let (agents_md, agents_md_from_persona) = if !persona.is_empty() && persona_agents.is_file() {
-        (persona_agents, true)
-    } else {
-        (home.join("AGENTS.md"), false)
-    };
-
     PersonaSoulFiles {
         soul,
-        agents_md,
+        agents_md: home.join("AGENTS.md"),
         user: home.join("USER.md"),
         soul_from_persona,
-        agents_md_from_persona,
     }
 }
 
@@ -276,6 +269,9 @@ mod tests {
         assert_eq!(main_soul.user, research_soul.user);
         assert_eq!(main_soul.user, home.join("USER.md"));
         assert!(!main_soul.user.starts_with(&cfg.agents.directory));
+        // AGENTS.md always home (learned memory) — even if personas differ
+        assert_eq!(main_soul.agents_md, research_soul.agents_md);
+        assert_eq!(main_soul.agents_md, home.join("AGENTS.md"));
     }
 
     #[test]
@@ -385,5 +381,51 @@ mod tests {
         assert_eq!(files.soul, home.join("SOUL.md"));
         assert_eq!(files.agents_md, home.join("AGENTS.md"));
         assert_eq!(files.user, home.join("USER.md"));
+    }
+
+    #[test]
+    fn agents_md_always_home_even_when_persona_agents_md_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".rustfox");
+        let agents = home.join("agents");
+        std::fs::create_dir_all(agents.join("researcher")).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "HOME_LEARNED_MEMORY\n").unwrap();
+        // Mistaken per-persona AGENTS.md must be ignored (PO/TL lock §7.4).
+        std::fs::write(
+            agents.join("researcher/AGENTS.md"),
+            "PERSONA_AGENTS_MUST_NOT_WIN\n",
+        )
+        .unwrap();
+        std::fs::write(agents.join("researcher/SOUL.md"), "RESEARCHER_SOUL\n").unwrap();
+        std::fs::write(home.join("USER.md"), "SHARED_USER\n").unwrap();
+
+        let files = resolve_persona_soul_files(&home, &agents, "researcher");
+        assert_eq!(files.agents_md, home.join("AGENTS.md"));
+        assert!(!files.agents_md.starts_with(&agents));
+        assert!(files.soul_from_persona);
+        assert_eq!(files.soul, agents.join("researcher/SOUL.md"));
+        assert_eq!(files.user, home.join("USER.md"));
+    }
+
+    #[test]
+    fn different_personas_share_home_agents_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".rustfox");
+        let agents = home.join("agents");
+        std::fs::create_dir_all(agents.join("main")).unwrap();
+        std::fs::create_dir_all(agents.join("researcher")).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "SHARED_MEMORY\n").unwrap();
+        std::fs::write(agents.join("main/AGENTS.md"), "MAIN_AGENTS\n").unwrap();
+        std::fs::write(agents.join("researcher/AGENTS.md"), "RESEARCHER_AGENTS\n").unwrap();
+        std::fs::write(agents.join("main/SOUL.md"), "MAIN_SOUL\n").unwrap();
+        std::fs::write(agents.join("researcher/SOUL.md"), "RESEARCHER_SOUL\n").unwrap();
+
+        let main = resolve_persona_soul_files(&home, &agents, "main");
+        let research = resolve_persona_soul_files(&home, &agents, "researcher");
+        assert_eq!(main.agents_md, research.agents_md);
+        assert_eq!(main.agents_md, home.join("AGENTS.md"));
+        assert_ne!(main.soul, research.soul);
+        assert!(main.soul_from_persona);
+        assert!(research.soul_from_persona);
     }
 }

@@ -331,10 +331,11 @@ impl Agent {
 
     /// Build ambient system context (soul files, timestamp, location).
     ///
-    /// When `persona` is `Some`, SOUL/AGENTS.md prefer `agents/<persona>/`
-    /// overlays (§7.4). USER.md is always the shared home copy. Subagents pass
-    /// `None` to keep home-only soul files. Unlike build_system_prompt, this
-    /// does NOT include skills/agents listings.
+    /// When `persona` is `Some`, SOUL prefers `agents/<persona>/SOUL.md`
+    /// (§7.4; persona bind = AGENT.md + SOUL). AGENTS.md and USER.md are
+    /// always the shared home copies (PO/TL lock). Subagents pass `None` to
+    /// keep home-only soul files. Unlike build_system_prompt, this does NOT
+    /// include skills/agents listings.
     async fn build_system_context(&self, persona: Option<&str>) -> String {
         let mut ctx = String::new();
 
@@ -362,7 +363,7 @@ impl Agent {
                 }
             }
 
-            // Inject AGENTS.md (persona overlay or home)
+            // Inject AGENTS.md — always home learned memory (PO/TL lock)
             let agents_content = crate::learning::read_soul_file(&files.agents_md).await;
             if !agents_content.is_empty() {
                 let truncated = crate::learning::truncate_to(&agents_content, 8_000);
