@@ -193,6 +193,12 @@ impl<'a> AgenticLoop<'a> {
                     if let Some(ref handler) = self.special_tool_handler {
                         let fut = (handler)(&tc.function.name, &args, user_id, chat_id);
                         if let Some(result) = fut.await {
+                            // Peer cycle/depth/self-invoke must abort the turn so
+                            // Telegram clears Working and surfaces an error reply
+                            // (soft tool results left the UI stuck on hung LLM retries).
+                            if crate::peer_invoke::is_hard_invoke_error(&result) {
+                                return Err(anyhow::anyhow!("{result}"));
+                            }
                             messages.push_tool_result(&tc.id, result);
                             continue;
                         }

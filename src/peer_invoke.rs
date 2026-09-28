@@ -142,6 +142,31 @@ pub fn resolve_bot_loop_overrides(
     (model, tools)
 }
 
+/// True when an `invoke_agent` / peer-guard failure must abort the turn
+/// (clear Telegram Working + surface an error reply) instead of continuing
+/// the agentic loop with a soft tool result.
+pub fn is_hard_invoke_error(msg: &str) -> bool {
+    let m = msg.trim();
+    m.starts_with("Peer invoke cycle")
+        || m.starts_with("Peer invoke depth")
+        || m.starts_with("Peer invoke target")
+        || m.starts_with("Peer invoke rejected")
+}
+
+/// `bots[].id` that differs from `bots[].persona` is a Telegram bot identity,
+/// not an agents-pack name. Pack lookup requires the persona map (or id==persona).
+pub fn bot_id_is_unmapped_pack_name(bots: &[BotConfig], name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    bots.iter().any(|b| {
+        let id = b.id.trim();
+        let persona = b.persona.trim();
+        id == name && id != persona
+    })
+}
+
 /// Push a canonical `target` onto a cloned stack (caller must have already guarded).
 pub fn push_invoke_stack(stack: &[String], target: &str) -> Vec<String> {
     let mut next = stack.to_vec();
@@ -314,5 +339,49 @@ mod tests {
         let (m, t) = resolve_bot_loop_overrides(&b, None, &[]);
         assert!(m.is_none());
         assert!(t.is_none());
+    }
+
+    #[test]
+    fn unmapped_bot_id_resolves_as_persona_and_hard_errors_on_self() {
+        let bots = vec![bot("qa2", "researcher"), bot("qa", "main")];
+        assert!(bot_id_is_unmapped_pack_name(&bots, "qa2"));
+        // Callers pass in_agents=false / in_skills=false for unmapped bot_id.
+        let source = resolve_invoke_source("qa2", false, false, &bots);
+        assert_eq!(
+            source,
+            Some(InvokeSource::BotPersona {
+                bot_id: "qa2".into(),
+                persona: "researcher".into(),
+            })
+        );
+        let key = stack_key_for_invoke("qa2", &source);
+        assert_eq!(key, "qa2");
+        let err = guard_peer_invoke(&["qa2".into()], &key).unwrap_err();
+        assert!(is_hard_invoke_error(&err), "unexpected: {err}");
+        // Peer bot_id from another root is fine.
+        assert!(guard_peer_invoke(&["qa".into()], &key).is_ok());
+    }
+
+    #[test]
+    fn hard_invoke_error_detects_cycle_and_depth() {
+        assert!(is_hard_invoke_error(
+            "Peer invoke cycle detected: 'qa2' is already on the invoke stack [qa2]"
+        ));
+        assert!(is_hard_invoke_error(
+            "Peer invoke depth limit exceeded (max_peer_depth=2): stack [a → b → c] cannot invoke 'x'"
+        ));
+        assert!(is_hard_invoke_error("Peer invoke target is empty"));
+        assert!(!is_hard_invoke_error("via researcher:\nfindings"));
+        assert!(!is_hard_invoke_error("Missing prompt"));
+    }
+
+    #[test]
+    fn bot_id_distinct_from_persona_is_unmapped_pack_name() {
+        let bots = vec![bot("qa2", "researcher"), bot("main", "main")];
+        assert!(bot_id_is_unmapped_pack_name(&bots, "qa2"));
+        // id == persona → may share agents/<id> pack name
+        assert!(!bot_id_is_unmapped_pack_name(&bots, "main"));
+        assert!(!bot_id_is_unmapped_pack_name(&bots, "researcher"));
+        assert!(!bot_id_is_unmapped_pack_name(&bots, "ghost"));
     }
 }
