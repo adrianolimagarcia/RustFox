@@ -18,6 +18,12 @@ impl MemoryStore {
     /// Get or create an active (non-archived) conversation for a platform+bot+user.
     /// Empty `bot_id` is normalized to `"default"`. If all existing conversations for
     /// that triple are archived, a new one is created.
+    ///
+    /// **Legacy claim/remap:** migration backfills pre-§7.3 rows to `bot_id = "default"`,
+    /// but primary Telegram bots often use `[[bots]].id = "main"`. On miss for a primary
+    /// alias (`"main"`; `"default"` is a no-op here), claim the active
+    /// `(platform, "default", user_id)` row by updating its `bot_id` so history is not
+    /// orphaned. Secondary bot ids (e.g. `"researcher"`) never claim.
     pub async fn get_or_create_conversation(
         &self,
         platform: &str,
@@ -41,6 +47,31 @@ impl MemoryStore {
 
         if let Some(id) = existing {
             return Ok(id);
+        }
+
+        // Primary-bot legacy claim: remap active default-row to this bot_id.
+        // `"default"` looking up `"default"` already returned above if present.
+        if bot_id == "main" {
+            let legacy: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE platform = ?1 AND bot_id = ?2 AND user_id = ?3
+                       AND (is_archived IS NULL OR is_archived = 0)
+                     ORDER BY updated_at DESC LIMIT 1",
+                    rusqlite::params![platform, crate::platform::DEFAULT_BOT_ID, user_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if let Some(id) = legacy {
+                conn.execute(
+                    "UPDATE conversations SET bot_id = ?1, updated_at = datetime('now')
+                     WHERE id = ?2",
+                    rusqlite::params![bot_id, &id],
+                )
+                .context("Failed to claim legacy default conversation")?;
+                return Ok(id);
+            }
         }
 
         // Create a new conversation
@@ -545,6 +576,113 @@ mod tests {
             .unwrap();
         assert_eq!(conv_a, again_a);
         assert_eq!(conv_b, again_b);
+    }
+
+    #[tokio::test]
+    async fn test_main_claims_legacy_default_conversation() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+
+        // History created under migration backfill bot_id = "default"
+        let legacy_id = store
+            .get_or_create_conversation("telegram", "default", "legacy_user")
+            .await
+            .unwrap();
+        store
+            .save_message(&legacy_id, &make_msg("user", "hello from before multi-bot"))
+            .await
+            .unwrap();
+
+        // First lookup as primary alias "main" must reclaim the same row
+        let claimed = store
+            .get_or_create_conversation("telegram", "main", "legacy_user")
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed, legacy_id,
+            "main must reclaim the legacy default conversation id"
+        );
+
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let stored_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&claimed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations
+                 WHERE platform = 'telegram' AND user_id = 'legacy_user'
+                   AND (is_archived IS NULL OR is_archived = 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(stored_bot, "main", "bot_id column must be remapped to main");
+        assert_eq!(
+            active_count, 1,
+            "must not create a duplicate blank conversation"
+        );
+
+        let messages = store.load_messages(&claimed).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .as_ref()
+                .map(|c| c.as_text())
+                .unwrap()
+                .contains("hello from before multi-bot"),
+            "legacy messages must still load after claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secondary_bot_does_not_steal_default_history() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+
+        let legacy_id = store
+            .get_or_create_conversation("telegram", "default", "shared_user")
+            .await
+            .unwrap();
+        store
+            .save_message(&legacy_id, &make_msg("user", "primary history"))
+            .await
+            .unwrap();
+
+        let researcher = store
+            .get_or_create_conversation("telegram", "researcher", "shared_user")
+            .await
+            .unwrap();
+        assert_ne!(
+            researcher, legacy_id,
+            "secondary bot must not steal default history"
+        );
+
+        let conn = store.connection();
+        let conn = conn.lock().await;
+        let legacy_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&legacy_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let researcher_bot: String = conn
+            .query_row(
+                "SELECT bot_id FROM conversations WHERE id = ?1",
+                rusqlite::params![&researcher],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(legacy_bot, "default");
+        assert_eq!(researcher_bot, "researcher");
     }
 
     #[tokio::test]
