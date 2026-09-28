@@ -33,6 +33,9 @@ impl Backend for ScriptBackend {
     async fn run(&self, job: &mut Job, _ctx: &RunContext) -> Result<JobOutput> {
         run_cli_process(job, &self.bin, &self.args, &self.workdir).await
     }
+    async fn cancel(&self, job_id: &str) -> Result<()> {
+        crate::supervisor::backend::cancel_cli_job(job_id).await
+    }
 }
 
 #[cfg(test)]
