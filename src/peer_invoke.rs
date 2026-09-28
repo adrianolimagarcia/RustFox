@@ -24,8 +24,10 @@ pub enum InvokeSource {
 /// Reject cycles and depth overflow before pushing `target` onto `stack`.
 ///
 /// `stack` is seeded with the root caller **bot_id**. Callers must pass a
-/// canonical `target` from [`stack_key_for_invoke`] (bot personas → `bot_id`;
-/// agents/skills keep their registry name). Peer depth is `stack.len() - 1`.
+/// canonical `target` from [`stack_key_for_invoke`] then
+/// [`canonicalize_self_stack_key`] (bot personas → `bot_id`; agents/skills keep
+/// their registry name unless that name is the caller's persona / bot_id).
+/// Peer depth is `stack.len() - 1`.
 pub fn guard_peer_invoke(stack: &[String], target: &str) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
@@ -103,6 +105,40 @@ pub fn stack_key_for_invoke(name: &str, source: &Option<InvokeSource>) -> String
         Some(InvokeSource::BotPersona { bot_id, .. }) => bot_id.clone(),
         _ => name.trim().to_string(),
     }
+}
+
+/// Rewrite the invoke stack key when the target is the **current** bot on the
+/// stack — by `bot_id` or that bot's `persona` — so AgentRegistry / SkillRegistry
+/// packs named like the caller's persona hard-reject as self (same cycle path).
+///
+/// Cross-persona peer invoke is unchanged: only frames already on `stack` count.
+/// Example: bot `qa2` (persona=`researcher`) with stack `["qa2"]` invoking
+/// agent pack `"researcher"` → key `"qa2"` → [`guard_peer_invoke`] cycle error.
+pub fn canonicalize_self_stack_key(
+    stack: &[String],
+    invoke_name: &str,
+    preliminary_key: &str,
+    bots: &[BotConfig],
+) -> String {
+    let name = invoke_name.trim();
+    let key = preliminary_key.trim();
+    if name.is_empty() && key.is_empty() {
+        return preliminary_key.to_string();
+    }
+
+    for frame in stack {
+        let frame = frame.as_str();
+        if key == frame || name == frame {
+            return frame.to_string();
+        }
+        if let Some(bot) = bots.iter().find(|b| b.id.trim() == frame) {
+            let persona = bot.persona.trim();
+            if !persona.is_empty() && (name == persona || key == persona) {
+                return bot.id.trim().to_string();
+            }
+        }
+    }
+    key.to_string()
 }
 
 /// Look up the bot config for a peer target (id or persona).
@@ -383,5 +419,37 @@ mod tests {
         assert!(!bot_id_is_unmapped_pack_name(&bots, "main"));
         assert!(!bot_id_is_unmapped_pack_name(&bots, "researcher"));
         assert!(!bot_id_is_unmapped_pack_name(&bots, "ghost"));
+    }
+
+    #[test]
+    fn agent_registry_persona_self_canonicalizes_to_caller_bot_id() {
+        // TL HOLD (Product Q1): qa2 persona=researcher → invoke_agent("researcher")
+        // via AgentRegistry must canonicalize to bot_id and hard-reject as self.
+        let bots = vec![bot("qa2", "researcher"), bot("qa", "main")];
+        let stack = vec!["qa2".to_string()];
+        let source = resolve_invoke_source("researcher", true, false, &bots);
+        assert_eq!(source, Some(InvokeSource::AgentRegistry));
+        let prelim = stack_key_for_invoke("researcher", &source);
+        assert_eq!(prelim, "researcher", "preliminary key stays registry name");
+        let key = canonicalize_self_stack_key(&stack, "researcher", &prelim, &bots);
+        assert_eq!(
+            key, "qa2",
+            "persona pack must canonicalize to stacked bot_id"
+        );
+        let err = guard_peer_invoke(&stack, &key).unwrap_err();
+        assert!(
+            err.contains("cycle") && err.contains("'qa2'"),
+            "unexpected: {err}"
+        );
+        assert!(
+            is_hard_invoke_error(&err),
+            "must hard-abort like cycle: {err}"
+        );
+
+        // Cross-persona peer invoke still OK: qa → researcher agent pack.
+        let stack_qa = vec!["qa".to_string()];
+        let key_peer = canonicalize_self_stack_key(&stack_qa, "researcher", &prelim, &bots);
+        assert_eq!(key_peer, "researcher");
+        assert!(guard_peer_invoke(&stack_qa, &key_peer).is_ok());
     }
 }

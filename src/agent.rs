@@ -1533,7 +1533,8 @@ impl Agent {
         });
 
         // Classify first (agents → skills → bots), then guard/push a *canonical*
-        // stack key: BotPersona → bot_id (persona is alias); agent/skill keep name.
+        // stack key: BotPersona → bot_id (persona is alias); agent/skill keep name
+        // unless that name is the caller's persona/bot_id on the stack (self).
         // bot_id ≠ agent pack without explicit map: a [[bots]].id that differs
         // from its persona must not be looked up as agents/<bot_id> / skills.
         let skip_pack =
@@ -1555,6 +1556,14 @@ impl Agent {
             &self.config.bots,
         );
         let stack_key = crate::peer_invoke::stack_key_for_invoke(&agent_name, &source);
+        // AgentRegistry/Skill pack named like the caller's persona (or bot_id)
+        // must canonicalize to the stacked bot_id and hard-reject as self.
+        let stack_key = crate::peer_invoke::canonicalize_self_stack_key(
+            &invoke_stack,
+            &agent_name,
+            &stack_key,
+            &self.config.bots,
+        );
 
         if let Err(e) = crate::peer_invoke::guard_peer_invoke(&invoke_stack, &stack_key) {
             warn!(
