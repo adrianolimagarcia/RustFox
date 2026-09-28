@@ -21,18 +21,10 @@ use crate::tool_registry::ToolUiMode;
 use crate::utils::markdown_entities::{markdown_to_entities, split_entities};
 use crate::utils::rich_sender;
 use crate::utils::telegram_markdown::escape_text;
-use std::sync::OnceLock;
 
 /// Helper: parse a chat_id string (e.g. "123456789") into teloxide's ChatId.
 fn parse_chat_id(s: &str) -> Result<teloxide::types::ChatId> {
     Ok(teloxide::types::ChatId(s.parse::<i64>()?))
-}
-
-static BOT_TOKEN: OnceLock<String> = OnceLock::new();
-
-/// Must be called once at startup after the Bot is created.
-pub fn init_bot_token(token: String) {
-    BOT_TOKEN.set(token).ok();
 }
 
 /// Message format mode for Telegram responses.
@@ -350,7 +342,7 @@ pub async fn send_markdown_message(
 ) -> ResponseResult<()> {
     match format {
         MessageFormat::Rich => {
-            let token = BOT_TOKEN.get().expect("BOT_TOKEN not initialized");
+            let token = bot.token();
             let processed = crate::utils::markdown_entities::preprocess_markdown(markdown);
             rich_sender::send_rich_messages(token, chat_id.0, &processed)
                 .await
@@ -361,7 +353,7 @@ pub async fn send_markdown_message(
         }
         MessageFormat::Markdown => send_entities_message(bot, chat_id, markdown).await,
         MessageFormat::Auto => {
-            let token = BOT_TOKEN.get().expect("BOT_TOKEN not initialized");
+            let token = bot.token();
 
             let entity_sender = || async { send_entities_message(bot, chat_id, markdown).await };
 
@@ -1523,12 +1515,12 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
         let (plain_text, entities) = markdown_to_entities(&full_text);
         let entity_chunks = split_entities(&plain_text, &entities, MAX_UTF16);
         let rich_chunks = rich_sender::split_markdown_at_newlines(&processed, MAX_UTF16);
-        let token = BOT_TOKEN.get().expect("BOT_TOKEN not initialized").clone();
+        let token = stream_bot.token();
 
         match stream_format {
             MessageFormat::Rich => {
                 for chunk_md in &rich_chunks {
-                    if rich_sender::send_rich_message(&token, stream_chat_id.0, chunk_md)
+                    if rich_sender::send_rich_message(token, stream_chat_id.0, chunk_md)
                         .await
                         .is_err()
                     {
@@ -1550,7 +1542,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
             MessageFormat::Auto => {
                 for (i, chunk_md) in rich_chunks.iter().enumerate() {
                     let result =
-                        rich_sender::send_rich_message(&token, stream_chat_id.0, chunk_md).await;
+                        rich_sender::send_rich_message(token, stream_chat_id.0, chunk_md).await;
                     if result.is_err() {
                         // Fallback: use entity chunk i
                         if let Some((ct, ce)) = entity_chunks.get(i) {
