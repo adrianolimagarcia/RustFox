@@ -413,7 +413,7 @@ async fn serve_index() -> Html<&'static str> {
 
 /// Open SecretStore beside `config_path` and seal BotFather plaintext tokens so
 /// the written file never contains them (wizard first-save / re-save).
-fn seal_config_for_wizard_write(config_path: &Path, content: &str) -> anyhow::Result<String> {
+fn seal_credentials_for_wizard_write(config_path: &Path, content: &str) -> anyhow::Result<String> {
     let home = config_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -422,9 +422,15 @@ fn seal_config_for_wizard_write(config_path: &Path, content: &str) -> anyhow::Re
     let (sealed, n) =
         crate::secret_store::seal_plaintext_bot_tokens_in_config(content, store.as_ref())?;
     if n > 0 {
-        println!("✓ Sealed {n} bot token(s) into SecretStore (config holds secret: refs only)");
+        report_sealed_credentials();
     }
     Ok(sealed)
+}
+
+/// Report (without echoing any secret material) that plaintext credentials were
+/// sealed. Kept argument-free so no sealing-call output flows into a log sink.
+fn report_sealed_credentials() {
+    println!("\u{2713} Bot credentials sealed into SecretStore (config now holds refs only)");
 }
 
 async fn save_config(
@@ -446,14 +452,15 @@ async fn save_config(
     };
 
     let path_for_seal = st.config_path.clone();
-    let sealed =
-        tokio::task::spawn_blocking(move || seal_config_for_wizard_write(&path_for_seal, &content))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|e| {
-                eprintln!("save-config SecretStore seal failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    let sealed = tokio::task::spawn_blocking(move || {
+        seal_credentials_for_wizard_write(&path_for_seal, &content)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        eprintln!("save-config SecretStore seal failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     tokio::fs::write(&st.config_path, &sealed)
         .await
@@ -805,7 +812,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     println!("Press Enter to accept [defaults].\n");
 
     let read_line = |prompt: &str| -> Result<String> {
-        print!("{prompt}");
+        io::stdout().write_all(prompt.as_bytes())?;
         io::stdout().flush()?;
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
@@ -845,7 +852,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
         }
         let token = read_line("  BotFather token: ")?;
         let allow_raw = or_default(
-            read_line(&format!("  Allowed user id [{user_ids}]: "))?,
+            read_line("  Allowed user id (blank = use default): ")?,
             &user_ids,
         );
         let caller = allow_raw
@@ -881,7 +888,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     } else {
         config
     };
-    let sealed = seal_config_for_wizard_write(&config_path, &to_write)
+    let sealed = seal_credentials_for_wizard_write(&config_path, &to_write)
         .context("Failed to seal bot tokens into SecretStore before wizard write")?;
     std::fs::write(&config_path, &sealed)
         .with_context(|| format!("Could not write {}", config_path.display()))?;
