@@ -71,74 +71,143 @@ pub fn store_bot_token(store: &dyn SecretStore, bot_id: &str, plaintext: &str) -
     Ok(bot_token_secret_ref(bot_id))
 }
 
-/// One-time migrate: BotFather-shaped plaintext in `[[bots]]` (and legacy
-/// `[telegram].bot_token` when present) → SecretStore + scrub on disk.
+/// Seal BotFather-shaped plaintext `bot_token` values in a config TOML string.
 ///
-/// Returns the number of tokens written to the store. No-op when everything is
-/// already a `secret:NAME` ref or a non-token placeholder.
+/// Writes each token into [`SecretStore`] under `bot.<id>.token` and replaces the
+/// config value with `secret:bot.<id>.token`. Placeholders and existing
+/// `secret:NAME` refs are left alone. Does **not** materialize `[[bots]]` from
+/// legacy `[telegram]` — only scrubs in place (wizard first-save stays
+/// `[telegram]`-shaped).
+///
+/// Returns `(sealed_toml, tokens_stored_or_scrubbed)`.
+pub fn seal_plaintext_bot_tokens_in_config(
+    content: &str,
+    store: &dyn SecretStore,
+) -> Result<(String, usize)> {
+    let mut doc: toml::Value =
+        toml::from_str(content).context("Failed to parse config.toml before bot-token seal")?;
+    let table = doc
+        .as_table_mut()
+        .context("config.toml root is not a table")?;
+
+    let mut changed = 0usize;
+
+    // Scrub [[bots]] rows first so [telegram] can reuse the shim ref.
+    if let Some(arr) = table.get("bots").and_then(|v| v.as_array()).cloned() {
+        let mut new_arr = Vec::with_capacity(arr.len());
+        for bot_val in arr {
+            let mut bot_val = bot_val;
+            if let Some(bot) = bot_val.as_table_mut() {
+                let id = bot
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let token = bot
+                    .get("bot_token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !id.is_empty() && looks_like_bot_token(&token) {
+                    let secret_ref = store_bot_token(store, &id, &token)?;
+                    bot.insert("bot_token".into(), toml::Value::String(secret_ref));
+                    changed += 1;
+                }
+            }
+            new_arr.push(bot_val);
+        }
+        table.insert("bots".into(), toml::Value::Array(new_arr));
+    }
+
+    let telegram_token = table
+        .get("telegram")
+        .and_then(|v| v.as_table())
+        .and_then(|tg| tg.get("bot_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    if let Some(token) = telegram_token {
+        if looks_like_bot_token(&token) {
+            let shim_id = shim_bot_id_from_table(table).unwrap_or_else(|| "default".to_string());
+            let secret_ref = match bot_token_field_for_id(table, &shim_id) {
+                Some(existing) if is_secret_ref(&existing) => existing,
+                _ => store_bot_token(store, &shim_id, &token)?,
+            };
+            if let Some(tg) = table.get_mut("telegram").and_then(|v| v.as_table_mut()) {
+                tg.insert("bot_token".into(), toml::Value::String(secret_ref));
+                changed += 1;
+            }
+        }
+    }
+
+    if changed == 0 {
+        return Ok((content.to_string(), 0));
+    }
+    let sealed =
+        toml::to_string_pretty(&doc).context("Failed to serialize config after bot-token seal")?;
+    Ok((sealed, changed))
+}
+
+fn shim_bot_id_from_table(table: &toml::map::Map<String, toml::Value>) -> Option<String> {
+    let arr = table.get("bots")?.as_array()?;
+    let mut ids: Vec<String> = Vec::new();
+    for bot in arr {
+        if let Some(id) = bot
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+        {
+            if !id.is_empty() {
+                ids.push(id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    if let Some(main) = ids.iter().find(|id| *id == "main") {
+        return Some(main.clone());
+    }
+    if let Some(default) = ids.iter().find(|id| *id == "default") {
+        return Some(default.clone());
+    }
+    Some(ids[0].clone())
+}
+
+fn bot_token_field_for_id(table: &toml::map::Map<String, toml::Value>, id: &str) -> Option<String> {
+    let arr = table.get("bots")?.as_array()?;
+    for bot in arr {
+        let bot_id = bot.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if bot_id == id {
+            return bot
+                .get("bot_token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// One-time migrate: BotFather-shaped plaintext in `[[bots]]` / `[telegram]` →
+/// SecretStore + scrub on disk (safety net after wizard/bind seal).
+///
+/// Returns the number of tokens scrubbed. No-op when everything is already a
+/// `secret:NAME` ref or a non-token placeholder.
 pub fn migrate_plaintext_bot_tokens(config_path: &Path, store: &dyn SecretStore) -> Result<usize> {
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    // Validate shape early so we do not seal a broken file onto disk.
     let mut cfg: Config =
         toml::from_str(&content).context("Failed to parse config.toml before bot-token migrate")?;
     cfg.normalize_bots()
         .context("bots / telegram validation failed before bot-token migrate")?;
 
-    let mut changed = 0usize;
-    let mut bots = cfg.bots.clone();
-    for bot in &mut bots {
-        let raw = bot.bot_token.trim();
-        if is_secret_ref(raw) {
-            continue;
-        }
-        if !looks_like_bot_token(raw) {
-            // Placeholders like YOUR_TELEGRAM_BOT_TOKEN stay until a real bind.
-            continue;
-        }
-        bot.bot_token = store_bot_token(store, &bot.id, raw)?;
-        changed += 1;
-    }
-
+    let (sealed, changed) = seal_plaintext_bot_tokens_in_config(&content, store)?;
     if changed == 0 {
-        // Still scrub [telegram] if it alone holds plaintext while bots already refs
-        // (unlikely after normalize); check disk telegram without rewrite if nothing
-        // to do on bots.
         return Ok(0);
     }
-
-    let mut doc: toml::Value =
-        toml::from_str(&content).context("Failed to parse config.toml as Value for migrate")?;
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root is not a table")?;
-
-    table.insert(
-        "bots".to_string(),
-        crate::agents_edit::bots_to_toml_array(&bots),
-    );
-
-    // Scrub legacy [telegram].bot_token when it still looks like a BotFather token.
-    if let Some(tg) = table.get_mut("telegram").and_then(|v| v.as_table_mut()) {
-        let scrub = tg
-            .get("bot_token")
-            .and_then(|v| v.as_str())
-            .map(looks_like_bot_token)
-            .unwrap_or(false);
-        if scrub {
-            let shim_id = Config::shim_bot(&bots).id.clone();
-            // Prefer already-migrated shim ref from bots list.
-            let shim_ref = bots
-                .iter()
-                .find(|b| b.id == shim_id)
-                .map(|b| b.bot_token.clone())
-                .unwrap_or_else(|| bot_token_secret_ref(&shim_id));
-            tg.insert("bot_token".to_string(), toml::Value::String(shim_ref));
-        }
-    }
-
-    let new_content = toml::to_string_pretty(&doc)
-        .context("Failed to serialize config after bot-token migrate")?;
-    write_config_validated(config_path, &new_content)
+    write_config_validated(config_path, &sealed)
         .context("Failed to write scrubbed config after bot-token migrate")?;
     Ok(changed)
 }
@@ -218,5 +287,44 @@ allowed_directory = "/tmp"
         let r = store_bot_token(&store, "researcher", "333333333:AAResearchTokenSecretZZ").unwrap();
         assert_eq!(r, "secret:bot.researcher.token");
         assert!(store.exists("bot.researcher.token").unwrap());
+    }
+
+    #[test]
+    fn seal_scrubs_telegram_only_first_save() {
+        let store = FakeSecretStore::new();
+        let raw = r#"
+[telegram]
+bot_token = "111111111:AAWizardFirstSaveTokenXXXX"
+allowed_user_ids = [42]
+
+[openrouter]
+api_key = "sk-test"
+model = "test-model"
+"#;
+        let (sealed, n) = seal_plaintext_bot_tokens_in_config(raw, &store).unwrap();
+        assert_eq!(n, 1);
+        assert!(!sealed.contains("AAWizardFirstSaveTokenXXXX"));
+        assert!(sealed.contains("secret:bot.default.token"));
+        assert!(!sealed.contains("[[bots]]"));
+        assert_eq!(
+            store.get("bot.default.token").unwrap().unwrap().expose(),
+            "111111111:AAWizardFirstSaveTokenXXXX"
+        );
+        // Idempotent
+        let (_, n2) = seal_plaintext_bot_tokens_in_config(&sealed, &store).unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn seal_leaves_placeholder_alone() {
+        let store = FakeSecretStore::new();
+        let raw = r#"
+[telegram]
+bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+allowed_user_ids = [1]
+"#;
+        let (sealed, n) = seal_plaintext_bot_tokens_in_config(raw, &store).unwrap();
+        assert_eq!(n, 0);
+        assert!(sealed.contains("YOUR_TELEGRAM_BOT_TOKEN"));
     }
 }

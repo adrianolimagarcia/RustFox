@@ -2,8 +2,8 @@
 
 [telegram]
 # Get your bot token from @BotFather on Telegram.
-# Prefer secret:NAME (canonical: secret:bot.<id>.token). Plaintext BotFather
-# tokens are migrated into SecretStore and scrubbed from config.toml on startup.
+# Prefer secret:NAME (canonical: secret:bot.<id>.token). Wizard/bind seal on
+# first save; leftover plaintext is migrated/scrubbed on startup (safety net).
 bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 # Only these Telegram user IDs can interact with the bot
 # Find your user ID by messaging @userinfobot on Telegram
@@ -23,7 +23,7 @@ allowed_user_ids = [123456789]
 #
 # [[bots]]
 # id = "main"
-# bot_token = "secret:bot.main.token"   # or plaintext once — migrated/scrubbed on start
+# bot_token = "secret:bot.main.token"   # wizard/bind write secret refs; migrate is safety net
 # allowed_user_ids = [123456789]
 # persona = "main"                 # agents/<persona>/AGENT.md + optional SOUL.md overlay
 # # system_prompt_file = "prompts/main.md"  # optional; wins over AGENT.md when set

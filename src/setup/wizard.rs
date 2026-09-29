@@ -411,6 +411,22 @@ async fn serve_index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+/// Open SecretStore beside `config_path` and seal BotFather plaintext tokens so
+/// the written file never contains them (wizard first-save / re-save).
+fn seal_config_for_wizard_write(config_path: &Path, content: &str) -> anyhow::Result<String> {
+    let home = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let (store, _) = crate::secret_store::open(&home)?;
+    let (sealed, n) =
+        crate::secret_store::seal_plaintext_bot_tokens_in_config(content, store.as_ref())?;
+    if n > 0 {
+        println!("✓ Sealed {n} bot token(s) into SecretStore (config holds secret: refs only)");
+    }
+    Ok(sealed)
+}
+
 async fn save_config(
     State(st): State<WizardState>,
     Json(body): Json<SaveRequest>,
@@ -429,7 +445,17 @@ async fn save_config(
         body.config.clone()
     };
 
-    tokio::fs::write(&st.config_path, &content)
+    let path_for_seal = st.config_path.clone();
+    let sealed =
+        tokio::task::spawn_blocking(move || seal_config_for_wizard_write(&path_for_seal, &content))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+                eprintln!("save-config SecretStore seal failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    tokio::fs::write(&st.config_path, &sealed)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -855,7 +881,9 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     } else {
         config
     };
-    std::fs::write(&config_path, &to_write)
+    let sealed = seal_config_for_wizard_write(&config_path, &to_write)
+        .context("Failed to seal bot tokens into SecretStore before wizard write")?;
+    std::fs::write(&config_path, &sealed)
         .with_context(|| format!("Could not write {}", config_path.display()))?;
 
     println!("\n✓ config.toml saved to {}", config_path.display());
@@ -1220,6 +1248,32 @@ mod tests {
         let out = cfg("mytoken", "123456", "key", "gpt-4o", "/tmp", "db.db", "");
         assert!(out.contains("[telegram]"));
         assert!(out.contains(r#"bot_token = "mytoken""#));
+    }
+
+    #[test]
+    fn wizard_first_save_seals_botfather_token() {
+        use crate::secret_store::{
+            seal_plaintext_bot_tokens_in_config, FakeSecretStore, SecretStore,
+        };
+        let store = FakeSecretStore::new();
+        let raw = cfg(
+            "111111111:AAWizardCliFirstSaveTokenXX",
+            "123456",
+            "key",
+            "gpt-4o",
+            "/tmp",
+            "db.db",
+            "",
+        );
+        assert!(raw.contains("AAWizardCliFirstSaveTokenXX"));
+        let (sealed, n) = seal_plaintext_bot_tokens_in_config(&raw, &store).unwrap();
+        assert_eq!(n, 1);
+        assert!(!sealed.contains("AAWizardCliFirstSaveTokenXX"));
+        assert!(sealed.contains("secret:bot.default.token"));
+        assert_eq!(
+            store.get("bot.default.token").unwrap().unwrap().expose(),
+            "111111111:AAWizardCliFirstSaveTokenXX"
+        );
     }
 
     #[test]
