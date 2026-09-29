@@ -1,0 +1,122 @@
+# Dependabot configuration for RustFox
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Coverage:
+#   - cargo           : root Cargo.toml / Cargo.lock  (main binary)
+#   - npm (web/)      : the SPA frontend (Vite/React)
+#   - npm (root)      : tooling deps (e.g. playwright used by e2e-verify.mjs)
+#   - github-actions  : .github/workflows/*.yml actions
+#
+# Design notes:
+#   - Weekly cadence on Monday 09:00 HKT (= 01:00 UTC) keeps noise low.
+#   - Minor + patch bumps are GROUPED into a single PR per ecosystem so a
+#     routine week produces one reviewable PR instead of a dozen.
+#   - Major bumps are intentionally left OUT of the group so a breaking
+#     change (e.g. rmcp 0.x -> 2.x) arrives as its own PR and is never
+#     silently bundled with innocuous patch bumps.
+#   - Those per-ecosystem groups also satisfy GitHub's "Grouped security
+#     updates" behaviour for the same package managers.
+
+version: 2
+
+updates:
+  # ── Rust crate (root) ────────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "Asia/Hong_Kong"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── SPA frontend (web/) ──────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "Asia/Hong_Kong"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "javascript"
+      - "web"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      web-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      web-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── Root tooling npm (playwright / e2e helpers) ──────────────────────
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "Asia/Hong_Kong"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      root-npm-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      root-npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── GitHub Actions ───────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "Asia/Hong_Kong"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci(deps)"
+      include: "scope"
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
