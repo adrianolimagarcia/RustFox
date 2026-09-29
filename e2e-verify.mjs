@@ -4,11 +4,19 @@
 // chat (SSE stream + persistence), agents, memory, tasks, settings.
 //
 // Usage:
+//   (cd web && npm i)   # playwright is a dep of web/package.json
 //   ./scripts/build-all.sh && cargo build --release --example portal_preview
 //   (PORTAL_PREVIEW_PORT=8123 ./target/release/examples/portal_preview &)
 //   node e2e-verify.mjs
-import pw from '/home/kan/.nvm/versions/node/v24.13.0/lib/node_modules/@playwright/test/index.js'
-const { chromium } = pw
+//
+// Resolves `playwright` from web/node_modules (same package as web/e2e/smoke.mjs).
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+const require = createRequire(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), 'web', 'package.json'),
+)
+const { chromium } = require('playwright')
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8123'
 const TOKEN = process.env.TOKEN || 'preview-token'
