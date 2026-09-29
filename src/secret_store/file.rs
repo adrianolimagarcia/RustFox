@@ -115,7 +115,7 @@ fn load_or_create_key(key_path: &Path) -> Result<[u8; KEY_LEN]> {
     }
     // Draw the key directly from the OS CSPRNG instead of filling a
     // zero-initialised array, so no constant value is ever used as key material.
-    let key: [u8; KEY_LEN] = rand::rngs::OsRng.gen();
+    let key: [u8; KEY_LEN] = rand::rng().random();
     write_private_file(key_path, &key)?;
     Ok(key)
 }
@@ -164,7 +164,7 @@ fn encrypt_and_write(
 ) -> Result<()> {
     let plain = serde_json::to_vec(map).context("serialize secret map")?;
     // Fresh random nonce per encryption, drawn directly from the OS CSPRNG.
-    let nonce_bytes: [u8; NONCE_LEN] = rand::rngs::OsRng.gen();
+    let nonce_bytes: [u8; NONCE_LEN] = rand::rng().random();
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
