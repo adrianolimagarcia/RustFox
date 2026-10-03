@@ -1133,9 +1133,16 @@ impl Agent {
         // §7.5: main loop can peer-invoke (depth/cycle + via attribution).
         // Seed with bot_id (canonical); persona aliases resolve to this key.
         let root_stack = vec![bot_id.to_string()];
+        // Subagent loops hang tool/llm children on this same chain. They do not
+        // open a second rustfox_request parent.
+        let turn_trace = crate::loop_runner::TurnTrace {
+            chain_run_id: chain_run_id.clone(),
+            project: ls_project.clone(),
+        };
         let special_handler = {
             let self_weak = self.self_weak.clone();
             let parent_stack = root_stack.clone();
+            let turn_trace = turn_trace.clone();
             move |name: &str, args: &Value, user_id: &str, chat_id: &str| {
                 let name_owned = name.to_string();
                 let args_owned = args.clone();
@@ -1143,6 +1150,7 @@ impl Agent {
                 let parent_stack = parent_stack.clone();
                 let user_id = user_id.to_string();
                 let chat_id = chat_id.to_string();
+                let turn_trace = turn_trace.clone();
                 Box::pin(async move {
                     match name_owned.as_str() {
                         "invoke_agent" => {
@@ -1157,6 +1165,7 @@ impl Agent {
                                         parent_stack,
                                         &user_id,
                                         &chat_id,
+                                        Some(turn_trace.clone()),
                                     )
                                     .await,
                             )
@@ -1238,6 +1247,7 @@ impl Agent {
                                     let stack = parent_stack.clone();
                                     let user_id = user_id.clone();
                                     let chat_id = chat_id.clone();
+                                    let turn_trace = turn_trace.clone();
                                     Box::pin(async move {
                                         let caller = stack
                                             .first()
@@ -1254,6 +1264,7 @@ impl Agent {
                                             t,
                                             stack,
                                             delivery,
+                                            Some(turn_trace),
                                         )
                                         .await
                                     })
@@ -1303,7 +1314,10 @@ impl Agent {
         .await;
 
         match outcome {
-            Ok(crate::loop_runner::LoopOutcome::FinalResponse(final_content)) => {
+            Ok(crate::loop_runner::LoopOutcome::FinalResponse {
+                text: final_content,
+                iterations,
+            }) => {
                 // Save the delivered content to persistent memory
                 let save_msg = ChatMessage {
                     role: "assistant".to_string(),
@@ -1320,7 +1334,7 @@ impl Agent {
                     id: chain_run_id,
                     outputs: Some(serde_json::json!({
                         "response": final_content,
-                        "iterations": 0,
+                        "iterations": iterations,
                     })),
                     error: None,
                     end_time: Self::now_iso8601_static(),
@@ -1623,6 +1637,7 @@ impl Agent {
         invoke_stack: Vec<String>,
         user_id: &str,
         chat_id: &str,
+        trace: Option<crate::loop_runner::TurnTrace>,
     ) -> String {
         let agent_name = match args["bot"]
             .as_str()
@@ -1712,6 +1727,7 @@ impl Agent {
                 tools_override,
                 child_stack,
                 delivery,
+                trace,
             )
             .await;
         crate::peer_invoke::format_via_attribution(&via_label, &result)
@@ -1736,6 +1752,7 @@ impl Agent {
         tools_override: Option<Vec<String>>,
         invoke_stack: Vec<String>,
         delivery: crate::peer_invoke::ToolDelivery,
+        trace: Option<crate::loop_runner::TurnTrace>,
     ) -> String {
         // --- Ad-hoc mode (no predefined skill/agent) ---
         if skill_name.is_none() {
@@ -1800,6 +1817,7 @@ impl Agent {
                     None,
                     invoke_stack,
                     &delivery,
+                    trace,
                 )
                 .await;
             self.record_invoked_bot_turn(&delivery, &messages).await;
@@ -1966,6 +1984,7 @@ impl Agent {
                 None,
                 invoke_stack,
                 &delivery,
+                trace,
             )
             .await;
         self.record_invoked_bot_turn(&delivery, &messages).await;
@@ -1988,6 +2007,7 @@ impl Agent {
         cancel_token: Option<CancellationToken>,
         invoke_stack: Vec<String>,
         delivery: &'a crate::peer_invoke::ToolDelivery,
+        trace: Option<crate::loop_runner::TurnTrace>,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
         Box::pin(async move {
             // Build special_tool_handler for invoke_agent/spawn_agents (circular
@@ -1995,6 +2015,7 @@ impl Agent {
             let special_handler = {
                 let self_weak = self.self_weak.clone();
                 let parent_stack = invoke_stack.clone();
+                let turn_trace = trace.clone();
                 move |name: &str, args: &Value, user_id: &str, chat_id: &str| {
                     let name_owned = name.to_string();
                     let args_owned = args.clone();
@@ -2002,6 +2023,7 @@ impl Agent {
                     let parent_stack = parent_stack.clone();
                     let user_id = user_id.to_string();
                     let chat_id = chat_id.to_string();
+                    let turn_trace = turn_trace.clone();
                     Box::pin(async move {
                         match name_owned.as_str() {
                             "invoke_agent" => {
@@ -2016,6 +2038,7 @@ impl Agent {
                                             parent_stack,
                                             &user_id,
                                             &chat_id,
+                                            turn_trace.clone(),
                                         )
                                         .await,
                                 )
@@ -2098,6 +2121,7 @@ impl Agent {
                                         let stack = parent_stack.clone();
                                         let user_id = user_id.clone();
                                         let chat_id = chat_id.clone();
+                                        let turn_trace = turn_trace.clone();
                                         Box::pin(async move {
                                             let caller = stack
                                                 .first()
@@ -2115,6 +2139,7 @@ impl Agent {
                                                 t,
                                                 stack,
                                                 delivery,
+                                                turn_trace,
                                             )
                                             .await
                                         })
@@ -2178,7 +2203,7 @@ impl Agent {
                 loop_detection_enabled: true,
                 interactive_loop_callback: false,
                 allowed_tools: Some(allowed_tools_vec),
-                langsmith_project: None,
+                langsmith_project: trace.as_ref().map(|t| t.project.clone()),
                 model: Some(model.to_string()),
                 tool_event_tx: None,
                 stream_token_tx: None,
@@ -2191,8 +2216,8 @@ impl Agent {
                 &self.mcp,
                 &loop_config,
                 cancel_token,
-                None,
-                None,
+                trace.as_ref().map(|t| t.chain_run_id.clone()),
+                trace.as_ref().map(|_| self.langsmith.as_ref()),
                 turn_sender.as_ref() as &dyn PlatformSender,
                 Box::new(make_ctx),
                 Some(Box::new(special_handler)),
@@ -2208,7 +2233,7 @@ impl Agent {
             }
 
             match outcome {
-                Ok(crate::loop_runner::LoopOutcome::FinalResponse(text)) => text,
+                Ok(crate::loop_runner::LoopOutcome::FinalResponse { text, .. }) => text,
                 Ok(crate::loop_runner::LoopOutcome::Cancelled) => {
                     format!("Subagent '{}' cancelled by user.", label)
                 }

@@ -38,8 +38,22 @@ pub struct LoopConfig {
     pub recovery_nudge: Option<String>,
 }
 
+/// Parent chain created by `process_message_outcome`. Subagent loops reuse it
+/// and must not open a second `rustfox_request` run.
+#[derive(Debug, Clone)]
+pub struct TurnTrace {
+    pub chain_run_id: String,
+    pub project: String,
+}
+
+#[derive(Debug)]
 pub enum LoopOutcome {
-    FinalResponse(String),
+    /// `iterations` is the number of LLM rounds in this loop.
+    /// A turn that answers on the first round is 1.
+    FinalResponse {
+        text: String,
+        iterations: u32,
+    },
     Cancelled,
     MaxIterations,
 }
@@ -88,6 +102,54 @@ impl<'a> AgenticLoop<'a> {
         }
     }
 
+    fn trace_now() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn session_name(&self) -> String {
+        self.config
+            .langsmith_project
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Start a child run under the parent chain. Returns None when this loop
+    /// has no chain (nothing to parent). A disabled client still receives the
+    /// call; `LangSmithClient` returns before any HTTP.
+    fn begin_child(
+        &self,
+        name: &str,
+        run_type: crate::langsmith::RunType,
+        inputs: Value,
+    ) -> Option<String> {
+        let (Some(ls), Some(parent)) = (self.langsmith, self.chain_run_id.as_ref()) else {
+            return None;
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        ls.start_run(crate::langsmith::RunParams {
+            id: id.clone(),
+            name: name.to_string(),
+            run_type,
+            parent_run_id: Some(parent.clone()),
+            inputs,
+            session_name: self.session_name(),
+            start_time: Self::trace_now(),
+        });
+        Some(id)
+    }
+
+    fn finish_child(&self, id: Option<String>, outputs: Option<Value>, error: Option<String>) {
+        let (Some(ls), Some(id)) = (self.langsmith, id) else {
+            return;
+        };
+        ls.end_run(crate::langsmith::EndRunParams {
+            id,
+            outputs,
+            error,
+            end_time: Self::trace_now(),
+        });
+    }
+
     pub async fn run(
         &self,
         messages: &mut MessageContainer,
@@ -96,8 +158,9 @@ impl<'a> AgenticLoop<'a> {
     ) -> Result<LoopOutcome> {
         let context_window = self.config.context_window;
         let mut empty_count = 0u32;
+        let mut iterations;
 
-        for _iteration in 0..self.config.max_iterations {
+        for iteration in 0..self.config.max_iterations {
             if let Some(ref cancel) = self.cancel {
                 if cancel.is_cancelled() {
                     return Ok(LoopOutcome::Cancelled);
@@ -118,29 +181,41 @@ impl<'a> AgenticLoop<'a> {
                 all
             };
 
-            let (text, tool_calls) = if let Some(ref model) = self.config.model {
-                let completion = self
-                    .llm
+            let llm_run = self.begin_child(
+                "llm_call",
+                crate::langsmith::RunType::Llm,
+                serde_json::json!({ "messages": &prepared.messages }),
+            );
+            let llm_result = if let Some(ref model) = self.config.model {
+                self.llm
                     .chat_completion_with_model(&prepared.messages, &tool_defs, model)
-                    .await?;
-                let text = completion
-                    .message
-                    .content
-                    .as_ref()
-                    .map(|c| c.as_text())
-                    .unwrap_or_default();
-                let tool_calls = completion.message.tool_calls.clone().unwrap_or_default();
-                (text, tool_calls)
+                    .await
+                    .map(|completion| completion.message)
             } else {
-                let msg = self.llm.chat(&prepared.messages, &tool_defs).await?;
-                let text = msg
-                    .content
-                    .as_ref()
-                    .map(|c| c.as_text())
-                    .unwrap_or_default();
-                let tool_calls = msg.tool_calls.clone().unwrap_or_default();
-                (text, tool_calls)
+                self.llm.chat(&prepared.messages, &tool_defs).await
             };
+            let msg = match llm_result {
+                Ok(msg) => msg,
+                Err(e) => {
+                    self.finish_child(llm_run, None, Some(format!("{e:#}")));
+                    return Err(e);
+                }
+            };
+            let text = msg
+                .content
+                .as_ref()
+                .map(|c| c.as_text())
+                .unwrap_or_default();
+            let tool_calls = msg.tool_calls.clone().unwrap_or_default();
+            self.finish_child(
+                llm_run,
+                Some(serde_json::json!({
+                    "content": text,
+                    "tool_calls": msg.tool_calls,
+                })),
+                None,
+            );
+            iterations = iteration + 1;
 
             if text.is_empty() && tool_calls.is_empty() {
                 empty_count += 1;
@@ -157,9 +232,10 @@ impl<'a> AgenticLoop<'a> {
                     }
                 }
                 if empty_count >= self.config.empty_response_retry_limit {
-                    return Ok(LoopOutcome::FinalResponse(
-                        "I'm having trouble processing that. Please try again.".to_string(),
-                    ));
+                    return Ok(LoopOutcome::FinalResponse {
+                        text: "I'm having trouble processing that. Please try again.".to_string(),
+                        iterations,
+                    });
                 }
                 continue;
             }
@@ -173,21 +249,25 @@ impl<'a> AgenticLoop<'a> {
                 });
 
                 for tc in &tool_calls {
+                    let args: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(Value::Object(serde_json::Map::new()));
+                    let tool_run = self.begin_child(
+                        &tc.function.name,
+                        crate::langsmith::RunType::Tool,
+                        serde_json::json!({ "arguments": &args }),
+                    );
+
                     if let Some(ref whitelist) = self.config.allowed_tools {
                         if !whitelist.contains(&tc.function.name) {
-                            messages.push_tool_result(
-                                &tc.id,
-                                format!(
-                                    "Tool '{}' is not available to this agent.",
-                                    tc.function.name
-                                ),
+                            let rejected = format!(
+                                "Tool '{}' is not available to this agent.",
+                                tc.function.name
                             );
+                            self.finish_child(tool_run, None, Some(rejected.clone()));
+                            messages.push_tool_result(&tc.id, rejected);
                             continue;
                         }
                     }
-
-                    let args: Value = serde_json::from_str(&tc.function.arguments)
-                        .unwrap_or(Value::Object(serde_json::Map::new()));
 
                     // Check special tool handler first (for invoke_agent/spawn_agents)
                     if let Some(ref handler) = self.special_tool_handler {
@@ -197,27 +277,40 @@ impl<'a> AgenticLoop<'a> {
                             // Telegram clears Working and surfaces an error reply
                             // (soft tool results left the UI stuck on hung LLM retries).
                             if crate::peer_invoke::is_hard_invoke_error(&result) {
+                                self.finish_child(tool_run, None, Some(result.clone()));
                                 return Err(anyhow::anyhow!("{result}"));
                             }
+                            self.finish_child(
+                                tool_run,
+                                Some(serde_json::json!({ "result": &result })),
+                                None,
+                            );
                             messages.push_tool_result(&tc.id, result);
                             continue;
                         }
                     }
 
-                    let result = if tc.function.name.starts_with("mcp_") {
-                        self.mcp
-                            .call_tool(&tc.function.name, &args)
-                            .await
-                            .unwrap_or_else(|e| format!("Error: {e}"))
+                    let executed = if tc.function.name.starts_with("mcp_") {
+                        self.mcp.call_tool(&tc.function.name, &args).await
                     } else {
                         let ctx = (self.make_tool_ctx)(user_id, chat_id);
-                        self.tools
-                            .execute(&tc.function.name, args, ctx)
-                            .await
-                            .unwrap_or_else(|e| format!("Error: {e}"))
+                        self.tools.execute(&tc.function.name, args, ctx).await
                     };
-
-                    messages.push_tool_result(&tc.id, result);
+                    match executed {
+                        Ok(result) => {
+                            self.finish_child(
+                                tool_run,
+                                Some(serde_json::json!({ "result": &result })),
+                                None,
+                            );
+                            messages.push_tool_result(&tc.id, result);
+                        }
+                        Err(e) => {
+                            let err = format!("Error: {e}");
+                            self.finish_child(tool_run, None, Some(err.clone()));
+                            messages.push_tool_result(&tc.id, err);
+                        }
+                    }
                 }
                 continue;
             }
@@ -226,7 +319,7 @@ impl<'a> AgenticLoop<'a> {
                 if let Some(ref tx) = self.config.stream_token_tx {
                     let _ = LlmClient::stream_text(text.clone(), tx.clone()).await;
                 }
-                return Ok(LoopOutcome::FinalResponse(text));
+                return Ok(LoopOutcome::FinalResponse { text, iterations });
             }
 
             empty_count += 1;
