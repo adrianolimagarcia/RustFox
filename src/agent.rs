@@ -1318,16 +1318,21 @@ impl Agent {
                 text: final_content,
                 iterations,
             }) => {
-                // Save the delivered content to persistent memory
-                let save_msg = ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(MessageContent::from_text(final_content.clone())),
-                    tool_calls: None,
-                    tool_call_id: None,
-                };
-                self.memory
-                    .save_message(&conversation_id, &save_msg)
-                    .await?;
+                // Save the delivered content to persistent memory.
+                // A scheduled run's prompt and result are written by the job
+                // runner so failure, cancel, and max-iterations get a result
+                // turn too, with the schedule id on the segment.
+                if incoming.schedule_id.is_none() {
+                    let save_msg = ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(MessageContent::from_text(final_content.clone())),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    };
+                    self.memory
+                        .save_message(&conversation_id, &save_msg)
+                        .await?;
+                }
 
                 // --- LangSmith: end chain run (success) ---
                 self.langsmith.end_run(crate::langsmith::EndRunParams {
@@ -1406,8 +1411,15 @@ impl Agent {
         }
     }
 
-    /// Conversation a schedule run reads and writes: the owning bot's chat
-    /// with the user stored on the row. Not another bot, and not a shared cron thread.
+    /// Conversation a schedule run reads: the owning bot's chat with the user
+    /// stored on the row. Not another bot, and not a shared cron thread.
+    ///
+    /// The prompt is tagged with the schedule id. Persistence of the prompt
+    /// and the result (including failure, cancel, and max-iterations) is the
+    /// job runner's [`crate::scheduler::history::write_schedule_segment`],
+    /// which also copies a portal-origin run into the owning bot's Telegram
+    /// conversation. This incoming stays on the row so cancel keys do not
+    /// move onto the Telegram user.
     pub fn scheduled_incoming(task: &ScheduledTask) -> crate::platform::IncomingMessage {
         crate::platform::IncomingMessage {
             platform: task.platform.clone(),
@@ -1415,8 +1427,9 @@ impl Agent {
             user_id: task.user_id.clone(),
             chat_id: task.chat_id.clone(),
             user_name: String::new(),
-            text: task.prompt.clone(),
+            text: crate::scheduler::history::with_schedule_id(&task.id, &task.prompt),
             attachments: vec![],
+            schedule_id: Some(task.id.clone()),
         }
     }
 
