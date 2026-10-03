@@ -258,6 +258,7 @@ pub fn append_bot_binding(
         system_prompt_file: None,
         model: None,
         tools: None,
+        fully_silent: false,
     });
 
     let mut doc: toml::Value =
@@ -338,6 +339,11 @@ pub(crate) fn bots_to_toml_array(bots: &[BotConfig]) -> toml::Value {
                             .collect(),
                     ),
                 );
+            }
+            // Omit the default so a rewrite does not invent the opt-in.
+            // A speaking bot that turned it on must survive /agents create.
+            if b.fully_silent {
+                t.insert("fully_silent".into(), toml::Value::Boolean(true));
             }
             toml::Value::Table(t)
         })

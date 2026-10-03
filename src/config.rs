@@ -197,6 +197,14 @@ pub struct BotConfig {
     /// Optional per-bot tool whitelist.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// Opt-in: this bot's Telegram turns post no tool-call UI at all
+    /// (no in-progress Working bubble, no completed tool bubble, no raw
+    /// `Running:` line). Default `false` keeps today's silent: completed
+    /// tool messages are removed, and Working / Running may still appear
+    /// while a tool runs. Belongs to the speaking bot — not the setup
+    /// wizard, and not a per-chat `/verbose` override.
+    #[serde(default)]
+    pub fully_silent: bool,
 }
 
 fn default_bot_persona() -> String {
@@ -983,6 +991,7 @@ impl Config {
                 system_prompt_file: None,
                 model: None,
                 tools: None,
+                fully_silent: false,
             };
             Self::validate_bots(std::slice::from_ref(&synthesized))?;
             self.bots = vec![synthesized];
@@ -1002,6 +1011,17 @@ impl Config {
             .find(|b| b.id.trim() == "main")
             .or_else(|| bots.iter().find(|b| b.id.trim() == "default"))
             .unwrap_or(&bots[0])
+    }
+
+    /// Whether the speaking bot opted into fully silent tool-call UI.
+    ///
+    /// Absent or unknown ids are not fully silent. Another bot's flag is
+    /// not inherited.
+    pub fn bot_fully_silent(&self, bot_id: &str) -> bool {
+        let id = crate::platform::normalize_bot_id(bot_id);
+        self.bots
+            .iter()
+            .any(|b| crate::platform::normalize_bot_id(b.id.as_str()) == id && b.fully_silent)
     }
 
     /// Whether `bot_id` may claim legacy `(platform, "default", user)` conversation rows.
@@ -2002,6 +2022,7 @@ mod tests {
                 system_prompt_file: None,
                 model: None,
                 tools: None,
+                fully_silent: false,
             }
         }
 
@@ -2047,6 +2068,46 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.bots[0].persona, "main");
+        assert!(!cfg.bots[0].fully_silent);
+        assert!(!cfg.bot_fully_silent("only"));
+    }
+
+    #[test]
+    fn fully_silent_is_per_speaking_bot_and_defaults_off() {
+        let cfg = parse_and_normalize(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "tok-main"
+            allowed_user_ids = [1]
+            fully_silent = true
+
+            [[bots]]
+            id = "researcher"
+            bot_token = "tok-research"
+            allowed_user_ids = [1]
+            persona = "researcher"
+
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert!(cfg.bots[0].fully_silent);
+        assert!(!cfg.bots[1].fully_silent);
+        assert!(cfg.bot_fully_silent("main"));
+        assert!(!cfg.bot_fully_silent("researcher"));
+        assert!(!cfg.bot_fully_silent("missing"));
+
+        let legacy = parse_and_normalize(
+            r#"
+            [telegram]
+            bot_token = "tok"
+            allowed_user_ids = [1]
+            [openrouter]
+            api_key = "key"
+            "#,
+        );
+        assert!(!legacy.bot_fully_silent("default"));
     }
 
     #[test]

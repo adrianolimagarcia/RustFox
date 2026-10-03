@@ -746,6 +746,7 @@ mod tests {
             system_prompt_file: None,
             model: None,
             tools: None,
+            fully_silent: false,
         }];
         assert!(
             crate::config::Config::bot_claims_legacy_default(&sole_bots, "fox"),
@@ -826,6 +827,7 @@ mod tests {
                 system_prompt_file: None,
                 model: None,
                 tools: None,
+                fully_silent: false,
             },
             crate::config::BotConfig {
                 id: "researcher".into(),
@@ -835,6 +837,7 @@ mod tests {
                 system_prompt_file: None,
                 model: None,
                 tools: None,
+                fully_silent: false,
             },
         ];
         assert!(crate::config::Config::bot_claims_legacy_default(

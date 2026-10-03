@@ -7,8 +7,8 @@
 //! See `docs/telegram-update-injector.md`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use rustfox::agent::Agent;
 use rustfox::cancel_registry::CancelRegistry;
@@ -61,6 +61,9 @@ struct MockTelegramApi {
     server: MockServer,
     token: String,
     next_msg_id: Arc<AtomicI32>,
+    /// (assigned message id, text) for SendMessage and sendRichMessage.
+    sent: Arc<Mutex<Vec<(i32, String)>>>,
+    deleted: Arc<Mutex<Vec<i32>>>,
 }
 
 impl MockTelegramApi {
@@ -69,6 +72,8 @@ impl MockTelegramApi {
             server: MockServer::start().await,
             token: TOKEN.to_string(),
             next_msg_id: Arc::new(AtomicI32::new(100)),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -80,6 +85,7 @@ impl MockTelegramApi {
 
     async fn stub_bot_api(&self) {
         let counter = Arc::clone(&self.next_msg_id);
+        let sent_log = Arc::clone(&self.sent);
         Mock::given(method("POST"))
             .and(path_regex(r"^/bot[^/]+/SendMessage$"))
             .respond_with(move |req: &Request| {
@@ -95,6 +101,7 @@ impl MockTelegramApi {
                     .unwrap_or("")
                     .to_string();
                 let mid = counter.fetch_add(1, Ordering::SeqCst);
+                sent_log.lock().expect("sent log").push((mid, text.clone()));
                 ResponseTemplate::new(200).set_body_json(ok_message_result(chat_id, mid, &text))
             })
             .expect(0..)
@@ -126,12 +133,20 @@ impl MockTelegramApi {
             .mount(&self.server)
             .await;
 
+        let deleted_log = Arc::clone(&self.deleted);
         Mock::given(method("POST"))
             .and(path_regex(r"^/bot[^/]+/DeleteMessage$"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "ok": true,
-                "result": true
-            })))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
+                if let Some(mid) = body.get("message_id").and_then(|v| v.as_i64()) {
+                    deleted_log.lock().expect("deleted log").push(mid as i32);
+                }
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "ok": true,
+                    "result": true
+                }))
+            })
             .expect(0..)
             .mount(&self.server)
             .await;
@@ -139,6 +154,7 @@ impl MockTelegramApi {
         // rich_sender uses camelCase method names against the same api_base
         // (Bot::api_url), not teloxide's PascalCase paths.
         let counter_rich = Arc::clone(&self.next_msg_id);
+        let rich_log = Arc::clone(&self.sent);
         Mock::given(method("POST"))
             .and(path_regex(r"^/bot[^/]+/sendRichMessage$"))
             .respond_with(move |req: &Request| {
@@ -154,6 +170,7 @@ impl MockTelegramApi {
                     .unwrap_or("")
                     .to_string();
                 let mid = counter_rich.fetch_add(1, Ordering::SeqCst);
+                rich_log.lock().expect("rich log").push((mid, text.clone()));
                 ResponseTemplate::new(200).set_body_json(ok_message_result(chat_id, mid, &text))
             })
             .expect(0..)
@@ -216,6 +233,120 @@ impl MockTelegramApi {
     fn uri(&self) -> String {
         self.server.uri()
     }
+
+    fn sent_snapshot(&self) -> Vec<(i32, String)> {
+        self.sent.lock().expect("sent log").clone()
+    }
+
+    fn deleted_snapshot(&self) -> Vec<i32> {
+        self.deleted.lock().expect("deleted log").clone()
+    }
+}
+
+const TOOL_TURN_REPLY: &str = "FINAL_ASSISTANT_STILL_SENT";
+
+/// First completion is `execute_command`, then a fixed assistant reply.
+struct ToolThenReply {
+    config: rustfox::provider::ProviderConfig,
+    step: AtomicUsize,
+    reply: String,
+}
+
+impl ToolThenReply {
+    fn new(reply: impl Into<String>) -> Self {
+        Self {
+            config: rustfox::provider::ProviderConfig {
+                name: "fixture".into(),
+                provider_type: rustfox::config::ProviderType::OpenRouter,
+                base_url: "http://fixture.invalid/v1".into(),
+                api_key: None,
+                default_model: "stub".into(),
+                supports_vision: false,
+                max_tokens: 256,
+                discover_models: false,
+                context_window: 4096,
+                context_window_cache: Arc::new(tokio::sync::RwLock::new(None)),
+                parse_retry_limit: 0,
+                rate_limit_retry_limit: 0,
+            },
+            step: AtomicUsize::new(0),
+            reply: reply.into(),
+        }
+    }
+
+    fn into_registry(self) -> rustfox::provider::ProviderRegistry {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "fixture".to_string(),
+            Arc::new(self) as Arc<dyn rustfox::provider::Provider>,
+        );
+        rustfox::provider::ProviderRegistry::new(providers, "fixture".into())
+    }
+}
+
+#[async_trait::async_trait]
+impl rustfox::provider::Provider for ToolThenReply {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+    fn default_model(&self) -> &str {
+        &self.config.default_model
+    }
+    fn supports_vision(&self) -> bool {
+        self.config.supports_vision
+    }
+    fn config(&self) -> &rustfox::provider::ProviderConfig {
+        &self.config
+    }
+
+    async fn chat_completion(
+        &self,
+        _client: &reqwest::Client,
+        _messages: &[rustfox::llm::ChatMessage],
+        _tools: &[rustfox::llm::ToolDefinition],
+        model: &str,
+        _max_tokens: u32,
+    ) -> anyhow::Result<rustfox::llm::ChatCompletion> {
+        let n = self.step.fetch_add(1, Ordering::SeqCst);
+        let message = if n == 0 {
+            rustfox::llm::ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: Some(vec![rustfox::llm::ToolCall {
+                    id: "call_exec".into(),
+                    call_type: "function".into(),
+                    function: rustfox::llm::FunctionCall {
+                        name: "execute_command".into(),
+                        arguments: r#"{"command":"true"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+            }
+        } else {
+            rustfox::llm::ChatMessage {
+                role: "assistant".into(),
+                content: Some(rustfox::llm::MessageContent::from_text(self.reply.clone())),
+                tool_calls: None,
+                tool_call_id: None,
+            }
+        };
+        Ok(rustfox::llm::ChatCompletion {
+            message,
+            finish_reason: Some(if n == 0 { "tool_calls" } else { "stop" }.into()),
+            model: model.to_string(),
+        })
+    }
+
+    async fn list_models(&self, _client: &reqwest::Client) -> anyhow::Result<Vec<String>> {
+        Ok(vec![self.config.default_model.clone()])
+    }
+}
+
+fn is_tool_progress(text: &str) -> bool {
+    text.contains("Working")
+        || text.contains("Running:")
+        || text.contains("Thinking")
+        || text.contains("Tool activity")
 }
 
 /// Owns temp home/config + Agent wired to a mock Bot and [`FixtureLlm`].
@@ -326,6 +457,115 @@ impl HandleMessageHarness {
             .ok();
         // Leave message_format at default `auto` so sendRichMessage goes through
         // rich_sender → bot.api_url() (wiremock). Do NOT force markdown.
+
+        Self {
+            _tmp: tmp,
+            agent,
+            bot,
+            api,
+        }
+    }
+
+    /// Tool-using turn. Does not set per-chat `tool_ui_mode` (default Minimal).
+    /// `main_fully_silent` is only on bot id `main`; `researcher` stays off.
+    async fn tool_turn(main_fully_silent: bool) -> Self {
+        std::env::remove_var("RUSTFOX_HOME");
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join(".rustfox");
+        std::fs::create_dir_all(home.join("workspace")).unwrap();
+        std::fs::create_dir_all(home.join("skills")).unwrap();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+
+        let cfg_path = tmp.path().join("config.toml");
+        let silent_line = if main_fully_silent {
+            "fully_silent = true\n"
+        } else {
+            ""
+        };
+        let toml = format!(
+            r#"
+            [[bots]]
+            id = "main"
+            bot_token = "{TOKEN}"
+            allowed_user_ids = [{ALLOWED}]
+            persona = "main"
+            {silent_line}
+            [[bots]]
+            id = "researcher"
+            bot_token = "000000000:QA-INJECTOR-OTHER-BOT"
+            allowed_user_ids = [{ALLOWED}]
+            persona = "researcher"
+
+            [openrouter]
+            api_key = "fixture-unused"
+            model = "fixture/stub"
+            base_url = "http://fixture.invalid/v1"
+            max_tokens = 256
+            system_prompt = "You are a QA fixture bot."
+
+            [general]
+            home = "{home}"
+
+            [agent]
+            max_iterations = 4
+            empty_response_retry_limit = 0
+            parse_retry_limit = 0
+            rate_limit_retry_limit = 0
+            "#,
+            TOKEN = TOKEN,
+            ALLOWED = ALLOWED,
+            home = home.display(),
+            silent_line = silent_line,
+        );
+        std::fs::write(&cfg_path, &toml).unwrap();
+        let config = Config::load(&cfg_path).expect("load fixture config");
+
+        let api = MockTelegramApi::start().await;
+        api.stub_bot_api().await;
+        let bot = api.bot();
+        let bot_arc = Arc::new(bot.clone());
+
+        let registry = Arc::new(ToolThenReply::new(TOOL_TURN_REPLY).into_registry());
+        let memory = MemoryStore::open_in_memory().expect("in-memory sqlite");
+        let task_store = ScheduledTaskStore::new(memory.connection());
+        let scheduler = Arc::new(Scheduler::new().await.expect("scheduler"));
+        let (job_tx, _job_rx) =
+            tokio::sync::mpsc::unbounded_channel::<rustfox::agent::ScheduledJobRequest>();
+        let cancel_registry = Arc::new(CancelRegistry::new());
+        let sender: Arc<dyn rustfox::platform::PlatformSender> =
+            Arc::new(TelegramAdapter::new(bot.clone()));
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(Box::new(rustfox::command_tool::CommandTool::new(
+            config.sandbox.allowed_directory.clone(),
+            Arc::clone(&cancel_registry),
+        )));
+        let langsmith = Arc::new(LangSmithClient::new(None));
+        let restart_pending = Arc::new(AtomicBool::new(false));
+        let soul_updated = Arc::new(AtomicBool::new(false));
+
+        let agent = Arc::new_cyclic(|weak: &Weak<Agent>| {
+            Agent::new(
+                config,
+                registry,
+                McpManager::new(),
+                memory,
+                SkillRegistry::new(),
+                SkillRegistry::new(),
+                task_store,
+                scheduler,
+                weak.clone(),
+                job_tx,
+                langsmith,
+                cfg_path.clone(),
+                cancel_registry,
+                tool_registry,
+                sender,
+                bot_arc,
+                Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                restart_pending,
+                soul_updated,
+            )
+        });
 
         Self {
             _tmp: tmp,
@@ -635,5 +875,104 @@ async fn drive_handle_message_skips_callback_without_bot_calls() {
     assert!(
         texts.is_empty(),
         "drive_handle_message must not run callbacks; got {texts:?}"
+    );
+}
+
+async fn drive_tool_turn(h: &HandleMessageHarness, bot_id: &str) {
+    let upd = UpdateInjector::parse_update_file(fixture("chat_hello.json")).unwrap();
+    UpdateInjector::new([ALLOWED])
+        .with_bot_id(bot_id)
+        .drive_handle_message(&upd, h.bot.clone(), Arc::clone(&h.agent))
+        .await
+        .unwrap_or_else(|e| panic!("drive {bot_id}: {e:#}"));
+}
+
+#[tokio::test]
+async fn default_cleans_completed_tool_messages_and_may_show_progress() {
+    let h = HandleMessageHarness::tool_turn(false).await;
+    assert!(!h.agent.config.bot_fully_silent("main"));
+    assert!(!h.agent.config.bot_fully_silent("researcher"));
+    drive_tool_turn(&h, "main").await;
+
+    let sent = h.api.sent_snapshot();
+    let deleted = h.api.deleted_snapshot();
+    let progress: Vec<(i32, String)> = sent
+        .iter()
+        .filter(|(_, text)| is_tool_progress(text))
+        .cloned()
+        .collect();
+    assert!(
+        progress
+            .iter()
+            .any(|(_, text)| text.contains("Working") || text.contains("Running:")),
+        "default may still emit in-progress Working/Running; sent={sent:?}"
+    );
+    for (id, text) in &progress {
+        assert!(
+            deleted.contains(id),
+            "completed tool message {id} ({text}) must be cleaned; deleted={deleted:?}"
+        );
+    }
+    assert!(
+        sent.iter().any(|(_, text)| text.contains(TOOL_TURN_REPLY)),
+        "final assistant text must still be sent; sent={sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn fully_silent_speaking_bot_emits_no_tool_messages() {
+    let h = HandleMessageHarness::tool_turn(true).await;
+    assert!(h.agent.config.bot_fully_silent("main"));
+    assert!(!h.agent.config.bot_fully_silent("researcher"));
+    drive_tool_turn(&h, "main").await;
+
+    let sent = h.api.sent_snapshot();
+    let progress: Vec<&str> = sent
+        .iter()
+        .filter(|(_, text)| is_tool_progress(text))
+        .map(|(_, text)| text.as_str())
+        .collect();
+    assert!(
+        progress.is_empty(),
+        "fully silent speaking bot must emit no Working/Running/tool bubble; got {progress:?} all={sent:?}"
+    );
+    assert!(
+        sent.iter().any(|(_, text)| text.contains(TOOL_TURN_REPLY)),
+        "final assistant text must still be sent; sent={sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn second_bot_without_fully_silent_does_not_inherit_it() {
+    let h = HandleMessageHarness::tool_turn(true).await;
+    assert!(h.agent.config.bot_fully_silent("main"));
+    assert!(
+        !h.agent.config.bot_fully_silent("researcher"),
+        "researcher must not inherit main's fully_silent"
+    );
+    drive_tool_turn(&h, "researcher").await;
+
+    let sent = h.api.sent_snapshot();
+    let deleted = h.api.deleted_snapshot();
+    let progress: Vec<(i32, String)> = sent
+        .iter()
+        .filter(|(_, text)| is_tool_progress(text))
+        .cloned()
+        .collect();
+    assert!(
+        progress
+            .iter()
+            .any(|(_, text)| text.contains("Working") || text.contains("Running:")),
+        "bot without the option must still emit in-progress tool UI; sent={sent:?}"
+    );
+    for (id, text) in &progress {
+        assert!(
+            deleted.contains(id),
+            "researcher completed tool message {id} ({text}) must still be cleaned"
+        );
+    }
+    assert!(
+        sent.iter().any(|(_, text)| text.contains(TOOL_TURN_REPLY)),
+        "final assistant text must still be sent; sent={sent:?}"
     );
 }

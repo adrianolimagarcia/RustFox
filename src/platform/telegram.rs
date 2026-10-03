@@ -1969,11 +1969,21 @@ pub async fn handle_message(
         .await
         .ok();
 
-    // Check tool UI mode for this user
+    // Check tool UI mode for this user (per-chat /verbose). Unchanged default:
+    // Minimal still shows Working / Running while a tool runs and removes the
+    // completed tool message. Silent still uses the Thinking placeholder.
     let tool_ui_mode = read_tool_ui_mode(&agent, &user_id.to_string()).await;
+    // Opt-in on the speaking bot only. Not stored per chat, not inherited
+    // from another bot. When on, this turn posts zero tool-call messages.
+    let fully_silent = agent.config.bot_fully_silent(&bot_id);
+    let turn_ui_mode = if fully_silent {
+        ToolUiMode::Silent
+    } else {
+        tool_ui_mode
+    };
 
     // Set up tool event channel if not silent
-    let (tool_event_tx, tool_event_rx) = if tool_ui_mode != ToolUiMode::Silent {
+    let (tool_event_tx, tool_event_rx) = if turn_ui_mode != ToolUiMode::Silent {
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::platform::tool_notifier::ToolEvent>(32);
         (Some(tx), Some(rx))
     } else {
@@ -1981,11 +1991,11 @@ pub async fn handle_message(
     };
 
     // Spawn notifier task if not silent
-    let notifier_handle = if tool_ui_mode != ToolUiMode::Silent {
+    let notifier_handle = if turn_ui_mode != ToolUiMode::Silent {
         let bot_clone = bot.clone();
         let chat_id = msg.chat.id;
         let mut rx = tool_event_rx.expect("rx exists when not silent");
-        let mode = tool_ui_mode;
+        let mode = turn_ui_mode;
         Some(tokio::spawn(async move {
             let mut notifier =
                 crate::platform::tool_notifier::ToolCallNotifier::new(bot_clone, chat_id, mode);
@@ -2018,8 +2028,10 @@ pub async fn handle_message(
     // stream completes (success or error). This keeps the placeholder a
     // standalone progress signal rather than a doomed attempt to morph into the
     // final answer.
+    // Fully silent skips the Thinking placeholder too: no in-progress bubble.
+    // Per-chat silent (fully_silent off) still sends it.
     let placeholder_msg_id: Option<teloxide::types::MessageId> =
-        if tool_ui_mode == ToolUiMode::Silent {
+        if !fully_silent && tool_ui_mode == ToolUiMode::Silent {
             match bot.send_message(msg.chat.id, "⏳ Thinking...").await {
                 Ok(sent) => Some(sent.id),
                 Err(e) => {
@@ -2218,7 +2230,7 @@ pub async fn handle_message(
             &incoming,
             tool_event_tx,
             Some(stream_token_tx),
-            tool_ui_mode,
+            turn_ui_mode,
         )
         .await
     {

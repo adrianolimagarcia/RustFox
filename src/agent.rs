@@ -2139,6 +2139,9 @@ impl Agent {
             };
 
             let turn_sender = self.sender_for_bot(&delivery.bot_id).await;
+            let speaking_fully_silent = invoke_stack
+                .first()
+                .is_some_and(|id| self.config.bot_fully_silent(id));
             let make_ctx = {
                 let sandbox_dir = self.config.sandbox.allowed_directory.clone();
                 let home_dir = self.config.resolved_home.clone();
@@ -2155,7 +2158,14 @@ impl Agent {
                     user_id: user_id.clone(),
                     chat_id: chat_id.clone(),
                     bot_id: turn_bot.clone(),
-                    tool_ui_mode: crate::tool_registry::ToolUiMode::Minimal,
+                    // Follow the speaking bot (stack root), not the peer.
+                    // Another bot's fully_silent flag is not inherited, and a
+                    // silent speaker stays silent for peer tool UI too.
+                    tool_ui_mode: if speaking_fully_silent {
+                        crate::tool_registry::ToolUiMode::Silent
+                    } else {
+                        crate::tool_registry::ToolUiMode::Minimal
+                    },
                 }
             };
 
@@ -2777,6 +2787,7 @@ mod tests {
             system_prompt_file: None,
             model: None,
             tools: None,
+            fully_silent: false,
         }
     }
 
