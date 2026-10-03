@@ -1,4 +1,5 @@
 pub mod service;
+pub mod thin;
 pub mod wizard;
 
 pub enum Command {

@@ -638,6 +638,124 @@ fn parse_bool(raw: &str) -> Result<bool> {
     }
 }
 
+/// Result of trying to replace the fresh-install allowlist sentinel `[0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnownedClaim {
+    /// Not the unowned sentinel, or this sender is already on the real list.
+    /// Nothing was written.
+    Unchanged,
+    /// This sender replaced `[0]` and the file was persisted.
+    Claimed,
+    /// The bot already has a real allowlist and this sender is not on it.
+    /// Nothing was written.
+    Rejected,
+}
+
+fn claim_mutex() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
+fn section_allowlist(section: &toml::Value) -> Option<Vec<u64>> {
+    let arr = section.get("allowed_user_ids")?.as_array()?;
+    let mut ids = Vec::with_capacity(arr.len());
+    for item in arr {
+        let n = item.as_integer()?;
+        if n < 0 {
+            return None;
+        }
+        ids.push(n as u64);
+    }
+    Some(ids)
+}
+
+fn write_section_allowlist(section: &mut toml::Value, sender: u64) -> bool {
+    let Some(table) = section.as_table_mut() else {
+        return false;
+    };
+    table.insert(
+        "allowed_user_ids".into(),
+        toml::Value::Array(vec![toml::Value::Integer(sender as i64)]),
+    );
+    true
+}
+
+/// First inbound Telegram user replaces `allowed_user_ids = [0]` for one bot.
+///
+/// `0` is only the unowned sentinel. A real list is never overwritten. An
+/// empty list is never written. When `[[bots]]` is non-empty, only the bot
+/// whose `id` equals `bot_id` is touched. A `[telegram]`-only file is claimed
+/// only for the synthesized id `default`.
+///
+/// Re-reads the file under a process lock so two messages cannot both claim.
+pub fn claim_unowned_bot(path: &Path, bot_id: &str, sender: u64) -> Result<UnownedClaim> {
+    if sender == 0 || !path.exists() {
+        return Ok(UnownedClaim::Unchanged);
+    }
+    let _guard = claim_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut doc: toml::Value =
+        toml::from_str(&original).context("Failed to parse config.toml before allowlist claim")?;
+    let Some(root) = doc.as_table_mut() else {
+        return Ok(UnownedClaim::Unchanged);
+    };
+
+    let bots_present = root
+        .get("bots")
+        .and_then(|v| v.as_array())
+        .is_some_and(|bots| !bots.is_empty());
+
+    let ids: Option<()> = if bots_present {
+        let Some(bots) = root.get_mut("bots").and_then(|v| v.as_array_mut()) else {
+            return Ok(UnownedClaim::Unchanged);
+        };
+        let Some(bot) = bots.iter_mut().find(|bot| {
+            bot.get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id.trim() == bot_id.trim())
+        }) else {
+            return Ok(UnownedClaim::Unchanged);
+        };
+        match section_allowlist(bot) {
+            Some(ids) if ids == [0] => {
+                if !write_section_allowlist(bot, sender) {
+                    return Ok(UnownedClaim::Unchanged);
+                }
+                None
+            }
+            Some(ids) if ids.contains(&sender) => return Ok(UnownedClaim::Unchanged),
+            Some(_) => return Ok(UnownedClaim::Rejected),
+            None => return Ok(UnownedClaim::Unchanged),
+        }
+    } else if bot_id.trim() == "default" {
+        let Some(telegram) = root.get_mut("telegram") else {
+            return Ok(UnownedClaim::Unchanged);
+        };
+        match section_allowlist(telegram) {
+            Some(ids) if ids == [0] => {
+                if !write_section_allowlist(telegram, sender) {
+                    return Ok(UnownedClaim::Unchanged);
+                }
+                None
+            }
+            Some(ids) if ids.contains(&sender) => return Ok(UnownedClaim::Unchanged),
+            Some(_) => return Ok(UnownedClaim::Rejected),
+            None => return Ok(UnownedClaim::Unchanged),
+        }
+    } else {
+        return Ok(UnownedClaim::Unchanged);
+    };
+    let _ = ids;
+
+    let new_content =
+        toml::to_string_pretty(&doc).context("Failed to serialize config after allowlist claim")?;
+    write_config_validated(path, &new_content)?;
+    Ok(UnownedClaim::Claimed)
+}
+
 /// Restore `path` from its `.bak` sibling (used by tests + failure path).
 pub fn restore_from_bak(path: &Path) -> Result<()> {
     let bak = backup_path(path);
@@ -963,5 +1081,124 @@ model = "m"
         assert!(err.contains("empty"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert!(!path.with_extension("toml.bak").exists());
+    }
+
+    fn ids_in(path: &Path, bot_id: Option<&str>) -> Vec<i64> {
+        let raw = std::fs::read_to_string(path).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+        let section = if let Some(id) = bot_id {
+            doc.get("bots")
+                .and_then(|v| v.as_array())
+                .and_then(|bots| {
+                    bots.iter()
+                        .find(|bot| bot.get("id").and_then(|v| v.as_str()) == Some(id))
+                })
+                .unwrap()
+        } else {
+            doc.get("telegram").unwrap()
+        };
+        section
+            .get("allowed_user_ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_integer().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn first_sender_replaces_unowned_sentinel_and_second_does_not() {
+        let dir = tempdir().unwrap();
+        let path = write_cfg(
+            &dir,
+            r#"
+[telegram]
+bot_token = "123:abc"
+allowed_user_ids = [0]
+[openrouter]
+api_key = "k"
+model = "moonshotai/kimi-k2.6"
+"#,
+        );
+        assert_eq!(
+            claim_unowned_bot(&path, "default", 4242).unwrap(),
+            UnownedClaim::Claimed
+        );
+        assert_eq!(ids_in(&path, None), vec![4242]);
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            claim_unowned_bot(&path, "default", 9999).unwrap(),
+            UnownedClaim::Rejected
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            claim_unowned_bot(&path, "default", 4242).unwrap(),
+            UnownedClaim::Unchanged
+        );
+        assert_eq!(ids_in(&path, None), vec![4242]);
+        // Sender 0 is the sentinel, never an owner.
+        assert_eq!(
+            claim_unowned_bot(&path, "other", 7).unwrap(),
+            UnownedClaim::Unchanged
+        );
+    }
+
+    #[test]
+    fn existing_allowlist_is_not_overwritten() {
+        let dir = tempdir().unwrap();
+        let path = write_cfg(&dir, &minimal_toml());
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            claim_unowned_bot(&path, "default", 99).unwrap(),
+            UnownedClaim::Rejected
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(
+            claim_unowned_bot(&path, "default", 42).unwrap(),
+            UnownedClaim::Unchanged
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn claim_updates_only_the_bot_that_received_the_message() {
+        let dir = tempdir().unwrap();
+        let path = write_cfg(
+            &dir,
+            r#"
+[[bots]]
+id = "alpha"
+bot_token = "1:a"
+allowed_user_ids = [0]
+persona = "main"
+
+[[bots]]
+id = "beta"
+bot_token = "2:b"
+allowed_user_ids = [0]
+persona = "main"
+
+[openrouter]
+api_key = "k"
+model = "m"
+"#,
+        );
+        assert_eq!(
+            claim_unowned_bot(&path, "alpha", 55).unwrap(),
+            UnownedClaim::Claimed
+        );
+        assert_eq!(ids_in(&path, Some("alpha")), vec![55]);
+        assert_eq!(ids_in(&path, Some("beta")), vec![0]);
+        assert_eq!(
+            claim_unowned_bot(&path, "beta", 55).unwrap(),
+            UnownedClaim::Claimed
+        );
+        assert_eq!(ids_in(&path, Some("beta")), vec![55]);
+        assert_eq!(
+            claim_unowned_bot(&path, "alpha", 77).unwrap(),
+            UnownedClaim::Rejected
+        );
+        assert_eq!(ids_in(&path, Some("alpha")), vec![55]);
     }
 }

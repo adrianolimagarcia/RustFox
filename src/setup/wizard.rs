@@ -3,7 +3,7 @@
 //! Extracted from `src/bin/setup.rs` so the main binary can reuse it
 //! via `rustfox --setup`.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -33,7 +33,7 @@ fn redirect_uri() -> String {
 /// If `cli` is true, runs in terminal mode. Otherwise starts an Axum web server.
 pub async fn run(config_dir: &Path, cli: bool) -> Result<()> {
     if cli {
-        return run_cli(config_dir);
+        return run_cli(config_dir).await;
     }
     run_web(config_dir).await
 }
@@ -369,6 +369,12 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .route("/", get(serve_index))
         .route("/api/load-config", get(load_config))
         .route("/api/save-config", post(save_config))
+        .route("/api/thin-preview", post(thin_preview))
+        .route("/api/thin-save", post(thin_save))
+        .route("/api/ollama/local", get(ollama_local))
+        .route("/api/ollama/library", get(ollama_library))
+        .route("/api/ollama/pull", post(ollama_pull))
+        .route("/api/openrouter/models", get(openrouter_models))
         .route("/api/add-bot", post(add_bot))
         .route("/api/install-service", post(install_service))
         .route("/api/shutdown", post(shutdown_server))
@@ -439,19 +445,251 @@ async fn save_config(
 ) -> Result<Json<SaveResponse>, StatusCode> {
     // When [[bots]] already exists, merge-preserve those rows so a full wizard
     // rewrite cannot wipe secondary tools/model/persona/allowlist (§7.7 TL HOLD).
-    let content = if st.config_path.exists() {
-        match tokio::fs::read_to_string(&st.config_path).await {
-            Ok(existing) => merge_wizard_save(&existing, &body.config).map_err(|e| {
-                eprintln!("save-config merge failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?,
-            Err(_) => body.config.clone(),
+    let path = persist_wizard_toml(&st.config_path, body.config, false).await?;
+    Ok(Json(SaveResponse { ok: true, path }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ThinRequest {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    openrouter_api_key: String,
+    #[serde(default)]
+    openrouter_model: String,
+    #[serde(default)]
+    ollama_model: String,
+    #[serde(default)]
+    bot_token: String,
+    #[serde(default)]
+    system_prompt: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinResponse {
+    ok: bool,
+    config: String,
+    error: Option<String>,
+    path: Option<String>,
+}
+
+fn thin_answers(body: &ThinRequest) -> Result<super::thin::ThinAnswers> {
+    Ok(super::thin::ThinAnswers {
+        provider: super::thin::ThinProvider::parse(&body.provider)?,
+        openrouter_api_key: body.openrouter_api_key.clone(),
+        openrouter_model: body.openrouter_model.clone(),
+        ollama_model: body.ollama_model.clone(),
+        bot_token: body.bot_token.clone(),
+        system_prompt: body.system_prompt.clone(),
+    })
+}
+
+fn thin_response(result: Result<String>) -> Json<ThinResponse> {
+    match result {
+        Ok(config) => Json(ThinResponse {
+            ok: true,
+            config,
+            error: None,
+            path: None,
+        }),
+        Err(e) => Json(ThinResponse {
+            ok: false,
+            config: String::new(),
+            error: Some(e.to_string()),
+            path: None,
+        }),
+    }
+}
+
+async fn probe_ollama(client: &reqwest::Client) -> super::thin::OllamaDetect {
+    let reached = match client
+        .get(super::thin::OLLAMA_TAGS_URL)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => return super::thin::detect_from_http(true, &body),
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    super::thin::detect_from_http(reached, "")
+}
+
+async fn ollama_local(State(st): State<WizardState>) -> Json<serde_json::Value> {
+    let detect = probe_ollama(&st.http_client).await;
+    Json(serde_json::json!({
+        "running": detect.running,
+        "models": detect.models,
+        "message": detect.message,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibraryQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn load_ollama_library(client: &reqwest::Client, query: &str) -> super::thin::LibraryLoad {
+    let url = super::thin::library_request_url(query);
+    let reached = match client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "RustFox-setup")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => return super::thin::library_from_http(true, &body, query),
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    super::thin::library_from_http(reached, "", query)
+}
+
+/// Ollama library names from `https://ollama.com/library`. `q` filters that
+/// catalog (Ollama's `/search` is paginated, so it is not the source of truth).
+/// A failed fetch is an error and an empty list — never a hardcoded catalog.
+async fn ollama_library(
+    State(st): State<WizardState>,
+    Query(query): Query<LibraryQuery>,
+) -> Json<serde_json::Value> {
+    let load = load_ollama_library(&st.http_client, &query.q).await;
+    Json(serde_json::json!({
+        "ok": load.ok,
+        "models": load.models,
+        "error": load.error,
+    }))
+}
+
+async fn openrouter_models() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "models": super::thin::OPENROUTER_MODELS,
+        "default": super::thin::OPENROUTER_DEFAULT_MODEL,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaPullRequest {
+    #[serde(default)]
+    model: String,
+}
+
+/// Pulls one library model. Refuses a typed id. Does not run during detect.
+async fn ollama_pull(
+    State(st): State<WizardState>,
+    Json(body): Json<OllamaPullRequest>,
+) -> Json<serde_json::Value> {
+    let library = load_ollama_library(&st.http_client, "").await;
+    if !library.ok {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": library.error.unwrap_or(super::thin::OLLAMA_LIBRARY_UNAVAILABLE),
+        }));
+    }
+    let payload = match super::thin::pull_request_body(&body.model, &library.models) {
+        Ok(body) => body,
+        Err(e) => {
+            return Json(serde_json::json!({ "ok": false, "error": e.to_string() }));
+        }
+    };
+    let client = st.http_client.clone();
+    let result = client
+        .post(super::thin::OLLAMA_PULL_URL)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(60 * 30))
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            Json(serde_json::json!({ "ok": true, "model": body.model.trim() }))
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Ollama pull failed ({status})"),
+            }))
+        }
+        Err(_) => Json(serde_json::json!({
+            "ok": false,
+            "error": super::thin::OLLAMA_NOT_RUNNING,
+        })),
+    }
+}
+
+async fn thin_preview(Json(body): Json<ThinRequest>) -> Json<ThinResponse> {
+    thin_response(thin_answers(&body).and_then(|a| super::thin::render_config(&a)))
+}
+
+async fn thin_save(
+    State(st): State<WizardState>,
+    Json(body): Json<ThinRequest>,
+) -> Json<ThinResponse> {
+    let answers = match thin_answers(&body) {
+        Ok(a) => a,
+        Err(e) => return thin_response(Err(e)),
+    };
+    if answers.provider == super::thin::ThinProvider::Ollama {
+        let detect = probe_ollama(&st.http_client).await;
+        if !detect.running {
+            return thin_response(Err(anyhow::anyhow!(super::thin::OLLAMA_NOT_RUNNING)));
+        }
+        if !super::thin::ollama_choice_allowed(&answers.ollama_model, &detect.models) {
+            return thin_response(Err(anyhow::anyhow!("pick a detected Ollama model")));
+        }
+    }
+    let rendered = match super::thin::render_config(&answers) {
+        Ok(text) => text,
+        Err(e) => return thin_response(Err(e)),
+    };
+    match persist_wizard_toml(&st.config_path, rendered.clone(), true).await {
+        Ok(path) => Json(ThinResponse {
+            ok: true,
+            config: rendered,
+            error: None,
+            path: Some(path),
+        }),
+        Err(_) => Json(ThinResponse {
+            ok: false,
+            config: String::new(),
+            error: Some("failed to save config".into()),
+            path: None,
+        }),
+    }
+}
+
+async fn persist_wizard_toml(
+    config_path: &Path,
+    wizard_toml: String,
+    preserve_allowlist: bool,
+) -> Result<String, StatusCode> {
+    let content = if config_path.exists() {
+        match tokio::fs::read_to_string(config_path).await {
+            Ok(existing) => {
+                let wizard = if preserve_allowlist {
+                    super::thin::keep_existing_allowlist(&existing, &wizard_toml).map_err(|e| {
+                        eprintln!("thin save allowlist preserve failed: {e}");
+                        StatusCode::BAD_REQUEST
+                    })?
+                } else {
+                    wizard_toml
+                };
+                merge_wizard_save(&existing, &wizard).map_err(|e| {
+                    eprintln!("save-config merge failed: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+            }
+            Err(_) => wizard_toml,
         }
     } else {
-        body.config.clone()
+        wizard_toml
     };
 
-    let path_for_seal = st.config_path.clone();
+    let path_for_seal = config_path.to_path_buf();
     let sealed = tokio::task::spawn_blocking(move || {
         seal_credentials_for_wizard_write(&path_for_seal, &content)
     })
@@ -462,14 +700,13 @@ async fn save_config(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    tokio::fs::write(&st.config_path, &sealed)
+    tokio::fs::write(config_path, &sealed)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let path = st.config_path.to_string_lossy().to_string();
+    let path = config_path.to_string_lossy().to_string();
     println!("\n✓ config.toml saved to {path}");
-
-    Ok(Json(SaveResponse { ok: true, path }))
+    Ok(path)
 }
 
 /// POST /api/add-bot — append `[[bots]]` via validate → bak → atomic
@@ -803,7 +1040,7 @@ fn random_state() -> String {
 
 // ── CLI mode ───────────────────────────────────────────────────────────
 
-fn run_cli(config_dir: &Path) -> Result<()> {
+async fn run_cli(config_dir: &Path) -> Result<()> {
     use std::io::{self, Write};
 
     println!("============================================");
@@ -819,71 +1056,126 @@ fn run_cli(config_dir: &Path) -> Result<()> {
         Ok(buf.trim().to_owned())
     };
 
-    let or_default = |s: String, default: &str| {
-        if s.is_empty() {
-            default.to_owned()
+    let provider_raw = read_line("Provider [OpenRouter/ollama] (OpenRouter): ")?;
+    let mut provider = super::thin::ThinProvider::parse(&provider_raw)?;
+    let client = reqwest::Client::new();
+    let mut ollama_model = String::new();
+    let mut or_key = String::new();
+
+    if provider == super::thin::ThinProvider::Ollama {
+        let detect = probe_ollama(&client).await;
+        if !detect.running {
+            println!("{}", super::thin::OLLAMA_NOT_RUNNING);
+            println!("Using OpenRouter.");
+            provider = super::thin::ThinProvider::OpenRouter;
         } else {
-            s
+            println!("Ollama models on this machine:");
+            for (i, name) in detect.models.iter().enumerate() {
+                println!("  {}) {}", i + 1, name);
+            }
+            println!("  0) Pull from the Ollama library");
+            let pick = read_line("Pick a number: ")?;
+            if pick == "0" {
+                let filter = read_line("Filter the Ollama library (empty shows the library): ")?;
+                let loaded = load_ollama_library(&client, &filter).await;
+                if !loaded.ok {
+                    bail!(
+                        "{}",
+                        loaded
+                            .error
+                            .unwrap_or(super::thin::OLLAMA_LIBRARY_UNAVAILABLE)
+                    );
+                }
+                let library =
+                    super::thin::library_not_already_local(&loaded.models, &detect.models);
+                if library.is_empty() {
+                    bail!("no Ollama library models match that filter");
+                }
+                println!("Ollama library:");
+                for (i, name) in library.iter().enumerate() {
+                    println!("  {}) {}", i + 1, name);
+                }
+                let raw = read_line("Pick a number to pull: ")?;
+                let idx: usize = raw
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=library.len()).contains(n))
+                    .context("pick a model from the Ollama library list")?;
+                let name = library[idx - 1].clone();
+                let payload = super::thin::pull_request_body(&name, &loaded.models)?;
+                let resp = client
+                    .post(super::thin::OLLAMA_PULL_URL)
+                    .json(&payload)
+                    .timeout(std::time::Duration::from_secs(60 * 30))
+                    .send()
+                    .await
+                    .context(super::thin::OLLAMA_NOT_RUNNING)?;
+                if !resp.status().is_success() {
+                    bail!("Ollama pull failed ({})", resp.status());
+                }
+                let again = probe_ollama(&client).await;
+                ollama_model = again
+                    .models
+                    .into_iter()
+                    .find(|m| *m == name || m.starts_with(&format!("{name}:")))
+                    .unwrap_or_else(|| format!("{name}:latest"));
+            } else {
+                let idx: usize = pick
+                    .parse()
+                    .ok()
+                    .filter(|n| *n >= 1 && *n <= detect.models.len())
+                    .context("pick a detected Ollama model")?;
+                ollama_model = detect.models[idx - 1].clone();
+            }
         }
-    };
-
-    let tg_token = read_line("Telegram bot token: ")?;
-    let user_ids = read_line("Allowed user IDs (comma-separated): ")?;
-    let or_key = read_line("OpenRouter API key: ")?;
-    let model = or_default(
-        read_line("Model [moonshotai/kimi-k2.6]: ")?,
-        "moonshotai/kimi-k2.6",
-    );
-    let db_path = or_default(read_line("Memory DB path [rustfox.db]: ")?, "rustfox.db");
-    let location = read_line("Your location (optional, e.g. Tokyo, Japan): ")?;
-
-    // Optional additional bots (§7.7). Each is appended after the primary write
-    // via validate → bak → atomic (materializes [telegram] → [[bots]] on first add).
-    let mut extra_bots: Vec<(String, String, u64)> = Vec::new();
-    loop {
-        let ans = read_line("Add another bot? [y/N]: ")?;
-        if !(ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")) {
-            break;
-        }
-        let id = read_line("  Bot id (e.g. researcher): ")?;
-        if id.trim().is_empty() {
-            eprintln!("  Skipping — empty id.");
-            continue;
-        }
-        let token = read_line("  BotFather token: ")?;
-        let allow_raw = or_default(
-            read_line("  Allowed user id (blank = use default): ")?,
-            &user_ids,
-        );
-        let caller = allow_raw
-            .split([',', ' '])
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        if caller == 0 {
-            eprintln!("  Skipping — need a numeric allowed user id.");
-            continue;
-        }
-        extra_bots.push((id.trim().to_string(), token.trim().to_string(), caller));
     }
 
-    let config = format_config(&ConfigParams {
-        tg_token: &tg_token,
-        user_ids: &user_ids,
-        or_key: &or_key,
-        model: &model,
-        max_tokens: 4096,
-        db_path: &db_path,
-        location: &location,
-    });
+    let mut openrouter_model = String::new();
+    if provider == super::thin::ThinProvider::OpenRouter {
+        or_key = read_line("OpenRouter API key: ")?;
+        println!("OpenRouter model:");
+        for (i, name) in super::thin::OPENROUTER_MODELS.iter().enumerate() {
+            let mark = if *name == super::thin::OPENROUTER_DEFAULT_MODEL {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("  {}) {name}{mark}", i + 1);
+        }
+        let prompt = format!(
+            "Pick a number [{}]: ",
+            super::thin::OPENROUTER_DEFAULT_MODEL
+        );
+        let pick = read_line(&prompt)?;
+        openrouter_model = if pick.is_empty() {
+            super::thin::OPENROUTER_DEFAULT_MODEL.to_string()
+        } else {
+            let idx: usize = pick
+                .parse()
+                .ok()
+                .filter(|n| (1..=super::thin::OPENROUTER_MODELS.len()).contains(n))
+                .context("pick an OpenRouter model")?;
+            super::thin::OPENROUTER_MODELS[idx - 1].to_string()
+        };
+    }
+    let tg_token = read_line("Telegram bot token: ")?;
+    let sentence = read_line("System prompt (one sentence): ")?;
+
+    let config = super::thin::render_config(&super::thin::ThinAnswers {
+        provider,
+        openrouter_api_key: or_key,
+        openrouter_model,
+        ollama_model,
+        bot_token: tg_token,
+        system_prompt: sentence,
+    })?;
 
     let config_path = config_dir.join("config.toml");
-    // Preserve existing [[bots]] customizations on re-run (same as web save-config).
     let to_write = if config_path.exists() {
         let existing = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Could not read {}", config_path.display()))?;
-        merge_wizard_save(&existing, &config)
+        let wizard = super::thin::keep_existing_allowlist(&existing, &config)?;
+        merge_wizard_save(&existing, &wizard)
             .with_context(|| "Failed to merge wizard save with existing [[bots]]")?
     } else {
         config
@@ -895,25 +1187,6 @@ fn run_cli(config_dir: &Path) -> Result<()> {
 
     println!("\n✓ config.toml saved to {}", config_path.display());
 
-    for (id, token, caller) in &extra_bots {
-        let home = config_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        match crate::secret_store::open(&home).and_then(|(store, _)| {
-            crate::agents_edit::append_bot_binding(&config_path, id, token, *caller, store.as_ref())
-        }) {
-            Ok(r) => println!(
-                "✓ Added bot `{}` (persona=`{}`) bak={}",
-                r.id,
-                r.persona,
-                r.bak_path.display()
-            ),
-            Err(e) => eprintln!("Warning: failed to add bot `{id}`: {e}"),
-        }
-    }
-
-    // Offer service installation
     print!("\nInstall as a background service? [Y/n]: ");
     io::stdout().flush()?;
     let mut buf = String::new();

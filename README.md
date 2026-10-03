@@ -16,9 +16,9 @@ An open-source, self-hosted Telegram AI assistant written in Rust. It solves a s
 
 **Why RustFox?**
 
-Drop a file, ask a question, schedule a task — RustFox handles it. It runs an agentic loop against your choice of LLM provider — **OpenRouter by default, or any local model via Ollama / LM Studio** — receive your message, call sandboxed tools (file I/O, command execution, web search via MCP), and loop until done. It remembers context via SQLite + vector RAG, runs skills and sub-agents, and even verifies its own work.
+Drop a file, ask a question, schedule a task — RustFox handles it. The default path is OpenRouter. Ollama is the local option, and an Ollama model can be pulled from the Ollama library. It receives your message, calls sandboxed tools (file I/O, command execution, web search via MCP), and loops until done. It remembers context via SQLite + vector RAG, runs skills and sub-agents, and even verifies its own work.
 
-**Self-hosted, no cloud dependency.** Single binary. Setup wizard. Runs as systemd/launchd service. `cargo install` and you're running in 2 minutes.
+Single binary. Setup wizard. Runs as systemd/launchd service. `cargo install` and you're running in 2 minutes.
 
 Star the repo ⭐, fork to contribute, or open an issue for feedback.
 
