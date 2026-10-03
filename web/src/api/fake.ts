@@ -66,6 +66,9 @@ export function fakeApi(over: Partial<Api> = {}): Api {
     ],
     enableTask: async (id: string) => ({ ok: true, id, enabled: true, schedulerJobId: 'job-' + id, nextRun: '2026-09-26T07:30:00+08:00' }),
     disableTask: async (id: string) => ({ ok: true, id, enabled: false, jobRemoved: true }),
+    googleStatus: async () => ({ offered: false }),
+    startGoogle: async () => ({ offered: false }),
+    setGoogleClientId: async () => ({ offered: true }),
     getSettings: async () => ({
       editable: {
         model: 'anthropic/claude-opus-4.8',

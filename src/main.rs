@@ -245,8 +245,7 @@ async fn main() -> Result<()> {
 
     // MCP manager ready; connect_all runs after Telegram notify callback is wired
     // so missing `secret:NAME` env refs can notify allowlisted users (Slice 3).
-    let mut mcp_manager =
-        McpManager::new().with_secret_bridge(std::sync::Arc::clone(&secret_bridge));
+    let mcp_manager = McpManager::new().with_secret_bridge(std::sync::Arc::clone(&secret_bridge));
 
     // Seed bundled skills/agents from embedded data into the home directory.
     if let Err(e) = rustfox::skills::embed::seed_skills(&config.skills.directory).await {

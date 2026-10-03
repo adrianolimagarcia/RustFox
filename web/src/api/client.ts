@@ -153,6 +153,19 @@ export const api = {
 
   // ── settings & soul ─────────────────────────────────────────────────────
   getSettings: () => get<Settings>('/settings'),
+  /** Whether the Google button is shown. No client id in the body. */
+  googleStatus: () => get<{ offered: boolean }>('/connectors/google'),
+  /** One tap. Hidden when no client id is baked or saved. Not a wizard step. */
+  startGoogle: () =>
+    request<{ offered: boolean; service?: 'Google'; authorizeUrl?: string }>('/connectors/google', {
+      method: 'POST',
+    }),
+  /** Advanced setting. The id is not echoed back. */
+  setGoogleClientId: (clientId: string) =>
+    request<{ offered: boolean }>('/connectors/google/client-id', {
+      method: 'POST',
+      body: JSON.stringify({ clientId }),
+    }),
   patchSettings: (patch: SettingsPatch) =>
     request<SettingsPatchResult>('/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   getSoul: (name: SoulName) => get<SoulFile>(`/soul?name=${encodeURIComponent(name)}`),
