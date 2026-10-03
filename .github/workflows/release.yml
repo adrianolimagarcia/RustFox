@@ -23,15 +23,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             rustfox_bin: rustfox
-            archive_name: rustfox-${{ replace(github.ref_name, '/', '-') }}-x86_64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             rustfox_bin: rustfox
-            archive_name: rustfox-${{ replace(github.ref_name, '/', '-') }}-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             rustfox_bin: rustfox.exe
-            archive_name: rustfox-${{ replace(github.ref_name, '/', '-') }}-x86_64-pc-windows-msvc.zip
 
     steps:
       - uses: actions/checkout@v7
@@ -73,14 +70,25 @@ jobs:
             cp scripts/services/uninstall-service.bat.template staging/uninstall-service.bat
           fi
 
+      - name: Safe archive name
+        id: archive
+        shell: bash
+        run: |
+          safe="${GITHUB_REF_NAME//\//-}"
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc) ext=zip ;;
+            *) ext=tar.gz ;;
+          esac
+          echo "name=rustfox-${safe}-${{ matrix.target }}.${ext}" >> "$GITHUB_OUTPUT"
+
       - name: Create archive (Unix)
         if: runner.os != 'Windows'
-        run: tar -czf ${{ matrix.archive_name }} -C staging .
+        run: tar -czf ${{ steps.archive.outputs.name }} -C staging .
 
       - name: Create archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path staging\* -DestinationPath ${{ matrix.archive_name }}
+        run: Compress-Archive -Path staging\* -DestinationPath ${{ steps.archive.outputs.name }}
 
       - name: Build .deb package
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -93,9 +101,9 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.archive_name }}
+          name: ${{ steps.archive.outputs.name }}
           path: |
-            ${{ matrix.archive_name }}
+            ${{ steps.archive.outputs.name }}
             dist/*.deb
           if-no-files-found: error
 
