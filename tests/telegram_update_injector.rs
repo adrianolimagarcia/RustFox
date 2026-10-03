@@ -306,6 +306,7 @@ impl HandleMessageHarness {
                 tool_registry,
                 sender,
                 bot_arc,
+                Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
                 restart_pending,
                 soul_updated,
             )

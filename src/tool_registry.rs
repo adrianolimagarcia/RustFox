@@ -69,6 +69,8 @@ pub struct ToolContext {
     pub cancel_registry: Arc<CancelRegistry>,
     pub user_id: String,
     pub chat_id: String,
+    /// `[[bots]]` id of the turn. Schedule tools list and create only for this bot.
+    pub bot_id: String,
     pub tool_ui_mode: ToolUiMode,
 }
 
@@ -161,6 +163,7 @@ mod tests {
             cancel_registry: Arc::new(CancelRegistry::new()),
             user_id: "test".to_string(),
             chat_id: "0".to_string(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
             tool_ui_mode: ToolUiMode::Minimal,
         };
         let result = reg.execute("mock_tool", json!({}), ctx).await.unwrap();
@@ -177,6 +180,7 @@ mod tests {
             cancel_registry: Arc::new(CancelRegistry::new()),
             user_id: "test".to_string(),
             chat_id: "0".to_string(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
             tool_ui_mode: ToolUiMode::Minimal,
         };
         let result = reg.execute("unknown", json!({}), ctx).await;

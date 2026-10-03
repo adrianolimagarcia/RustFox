@@ -3,11 +3,51 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::info;
 
 /// Marker used to exclude non-user rows (e.g. system/builtin identities)
 /// from owner-scoped listings. Kept as a constant so future callers can
 /// extend the convention without re-deriving it.
 pub const SYSTEM_USER_PREFIX: &str = "__system";
+
+/// Assign rows that predate `bot_id` to the default bot. Does not drop them.
+/// Returns how many rows were updated. Safe to call on every open.
+pub fn migrate_unscoped_schedules(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(scheduled_tasks)")
+        .context("scheduled_tasks schema")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("read scheduled_tasks columns")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect scheduled_tasks columns")?;
+    if !cols.iter().any(|c| c == "bot_id") {
+        conn.execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN bot_id TEXT;")
+            .context("add scheduled_tasks.bot_id")?;
+    }
+    let n = conn
+        .execute(
+            "UPDATE scheduled_tasks SET bot_id = ?1 WHERE bot_id IS NULL OR bot_id = ''",
+            rusqlite::params![crate::platform::DEFAULT_BOT_ID],
+        )
+        .context("backfill scheduled_tasks.bot_id")?;
+    if n > 0 {
+        info!(
+            "Assigned {n} scheduled task(s) with no bot_id to the default bot ({})",
+            crate::platform::DEFAULT_BOT_ID
+        );
+    }
+    Ok(n)
+}
+
+/// Telegram (or any) handle for the bot that owns the run.
+/// Never falls back to a different bot.
+pub fn owning_bot<'a, T>(
+    owner_bot_id: &str,
+    bots: &'a std::collections::HashMap<String, T>,
+) -> Option<&'a T> {
+    bots.get(crate::platform::normalize_bot_id(owner_bot_id))
+}
 
 /// Next cron fire strictly after `after` for a 6-field expression
 /// (sec min hour day month weekday) — the same parser configuration
@@ -58,6 +98,9 @@ pub struct ScheduledTask {
     /// DELETE sets this instead of removing the row, so run history and the
     /// definition survive as evidence.
     pub deleted_at: Option<String>,
+    /// `[[bots]]` id that owns this schedule. Required. Old rows are migrated
+    /// to [`crate::platform::DEFAULT_BOT_ID`]; new rows must set it explicitly.
+    pub bot_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -85,13 +128,16 @@ impl ScheduledTaskStore {
     }
 
     pub async fn create(&self, task: &ScheduledTask) -> Result<()> {
+        if task.bot_id.trim().is_empty() {
+            anyhow::bail!("scheduled task requires bot_id");
+        }
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO scheduled_tasks
              (id, scheduler_job_id, user_id, chat_id, platform, trigger_type,
               trigger_value, prompt, description, status, created_at, next_run_at,
-              deleted_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              deleted_at, bot_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 task.id,
                 task.scheduler_job_id,
@@ -106,6 +152,7 @@ impl ScheduledTaskStore {
                 task.created_at,
                 task.next_run_at,
                 task.deleted_at,
+                task.bot_id,
             ],
         )
         .context("Failed to insert scheduled task")?;
@@ -175,12 +222,25 @@ impl ScheduledTaskStore {
 
     /// Active + paused tasks — what the portal Tasks page should show so a
     /// paused task can be re-enabled from the UI instead of vanishing.
-    pub async fn list_browsable(&self) -> Result<Vec<ScheduledTask>> {
+    /// Portal / command listing: only this bot's active and paused rows.
+    pub async fn list_browsable_for_bot(&self, bot_id: &str) -> Result<Vec<ScheduledTask>> {
+        let bot_id = crate::platform::normalize_bot_id(bot_id);
         let conn = self.conn.lock().await;
         self.query_tasks(
             &conn,
-            "WHERE status IN ('active', 'paused') AND deleted_at IS NULL",
-            rusqlite::params![],
+            "WHERE status IN ('active', 'paused') AND deleted_at IS NULL AND bot_id = ?1",
+            rusqlite::params![bot_id],
+        )
+    }
+
+    /// Active rows for one bot. Commands use this; there is no cross-bot list.
+    pub async fn list_active_for_bot(&self, bot_id: &str) -> Result<Vec<ScheduledTask>> {
+        let bot_id = crate::platform::normalize_bot_id(bot_id);
+        let conn = self.conn.lock().await;
+        self.query_tasks(
+            &conn,
+            "WHERE status = 'active' AND deleted_at IS NULL AND bot_id = ?1",
+            rusqlite::params![bot_id],
         )
     }
 
@@ -209,7 +269,8 @@ impl ScheduledTaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, scheduler_job_id, user_id, chat_id, platform, trigger_type,
-                        trigger_value, prompt, description, status, created_at, next_run_at, deleted_at
+                        trigger_value, prompt, description, status, created_at, next_run_at, deleted_at,
+                        bot_id
                  FROM scheduled_tasks WHERE id = ?1",
             )
             .context("Failed to prepare get_by_id query")?;
@@ -229,6 +290,7 @@ impl ScheduledTaskStore {
                     created_at: row.get(10)?,
                     next_run_at: row.get(11)?,
                     deleted_at: row.get(12)?,
+                    bot_id: row.get(13)?,
                 })
             })
             .context("Failed to query task by id")?;
@@ -411,7 +473,8 @@ impl ScheduledTaskStore {
     ) -> Result<Vec<ScheduledTask>> {
         let sql = format!(
             "SELECT id, scheduler_job_id, user_id, chat_id, platform, trigger_type,
-                    trigger_value, prompt, description, status, created_at, next_run_at, deleted_at
+                    trigger_value, prompt, description, status, created_at, next_run_at, deleted_at,
+                    bot_id
              FROM scheduled_tasks {}
              ORDER BY created_at ASC",
             where_clause
@@ -433,6 +496,7 @@ impl ScheduledTaskStore {
                     created_at: row.get(10)?,
                     next_run_at: row.get(11)?,
                     deleted_at: row.get(12)?,
+                    bot_id: row.get(13)?,
                 })
             })
             .context("Failed to map rows")?
@@ -462,6 +526,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00".to_string(),
             next_run_at: Some("2099-01-01T09:00:00".to_string()),
             deleted_at: None,
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
         }
     }
 
@@ -750,6 +815,127 @@ mod tests {
             !ids.contains(&"webmaster-task"),
             "an unrelated 'webmaster' owner must not be swept in: {ids:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_records_on_the_owning_bots_conversation() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let mut task = make_task("run-1", "owner", "recurring");
+        task.bot_id = "researcher".into();
+        task.platform = "telegram".into();
+        task.prompt = "check the calendar".into();
+        let incoming = crate::agent::Agent::scheduled_incoming(&task);
+        assert_eq!(incoming.bot_id, "researcher");
+        assert_eq!(incoming.user_id, "owner");
+        assert_eq!(incoming.platform, "telegram");
+        assert_eq!(incoming.chat_id, task.chat_id);
+        let conv = memory
+            .get_or_create_conversation(&incoming.platform, &incoming.bot_id, &incoming.user_id)
+            .await
+            .unwrap();
+        let other = memory
+            .get_or_create_conversation("telegram", "main", "owner")
+            .await
+            .unwrap();
+        assert_ne!(conv, other);
+        memory
+            .save_message(
+                &conv,
+                &crate::llm::ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(crate::llm::MessageContent::from_text("researcher-result")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let own = memory.load_messages(&conv).await.unwrap();
+        let foreign = memory.load_messages(&other).await.unwrap();
+        assert!(own.iter().any(|m| m
+            .content
+            .as_ref()
+            .is_some_and(|c| c.as_text().contains("researcher-result"))));
+        assert!(foreign.iter().all(|m| m
+            .content
+            .as_ref()
+            .map(|c| c.as_text())
+            .unwrap_or_default()
+            .is_empty()
+            || !m
+                .content
+                .as_ref()
+                .is_some_and(|c| c.as_text().contains("researcher-result"))));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_blank_bot_id() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let store = ScheduledTaskStore::new(memory.connection());
+        let mut task = make_task("no-bot", "user-1", "one_shot");
+        task.bot_id.clear();
+        let err = store.create(&task).await.unwrap_err().to_string();
+        assert!(err.contains("bot_id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_active_for_bot_hides_the_other_bot() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let store = ScheduledTaskStore::new(memory.connection());
+        let mut a = make_task("a", "owner", "recurring");
+        a.bot_id = "alpha".into();
+        let mut b = make_task("b", "owner", "recurring");
+        b.bot_id = "beta".into();
+        store.create(&a).await.unwrap();
+        store.create(&b).await.unwrap();
+        let alpha = store.list_active_for_bot("alpha").await.unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].id, "a");
+        let browsable = store.list_browsable_for_bot("beta").await.unwrap();
+        assert_eq!(browsable.len(), 1);
+        assert_eq!(browsable[0].id, "b");
+    }
+
+    #[tokio::test]
+    async fn old_rows_without_bot_id_migrate_to_the_default_bot() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scheduled_tasks (
+                id TEXT PRIMARY KEY, scheduler_job_id TEXT, user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL, platform TEXT NOT NULL, trigger_type TEXT NOT NULL,
+                trigger_value TEXT NOT NULL, prompt TEXT NOT NULL, description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')), next_run_at TEXT,
+                deleted_at TEXT);
+             INSERT INTO scheduled_tasks
+                (id, user_id, chat_id, platform, trigger_type, trigger_value, prompt, description)
+             VALUES ('legacy', 'owner', '1', 'telegram', 'recurring', '0 0 4 * * *', 'hi', 'legacy');",
+        )
+        .unwrap();
+        let n = migrate_unscoped_schedules(&conn).unwrap();
+        assert_eq!(n, 1);
+        let bot_id: String = conn
+            .query_row(
+                "SELECT bot_id FROM scheduled_tasks WHERE id = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bot_id, crate::platform::DEFAULT_BOT_ID);
+        assert_eq!(migrate_unscoped_schedules(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn approval_reply_uses_only_the_owning_bot() {
+        let mut bots = std::collections::HashMap::new();
+        bots.insert("main".to_string(), "token-main");
+        bots.insert("researcher".to_string(), "token-researcher");
+        assert_eq!(
+            owning_bot("researcher", &bots).copied(),
+            Some("token-researcher")
+        );
+        assert_eq!(owning_bot("missing", &bots), None);
+        assert_ne!(owning_bot("researcher", &bots).copied(), Some("token-main"));
     }
 
     #[tokio::test]

@@ -87,6 +87,20 @@ persona = "researcher"
 
 Shared sections (`[sandbox]`, `[skills]`, `[agents]`, MCP, providers) stay install-wide. See [`config.example.toml`](../config.example.toml) for the commented researcher example. Conversation history is keyed by `(platform, bot_id, user_id)`.
 
+### Per-bot schedules
+
+Every schedule row has a required `bot_id` (the `[[bots]]` id). There is no global cron and no schedule shared between bots. A run uses that bot's prompt, tools, and conversation with the owner (the chat stored on the row) and writes the result there. Portal and `list_scheduled_tasks` show only the current bot. Disable and delete affect only that bot. An approval reply is not sent on a bot that did not own the run. Rows saved before `bot_id` existed are assigned to `default` and logged, not dropped.
+
+```toml
+[[bots]]
+id = "researcher"
+bot_token = "secret:bot.researcher.token"
+allowed_user_ids = [123456789]
+persona = "researcher"
+# A cron created in this bot's chat is stored as bot_id = "researcher".
+# It does not appear in the portal (the default bot) or in another bot's list.
+```
+
 ### Peer invoke + slash commands
 
 - **`invoke_agent` / `spawn_agents`** — resolve `agents/`, subagent skills, or a `[[bots]]` persona id (`bot=` synonym). Nested peer depth max **2**; cycles rejected; user-visible peer summaries prepend `via <persona>:`. Reply stays in the **caller’s** chat. Details: [Agent Tools](#agent-tools).
@@ -195,9 +209,9 @@ MCP tools are namespaced as `mcp_<server-name>_<tool-name>` (e.g. `mcp_git_git_l
 
 | Tool | Description |
 |------|-------------|
-| `schedule_task` | Schedule a recurring (cron) or one-shot task |
-| `list_scheduled_tasks` | List all active scheduled tasks |
-| `cancel_scheduled_task` | Cancel a scheduled task by ID |
+| `schedule_task` | Schedule a recurring (cron) or one-shot task for the current bot |
+| `list_scheduled_tasks` | List the current bot's active scheduled tasks |
+| `cancel_scheduled_task` | Cancel one of the current bot's scheduled tasks by ID |
 
 ### Skill Tools
 

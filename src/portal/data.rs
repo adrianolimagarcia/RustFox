@@ -244,11 +244,11 @@ fn task_json(t: &crate::scheduler::reminders::ScheduledTask) -> serde_json::Valu
         "triggerValue": t.trigger_value,
         "status": t.status,
         "platform": t.platform,
+        "botId": t.bot_id,
     })
 }
 
-/// GET /api/tasks — every scheduled task (all platforms; Telegram-created
-/// tasks remain listed and toggle-able).
+/// GET /api/tasks — scheduled tasks for the portal's bot only.
 pub async fn tasks(
     State(state): State<PortalState>,
 ) -> Result<Json<serde_json::Value>, PortalError> {
@@ -256,7 +256,7 @@ pub async fn tasks(
     // rows must remain visible so the UI's Enable button can bring them back.
     let active = state
         .task_store
-        .list_browsable()
+        .list_browsable_for_bot(crate::platform::DEFAULT_BOT_ID)
         .await
         .map_err(PortalError::from)?;
     let out: Vec<serde_json::Value> = active.iter().map(task_json).collect();
@@ -273,9 +273,16 @@ pub async fn task_runs(
     State(state): State<PortalState>,
     Path(p): Path<TaskId>,
 ) -> Result<Json<serde_json::Value>, PortalError> {
+    let task = state
+        .task_store
+        .get_by_id(&p.id)
+        .await
+        .map_err(PortalError::from)?
+        .filter(|t| t.deleted_at.is_none() && t.bot_id == crate::platform::DEFAULT_BOT_ID)
+        .ok_or_else(|| PortalError::not_found("task"))?;
     let runs = state
         .task_store
-        .get_task_runs(&p.id, 20)
+        .get_task_runs(&task.id, 20)
         .await
         .map_err(PortalError::from)?;
     let out: Vec<serde_json::Value> = runs
@@ -379,7 +386,7 @@ pub async fn stats(
     drop(conn);
     let tasks = state
         .task_store
-        .list_all_active()
+        .list_active_for_bot(crate::platform::DEFAULT_BOT_ID)
         .await
         .map_err(PortalError::from)?;
     let skills = state.agent.skill_entries().await.len();

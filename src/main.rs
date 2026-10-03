@@ -18,6 +18,21 @@ use rustfox::setup;
 use rustfox::skills::loader::load_skills_from_dir;
 use rustfox::tool_registry::ToolUiMode;
 
+async fn send_schedule_reply(
+    bot: &Option<Arc<teloxide::Bot>>,
+    chat_id: teloxide::types::ChatId,
+    text: &str,
+    format: rustfox::platform::telegram::MessageFormat,
+) -> anyhow::Result<()> {
+    let Some(bot) = bot else {
+        tracing::info!("schedule reply skipped; this telegram bot does not own the run");
+        return Ok(());
+    };
+    rustfox::platform::telegram::send_markdown_message(bot, chat_id, text, format)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -272,11 +287,9 @@ async fn main() -> Result<()> {
     // Create scheduler as Arc so Agent can hold it and closures can reference it
     let scheduler = Arc::new(Scheduler::new().await?);
 
-    // One teloxide::Bot per [[bots]] entry. Agent / scheduler / TelegramAdapter
-    // keep the shim (primary) bot for send/schedule; conversation history and
-    // cancel keys are isolated per bot_id (§7.3). Per-bot persona prompt is
-    // resolved inside Agent::process_message (§7.4). Per-bot scheduler identity
-    // remains a later slice.
+    // One teloxide::Bot per [[bots]] entry. Schedule runs and approval replies
+    // use the bot id stored on the row, never a different bot's token.
+    // Conversation history and cancel keys stay isolated per bot_id (§7.3).
     let telegram_api_base =
         rustfox::config::telegram_api_base_url(config.telegram.api_base_url.as_deref());
     let telegram_api_url =
@@ -313,6 +326,12 @@ async fn main() -> Result<()> {
         .find(|(id, _, _)| id == &shim.id)
         .map(|(_, b, _)| Arc::clone(b))
         .expect("shim bot must exist in bot_runtimes");
+    let telegram_bots = Arc::new(std::sync::RwLock::new(
+        bot_runtimes
+            .iter()
+            .map(|(id, b, _)| (id.clone(), Arc::clone(b)))
+            .collect::<std::collections::HashMap<_, _>>(),
+    ));
 
     // Slice 3: missing-secret Telegram notify to allowlisted users (shim bot).
     {
@@ -366,6 +385,7 @@ async fn main() -> Result<()> {
         scheduling_ops.clone() as Arc<dyn rustfox::scheduler::schedule::SchedulingOps>,
         job_tx.clone(),
         Arc::clone(&bot),
+        Arc::clone(&telegram_bots),
         rerun_queue.clone(),
     )));
     tool_registry.register(Box::new(rustfox::skill_tools::SkillTools::new(
@@ -404,6 +424,7 @@ async fn main() -> Result<()> {
             tool_registry,
             sender.clone(),
             Arc::clone(&bot),
+            Arc::clone(&telegram_bots),
             restart_pending.clone(),
             soul_updated.clone(),
         )
@@ -479,8 +500,8 @@ async fn main() -> Result<()> {
                                         reason,
                                         rid
                                     );
-                                    let _ = rustfox::platform::telegram::send_markdown_message(
-                                        &req.bot,
+                                    let _ = send_schedule_reply(
+                                        &req.owning_telegram_bot,
                                         teloxide::types::ChatId(cv),
                                         &ask,
                                         rustfox::platform::telegram::MessageFormat::Auto,
@@ -506,8 +527,8 @@ async fn main() -> Result<()> {
                                                 reason,
                                                 qid
                                             );
-                                            let _ = rustfox::platform::telegram::send_markdown_message(
-                                                &req.bot,
+                                            let _ = send_schedule_reply(
+                                                &req.owning_telegram_bot,
                                                 teloxide::types::ChatId(cv),
                                                 &note,
                                                 rustfox::platform::telegram::MessageFormat::Auto,
@@ -526,8 +547,8 @@ async fn main() -> Result<()> {
                         }
                         // Deliver whatever partial text the loop produced, then stop.
                         if let Ok(cv) = req.incoming.chat_id.parse::<i64>() {
-                            let _ = rustfox::platform::telegram::send_markdown_message(
-                                &req.bot,
+                            let _ = send_schedule_reply(
+                                &req.owning_telegram_bot,
                                 teloxide::types::ChatId(cv),
                                 &r,
                                 rustfox::platform::telegram::MessageFormat::Auto,
@@ -610,8 +631,8 @@ async fn main() -> Result<()> {
                                     err_str,
                                     rid
                                 );
-                                let _ = rustfox::platform::telegram::send_markdown_message(
-                                    &req.bot,
+                                let _ = send_schedule_reply(
+                                    &req.owning_telegram_bot,
                                     teloxide::types::ChatId(cv),
                                     &ask,
                                     rustfox::platform::telegram::MessageFormat::Auto,
@@ -638,8 +659,8 @@ async fn main() -> Result<()> {
                                         let note = format!(
                                             "**Scheduled task hiccup:** transient provider failure (429/5xx), auto re-fire queued — I'll retry within the hour and only nag you if it fails again.\n\n(queue id: `{qid}`)"
                                         );
-                                        let _ = rustfox::platform::telegram::send_markdown_message(
-                                            &req.bot,
+                                        let _ = send_schedule_reply(
+                                            &req.owning_telegram_bot,
                                             teloxide::types::ChatId(cv),
                                             &note,
                                             rustfox::platform::telegram::MessageFormat::Auto,
@@ -672,8 +693,8 @@ async fn main() -> Result<()> {
                     };
                     let chat = teloxide::types::ChatId(chat_id_val);
                     let error_msg = format!("**Scheduled task failed:** {}", e);
-                    let _ = rustfox::platform::telegram::send_markdown_message(
-                        &req.bot,
+                    let _ = send_schedule_reply(
+                        &req.owning_telegram_bot,
                         chat,
                         &error_msg,
                         rustfox::platform::telegram::MessageFormat::Auto,
@@ -695,8 +716,8 @@ async fn main() -> Result<()> {
                 }
             };
             let chat = teloxide::types::ChatId(chat_id_val);
-            if let Err(e) = rustfox::platform::telegram::send_markdown_message(
-                &req.bot,
+            if let Err(e) = send_schedule_reply(
+                &req.owning_telegram_bot,
                 chat,
                 &response,
                 rustfox::platform::telegram::MessageFormat::Auto,
@@ -715,7 +736,7 @@ async fn main() -> Result<()> {
         let queue = rerun_queue.clone();
         let store = task_store.clone();
         let tx = job_tx.clone();
-        let bot2 = Arc::clone(&bot);
+        let bots_for_watch = Arc::clone(&telegram_bots);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
             interval.tick().await; // skip first immediate tick
@@ -759,13 +780,17 @@ async fn main() -> Result<()> {
                         tracing::warn!("Rerun bump-attempts failed for {}: {e:#}", row.id);
                         continue;
                     }
-                    if let Err(e) = rustfox::agent::Agent::build_rerun_request(
-                        &tx,
-                        Arc::clone(&bot2),
-                        store.clone(),
-                        &task,
-                        &row.id,
-                    ) {
+                    let owning = {
+                        let guard = bots_for_watch.read().unwrap_or_else(|err| err.into_inner());
+                        rustfox::agent::Agent::build_rerun_request(
+                            &tx,
+                            &guard,
+                            store.clone(),
+                            &task,
+                            &row.id,
+                        )
+                    };
+                    if let Err(e) = owning {
                         tracing::warn!("Rerun dispatch failed for {}: {e:#}", row.id);
                     }
                 }
@@ -774,19 +799,29 @@ async fn main() -> Result<()> {
                     Ok(ids) => {
                         for id in ids {
                             tracing::info!("Rerun {id} expired unanswered → abandoned");
-                            let chat_id = match queue.get(&id).await {
+                            let delivery = match queue.get(&id).await {
                                 Ok(Some(row)) => match store.get_by_id(&row.task_id).await {
-                                    Ok(Some(task)) => task.chat_id.parse::<i64>().ok(),
-                                    _ => None,
+                                    Ok(Some(task)) => {
+                                        let guard = bots_for_watch
+                                            .read()
+                                            .unwrap_or_else(|err| err.into_inner());
+                                        let owner = rustfox::scheduler::reminders::owning_bot(
+                                            &task.bot_id,
+                                            &guard,
+                                        )
+                                        .cloned();
+                                        (task.chat_id.parse::<i64>().ok(), owner)
+                                    }
+                                    _ => (None, None),
                                 },
-                                _ => None,
+                                _ => (None, None),
                             };
-                            if let Some(cv) = chat_id {
+                            if let (Some(cv), owner) = delivery {
                                 let note = format!(
                                     "Scheduled re-run gate expired unanswered — abandoned (queue id: `{id}`)."
                                 );
-                                let _ = rustfox::platform::telegram::send_markdown_message(
-                                    &bot2,
+                                let _ = send_schedule_reply(
+                                    &owner,
                                     teloxide::types::ChatId(cv),
                                     &note,
                                     rustfox::platform::telegram::MessageFormat::Auto,
