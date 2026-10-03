@@ -9,6 +9,7 @@ pub mod chat;
 pub mod control;
 pub mod data;
 pub mod error;
+pub mod google;
 pub mod install;
 pub mod secrets;
 pub mod settings;
@@ -67,6 +68,15 @@ pub trait AgentOps: Send + Sync {
     /// used by the agents editor to gate `tools:` frontmatter (ADR 0011).
     fn tool_names(&self) -> Vec<String>;
     fn config(&self) -> &Config;
+    /// Start the built-in Google HTTP MCP connector. Default is a no-op so
+    /// test fakes do not need a live MCP client.
+    fn start_google_connector(
+        &self,
+        config: crate::config::McpServerConfig,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        let _ = config;
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl AgentOps for Agent {
@@ -163,6 +173,12 @@ impl AgentOps for Agent {
     fn config(&self) -> &Config {
         &self.config
     }
+    fn start_google_connector(
+        &self,
+        config: crate::config::McpServerConfig,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move { self.mcp.connect(&config).await })
+    }
 }
 
 /// Lightweight view of a loaded skill / agent definition for the API layer
@@ -216,6 +232,9 @@ pub struct PortalState {
     pub secret_store: Arc<dyn crate::secret_store::SecretStore>,
     /// Pending one-shot secret claims (Slice 2).
     pub pending_secrets: Arc<crate::secret_store::PendingSecretRegistry>,
+    /// In-flight Google OAuth `state` values. The callback is public, so a
+    /// matching state is the only proof the tap started here.
+    pub google_oauth_states: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl PortalState {
@@ -242,6 +261,7 @@ impl PortalState {
             started_at: std::time::Instant::now(),
             secret_store: Arc::new(crate::secret_store::FakeSecretStore::new()),
             pending_secrets: Arc::new(crate::secret_store::PendingSecretRegistry::default()),
+            google_oauth_states: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -278,6 +298,7 @@ pub fn router(state: PortalState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/health", get(data::health))
+        .route("/connectors/google/callback", get(google::callback))
         // Slice 2: claim by opaque one-shot token (magic link; no session).
         .route(
             "/secrets/claim/{token}",
@@ -330,6 +351,7 @@ pub fn router(state: PortalState) -> Router {
         .route("/tasks/{id}/disable", post(tasks_admin::task_disable))
         .route("/stats", get(data::stats))
         .route("/settings", get(settings::get_settings))
+        .route("/connectors/google", post(google::start))
         .route("/settings", axum::routing::patch(settings::patch_settings))
         .route("/soul", get(settings::get_soul))
         .route("/soul", axum::routing::put(settings::put_soul))

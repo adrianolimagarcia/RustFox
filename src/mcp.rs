@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
@@ -242,7 +243,7 @@ pub struct McpConnection {
 
 /// Manages multiple MCP server connections
 pub struct McpManager {
-    connections: HashMap<String, McpConnection>,
+    connections: Mutex<HashMap<String, McpConnection>>,
     /// Slice 3: resolve `secret:NAME` env refs + redact tool results.
     secret_bridge: Option<std::sync::Arc<crate::secret_store::SecretBridge>>,
 }
@@ -256,7 +257,7 @@ impl Default for McpManager {
 impl McpManager {
     pub fn new() -> Self {
         Self {
-            connections: HashMap::new(),
+            connections: Mutex::new(HashMap::new()),
             secret_bridge: None,
         }
     }
@@ -281,8 +282,39 @@ impl McpManager {
         }
     }
 
+    fn lock_connections(&self) -> std::sync::MutexGuard<'_, HashMap<String, McpConnection>> {
+        self.connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Bearer for an HTTP MCP server. `secret:NAME` is resolved from SecretStore
+    /// and never logged. Plaintext tokens (older configs) pass through.
+    fn resolve_bearer(&self, config: &McpServerConfig) -> Result<Option<String>> {
+        let Some(raw) = config
+            .auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        if let Some(name) = crate::secret_store::parse_secret_ref(raw) {
+            let bridge = self
+                .secret_bridge
+                .as_ref()
+                .context("MCP auth_token is a secret:NAME ref but no SecretStore is attached")?;
+            match bridge.store().get(name)? {
+                Some(value) => Ok(Some(value.expose().to_string())),
+                None => anyhow::bail!("secret `{name}` not found in SecretStore"),
+            }
+        } else {
+            Ok(Some(raw.to_string()))
+        }
+    }
+
     /// Connect to an MCP server — dispatches to HTTP or stdio based on config.
-    pub async fn connect(&mut self, config: &McpServerConfig) -> Result<()> {
+    pub async fn connect(&self, config: &McpServerConfig) -> Result<()> {
         if config.url.is_some() {
             self.connect_http(config).await
         } else {
@@ -291,7 +323,7 @@ impl McpManager {
     }
 
     /// Connect to an HTTP-based MCP server using the Streamable HTTP transport.
-    async fn connect_http(&mut self, config: &McpServerConfig) -> Result<()> {
+    async fn connect_http(&self, config: &McpServerConfig) -> Result<()> {
         let url = config
             .url
             .as_deref()
@@ -305,9 +337,9 @@ impl McpManager {
         // Using unwrap_or_default() would pass an empty string, causing
         // reqwest to send "Authorization: Bearer " (empty token) which
         // remote servers (e.g. Notion) reject with 401 invalid_token.
-        match &config.auth_token {
-            Some(token) if !token.is_empty() => {
-                transport_config = transport_config.auth_header(token.clone());
+        match self.resolve_bearer(config)? {
+            Some(token) => {
+                transport_config = transport_config.auth_header(token);
             }
             None => {
                 tracing::debug!(
@@ -316,7 +348,6 @@ impl McpManager {
                     config.name
                 );
             }
-            _ => {}
         }
 
         let transport = StreamableHttpClientTransport::from_config(transport_config);
@@ -332,7 +363,7 @@ impl McpManager {
     }
 
     /// Connect to a stdio-based MCP server via a child process.
-    async fn connect_stdio(&mut self, config: &McpServerConfig) -> Result<()> {
+    async fn connect_stdio(&self, config: &McpServerConfig) -> Result<()> {
         let command_str = config
             .command
             .as_deref()
@@ -377,7 +408,7 @@ impl McpManager {
 
     /// Register a connected client, listing its tools and storing it.
     async fn register_client(
-        &mut self,
+        &self,
         config: &McpServerConfig,
         client: RunningService<rmcp::service::RoleClient, ()>,
     ) -> Result<()> {
@@ -401,7 +432,7 @@ impl McpManager {
             info!("  - {}: {:?}", tool.name, tool.description);
         }
 
-        self.connections.insert(
+        self.lock_connections().insert(
             config.name.clone(),
             McpConnection {
                 name: config.name.clone(),
@@ -414,7 +445,7 @@ impl McpManager {
     }
 
     /// Connect to all configured MCP servers, logging errors but not failing
-    pub async fn connect_all(&mut self, configs: &[McpServerConfig]) {
+    pub async fn connect_all(&self, configs: &[McpServerConfig]) {
         for config in configs {
             if !config.enabled {
                 tracing::info!(
@@ -432,14 +463,14 @@ impl McpManager {
 
     /// Number of connected MCP servers
     pub fn server_count(&self) -> usize {
-        self.connections.len()
+        self.lock_connections().len()
     }
 
     /// Get all MCP tools as OpenRouter-compatible tool definitions
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = Vec::new();
 
-        for connection in self.connections.values() {
+        for connection in self.lock_connections().values() {
             for tool in &connection.tools {
                 let parameters = tool.schema_as_json_value();
                 definitions.push(ToolDefinition {
@@ -467,54 +498,63 @@ impl McpManager {
             .strip_prefix("mcp_")
             .context("MCP tool name must start with 'mcp_'")?;
 
-        // Find the matching connection
-        for connection in self.connections.values() {
-            let prefix = format!("{}_", connection.name);
-            if let Some(tool_name) = without_mcp.strip_prefix(&prefix) {
-                // Verify this tool exists on this server
-                if connection
-                    .tools
-                    .iter()
-                    .any(|t| t.name.as_ref() == tool_name)
-                {
-                    info!(
-                        "Calling MCP tool '{}' on server '{}'",
-                        tool_name, connection.name
-                    );
-
-                    let tool_name_owned: std::borrow::Cow<'static, str> =
-                        std::borrow::Cow::Owned(tool_name.to_string());
-                    let mut call_params = CallToolRequestParams::new(tool_name_owned);
-                    if let Some(args) = arguments.as_object().cloned() {
-                        call_params = call_params.with_arguments(args);
-                    }
-                    let result = connection
-                        .client
-                        .call_tool(call_params)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to call MCP tool '{}' on server '{}'",
-                                tool_name, connection.name
-                            )
-                        })?;
-
-                    // Extract text content from the result
-                    let text_parts: Vec<String> = result
-                        .content
+        // Find the matching connection. Clone the peer so the lock is not held
+        // across the tool-call await.
+        let found = {
+            let guard = self.lock_connections();
+            let mut found = None;
+            for connection in guard.values() {
+                let prefix = format!("{}_", connection.name);
+                if let Some(tool_name) = without_mcp.strip_prefix(&prefix) {
+                    if connection
+                        .tools
                         .iter()
-                        .filter_map(|c| match c {
-                            ContentBlock::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .collect();
-
-                    if text_parts.is_empty() {
-                        return Ok(self.redact_tool_text(&format!("{:?}", result.content)));
+                        .any(|t| t.name.as_ref() == tool_name)
+                    {
+                        found = Some((
+                            connection.client.peer().clone(),
+                            tool_name.to_string(),
+                            connection.name.clone(),
+                        ));
+                        break;
                     }
-                    return Ok(self.redact_tool_text(&text_parts.join("\n")));
                 }
             }
+            found
+        };
+        if let Some((peer, tool_name, server_name)) = found {
+            info!(
+                "Calling MCP tool '{}' on server '{}'",
+                tool_name, server_name
+            );
+
+            let tool_name_owned: std::borrow::Cow<'static, str> =
+                std::borrow::Cow::Owned(tool_name.clone());
+            let mut call_params = CallToolRequestParams::new(tool_name_owned);
+            if let Some(args) = arguments.as_object().cloned() {
+                call_params = call_params.with_arguments(args);
+            }
+            let result = peer.call_tool(call_params).await.with_context(|| {
+                format!(
+                    "Failed to call MCP tool '{}' on server '{}'",
+                    tool_name, server_name
+                )
+            })?;
+
+            // Extract text content from the result
+            let text_parts: Vec<String> = result
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            if text_parts.is_empty() {
+                return Ok(self.redact_tool_text(&format!("{:?}", result.content)));
+            }
+            return Ok(self.redact_tool_text(&text_parts.join("\n")));
         }
 
         anyhow::bail!("MCP tool not found: {}", prefixed_name)
@@ -527,8 +567,9 @@ impl McpManager {
 
     /// Shutdown all MCP connections
     #[allow(dead_code)]
-    pub async fn shutdown(&mut self) {
-        for (name, connection) in self.connections.drain() {
+    pub async fn shutdown(&self) {
+        let drained: Vec<_> = self.lock_connections().drain().collect();
+        for (name, connection) in drained {
             info!("Shutting down MCP server: {}", name);
             if let Err(e) = connection.client.cancel().await {
                 error!("Error shutting down MCP server '{}': {}", name, e);

@@ -10,6 +10,7 @@ pub mod config;
 pub mod config_edit;
 pub mod conversation;
 pub mod file_processor;
+pub mod google_mcp;
 pub mod home;
 pub mod langsmith;
 pub mod learning;

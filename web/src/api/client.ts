@@ -153,6 +153,9 @@ export const api = {
 
   // ── settings & soul ─────────────────────────────────────────────────────
   getSettings: () => get<Settings>('/settings'),
+  /** One tap. Opens Google's authorize URL. Not a setup-wizard step. */
+  startGoogle: () =>
+    request<{ service: 'Google'; authorizeUrl: string }>('/connectors/google', { method: 'POST' }),
   patchSettings: (patch: SettingsPatch) =>
     request<SettingsPatchResult>('/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   getSoul: (name: SoulName) => get<SoulFile>(`/soul?name=${encodeURIComponent(name)}`),

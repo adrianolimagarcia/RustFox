@@ -181,6 +181,23 @@ function SettingsPage() {
           </section>
 
           <section className="section">
+            <h2 className="section-title">Google</h2>
+            <div className="card">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => {
+                  void api.startGoogle().then((res) => {
+                    window.location.href = res.authorizeUrl
+                  })
+                }}
+              >
+                Google
+              </button>
+            </div>
+          </section>
+
+          <section className="section">
             <h2 className="section-title">{t('settings.maskedTitle')}</h2>
             <div className="card">
               <SecretRow k={t('settings.telegramBotToken')} v={masked?.telegramBotToken ?? ''} />
