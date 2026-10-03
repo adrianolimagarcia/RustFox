@@ -94,7 +94,7 @@
   .field-row .field { flex: 1; }
   label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 0.4rem; color: #cbd5e0; }
   label .hint { font-weight: 400; color: #718096; margin-left: 0.4rem; }
-  input[type=text], input[type=password], input[type=number], textarea {
+  input[type=text], input[type=password], input[type=number], textarea, select {
     width: 100%;
     background: #0f1117;
     border: 1px solid #2d3748;
@@ -105,7 +105,7 @@
     font-family: inherit;
     transition: border-color 0.2s;
   }
-  input[type=text]:focus, input[type=password]:focus, input[type=number]:focus, textarea:focus {
+  input[type=text]:focus, input[type=password]:focus, input[type=number]:focus, textarea:focus, select:focus {
     outline: none;
     border-color: #f6851b;
   }
@@ -477,10 +477,6 @@
     <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:25%"></div></div>
   </div>
   <div class="global-row">
-    <label class="global-toggle" for="show-all-toggle">
-      <input type="checkbox" id="show-all-toggle" onchange="toggleShowAll()">
-      <span>⚙️ Show all settings</span>
-    </label>
     <div class="existing-banner" id="existing-banner" style="display:none">
       <strong>Editing existing configuration</strong> — pre-loaded from <code>config.toml</code>.
     </div>
@@ -493,280 +489,28 @@
 </div>
 
 <!-- OAuth Setup Modal -->
-<div class="modal-overlay" id="oauth-modal" onclick="closeOAuthModal(event)">
-  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="oauth-modal-title">
-    <button class="modal-close" onclick="closeOAuthModal()" aria-label="Close">&#x2715;</button>
-    <h3 id="oauth-modal-title">Google Workspace — OAuth Setup</h3>
-    <p class="modal-subtitle">Follow these 4 steps to generate your refresh token. You only need to do this once.</p>
-    <ol class="oauth-steps">
-      <li class="oauth-step">
-        <div class="oauth-step-num">1</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Enable APIs in Google Cloud Console</div>
-          <div class="oauth-step-desc">
-            Open <a href="https://console.cloud.google.com/apis/library" target="_blank" rel="noopener">console.cloud.google.com/apis/library</a>,
-            create or select a project, then enable all six APIs:<br>
-            <strong>Google Drive API, Gmail API, Google Calendar API, Google Docs API, Google Sheets API, Google Slides API.</strong>
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">2</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Configure OAuth Consent Screen &amp; Credentials</div>
-          <div class="oauth-step-desc">
-            Go to <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">APIs &amp; Services → Credentials</a>.<br>
-            &bull; <em>OAuth consent screen</em> → External → add your Google account as a <strong>Test user</strong>.<br>
-            &bull; <em>+ Create Credentials</em> → <strong>OAuth Client ID</strong> → Application type: <strong>Web application</strong>.<br>
-            &bull; Under <em>Authorised redirect URIs</em> add exactly:<br>
-            <code style="font-size:0.72rem">https://developers.google.com/oauthplayground</code><br>
-            Save and copy your <strong>Client ID</strong> and <strong>Client Secret</strong>.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">3</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Authorise Scopes in OAuth Playground</div>
-          <div class="oauth-step-desc">
-            Open <a href="https://developers.google.com/oauthplayground" target="_blank" rel="noopener">developers.google.com/oauthplayground</a>.<br>
-            &bull; Click the <strong>&#x2699; gear icon</strong> (top-right) → tick <em>"Use your own OAuth credentials"</em>
-            → paste your <strong>Client ID</strong> and <strong>Client Secret</strong>.<br>
-            &bull; In the scope input, paste each scope below and click <strong>Add to scopes</strong>, then click <strong>Authorise APIs</strong>:
-            <ul class="scope-list">
-              <li>https://www.googleapis.com/auth/drive</li>
-              <li>https://www.googleapis.com/auth/gmail.modify</li>
-              <li>https://www.googleapis.com/auth/calendar</li>
-              <li>https://www.googleapis.com/auth/documents</li>
-              <li>https://www.googleapis.com/auth/spreadsheets</li>
-              <li>https://www.googleapis.com/auth/presentations</li>
-            </ul>
-            Sign in with the Google account you added as a test user.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">4</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Exchange Code &amp; Copy the Refresh Token</div>
-          <div class="oauth-step-desc">
-            After authorising, click <strong>"Exchange authorization code for tokens"</strong>.<br>
-            Copy the value of <strong>Refresh token</strong> and paste it into the
-            <code>GOOGLE_WORKSPACE_REFRESH_TOKEN</code> field below.
-          </div>
-        </div>
-      </li>
-    </ol>
-    <div class="oauth-warning">
-      <strong>Missing even one scope causes 403 errors.</strong>
-      If you see "insufficient authentication scopes", repeat from Step 3 with all six scopes included and generate a new refresh token.
-    </div>
-  </div>
-</div>
-
-<!-- Threads API Setup Modal -->
-<div class="modal-overlay" id="threads-modal" onclick="closeThreadsModal(event)">
-  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="threads-modal-title">
-    <button class="modal-close" onclick="closeThreadsModal()" aria-label="Close">&#x2715;</button>
-    <h3 id="threads-modal-title">Meta Threads — Access Token Setup</h3>
-    <p class="modal-subtitle">Follow these 4 steps to get your long-lived access token. You only need to do this once.</p>
-    <ol class="oauth-steps">
-      <li class="oauth-step">
-        <div class="oauth-step-num">1</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Create a Meta Developer App</div>
-          <div class="oauth-step-desc">
-            Go to <a href="https://developers.facebook.com/apps" target="_blank" rel="noopener">developers.facebook.com/apps</a>
-            and click <strong>Create App</strong>.<br>
-            Choose the <strong>Business</strong> app type, give it a name, and complete the creation flow.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">2</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Add the Threads API Product</div>
-          <div class="oauth-step-desc">
-            In your app dashboard, click <strong>Add Product</strong> and find <strong>Threads API</strong>.<br>
-            Click <strong>Set Up</strong> to add it to your app.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">3</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Configure Permissions</div>
-          <div class="oauth-step-desc">
-            Under <strong>Threads API → Permissions</strong>, request all four permissions:
-            <ul class="scope-list">
-              <li>threads_basic</li>
-              <li>threads_content_publish</li>
-              <li>threads_manage_replies</li>
-              <li>threads_read_replies</li>
-            </ul>
-            Add your Instagram/Threads account as a <strong>Test User</strong> under
-            <strong>App Roles → Roles</strong> so you can generate a token before app review.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">4</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Generate a Long-Lived Access Token</div>
-          <div class="oauth-step-desc">
-            Under <strong>Threads API → Access Tokens</strong>, click <strong>Generate Token</strong>
-            for your test user account.<br>
-            Copy the token — it is valid for approximately <strong>60 days</strong>.<br>
-            Paste it into the <code>THREADS_ACCESS_TOKEN</code> field below.<br>
-            To refresh it before expiry, use the
-            <a href="https://developers.facebook.com/tools/explorer/" target="_blank" rel="noopener">Graph API Explorer</a>
-            or call the token-refresh endpoint documented in the Threads API docs.
-          </div>
-        </div>
-      </li>
-    </ol>
-    <div class="oauth-warning">
-      <strong>Missing permissions cause publishing errors.</strong>
-      If you see "permissions error" when posting, ensure all four permissions above are approved for your test user and regenerate the token.
-    </div>
-  </div>
-</div>
-
-<!-- Notion MCP Setup Modal -->
-<div class="modal-overlay" id="notion-modal" onclick="closeNotionModal(event)">
-  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="notion-modal-title">
-    <button class="modal-close" onclick="closeNotionModal()" aria-label="Close">&#x2715;</button>
-    <h3 id="notion-modal-title">Notion — OAuth 2.0 Setup</h3>
-    <p class="modal-subtitle">
-      Notion's official MCP server at <code>https://mcp.notion.com/mcp</code> requires an
-      <strong>OAuth 2.0 access token</strong>, not a static integration token.
-      Click <strong>Connect with Notion</strong> below to authorize automatically —
-      no manual token copying needed.
-    </p>
-    <ol class="oauth-steps">
-      <li class="oauth-step">
-        <div class="oauth-step-num">1</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Click "Connect with Notion"</div>
-          <div class="oauth-step-desc">
-            In the MCP Tools step, enable the <strong>notion</strong> server, then click the
-            <strong>🔐 Connect with Notion</strong> button that appears below it.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">2</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Authorize in the popup</div>
-          <div class="oauth-step-desc">
-            A Notion authorization page opens in a popup window.<br>
-            Sign in with your Notion account and click <strong>Allow access</strong>.
-          </div>
-        </div>
-      </li>
-      <li class="oauth-step">
-        <div class="oauth-step-num">3</div>
-        <div class="oauth-step-body">
-          <div class="oauth-step-title">Token is filled automatically</div>
-          <div class="oauth-step-desc">
-            The popup closes and the <code>NOTION_TOKEN</code> field is populated with your
-            OAuth access token.  Save the config and you're done.
-          </div>
-        </div>
-      </li>
-    </ol>
-    <div class="oauth-warning">
-      <strong>HTTP transport — no local server needed.</strong>
-      RustFox passes the OAuth token as a <code>Bearer</code> header to
-      <code>https://mcp.notion.com/mcp</code>.
-      The old <code>@notionhq/notion-mcp-server</code> npm package is deprecated.
-    </div>
-  </div>
-</div>
-
 <script>
-// ── MCP Catalog ────────────────────────────────────────────────────────────────
-const MCP_CATALOG = [
-  { name:'playwright',       category:'Browser & Web',      desc:'Browser automation & web scraping',           runner:'npx', args:['-y','@playwright/mcp'],                          envVars:[],                                           link:'https://www.npmjs.com/package/@playwright/mcp' },
-  { name:'brave-search',     category:'Browser & Web',      desc:'Real-time web search via Brave',               runner:'npx', args:['-y','@brave/brave-search-mcp-server'],          envVars:['BRAVE_API_KEY'],                            link:'https://www.npmjs.com/package/@brave/brave-search-mcp-server' },
-  { name:'firecrawl',        category:'Browser & Web',      desc:'URL to clean Markdown scraping',               runner:'npx', args:['-y','firecrawl-mcp'],                            envVars:['FIRECRAWL_API_KEY'],                        link:'https://www.npmjs.com/package/firecrawl-mcp' },
-  { name:'fetch',            category:'Browser & Web',      desc:'Lightweight page fetching',                    runner:'uvx', args:['mcp-server-fetch'],                              envVars:[],                                           link:'https://pypi.org/project/mcp-server-fetch' },
-  { name:'google-workspace', category:'Productivity',       desc:'Gmail, Calendar, Drive, Docs',                 runner:'uvx', args:['--from','google-workspace-mcp','google-workspace-worker'], envVars:['GOOGLE_WORKSPACE_CLIENT_ID','GOOGLE_WORKSPACE_CLIENT_SECRET','GOOGLE_WORKSPACE_REFRESH_TOKEN','GOOGLE_WORKSPACE_ENABLED_CAPABILITIES'], envDefaults:{'GOOGLE_WORKSPACE_ENABLED_CAPABILITIES':'["drive","docs","gmail","calendar","sheets","slides"]'}, setupGuide:'__OAUTH_GUIDE_BUTTON__', link:'https://pypi.org/project/google-workspace-mcp' },
-  { name:'notion',           category:'Productivity',       desc:'Read/write Notion workspace (official HTTP MCP)', url:'https://mcp.notion.com/mcp', authTokenVar:'NOTION_TOKEN', setupGuide:'__NOTION_OAUTH_BUTTON__', link:'https://developers.notion.com/guides/mcp/mcp' },
-  { name:'obsidian',         category:'Productivity',       desc:'Local Obsidian vault access',                  runner:'npx', args:['-y','obsidian-mcp'],                             envVars:[],                                           link:'https://www.npmjs.com/package/obsidian-mcp' },
-  { name:'slack',            category:'Communication',      desc:'Read channels, post Slack messages',           runner:'npx', args:['-y','@modelcontextprotocol/server-slack'],         envVars:['SLACK_BOT_TOKEN'],                          link:'https://www.npmjs.com/package/@modelcontextprotocol/server-slack' },
-  { name:'discord',          category:'Communication',      desc:'Send and read Discord messages',               runner:'npx', args:['-y','discord-mcp'],                              envVars:['DISCORD_TOKEN'],                            link:'https://www.npmjs.com/package/discord-mcp' },
-  { name:'github',           category:'Developer Tools',    desc:'Issues, PRs, repository management',           runner:'npx', args:['-y','@modelcontextprotocol/server-github'],         envVars:['GITHUB_TOKEN'],                             link:'https://www.npmjs.com/package/@modelcontextprotocol/server-github' },
-  { name:'git',              category:'Developer Tools',    desc:'Local git repository operations',              runner:'uvx', args:['mcp-server-git'],                                envVars:[],                                           link:'https://pypi.org/project/mcp-server-git' },
-  { name:'filesystem',       category:'Developer Tools',    desc:'Expanded filesystem access beyond sandbox',    runner:'npx', args:['-y','@modelcontextprotocol/server-filesystem'],  envVars:[],                                           link:'https://www.npmjs.com/package/@modelcontextprotocol/server-filesystem' },
-  { name:'memory',           category:'Knowledge & Data',   desc:'Persistent cross-session memory graph',        runner:'npx', args:['-y','@modelcontextprotocol/server-memory'],         envVars:[],                                           link:'https://www.npmjs.com/package/@modelcontextprotocol/server-memory' },
-  { name:'tavily',           category:'Knowledge & Data',   desc:'AI-optimised semantic web search',             runner:'npx', args:['-y','tavily-mcp'],                               envVars:['TAVILY_API_KEY'],                           link:'https://www.npmjs.com/package/tavily-mcp' },
-  { name:'context7',         category:'Knowledge & Data',   desc:'Live library documentation fetching',          runner:'npx', args:['-y','@upstash/context7-mcp'],                    envVars:[],                                           link:'https://www.npmjs.com/package/@upstash/context7-mcp' },
-  { name:'open-meteo',       category:'Weather & Location', desc:'Free weather forecasts, no API key needed',   runner:'npx', args:['-y','-p','open-meteo-mcp-server','open-meteo-mcp-server'], envVars:[],                                      link:'https://www.npmjs.com/package/open-meteo-mcp-server' },
-  { name:'openweathermap',   category:'Weather & Location', desc:'Current weather and forecasts',                runner:'npx', args:['-y','mcp-openweathermap'],                         envVars:['OPENWEATHERMAP_API_KEY'],                   link:'https://www.npmjs.com/package/mcp-openweathermap' },
-  { name:'threads',          category:'Social Media',       desc:'Publish and manage Meta Threads posts',        runner:'npx', args:['-y','threads-mcp-server'],                       envVars:['THREADS_ACCESS_TOKEN'], setupGuide:'__THREADS_GUIDE_BUTTON__', link:'https://github.com/baguskto/threads-mcp' },
-];
-
-// ── State ──────────────────────────────────────────────────────────────────────
-const DEFAULT_PROMPT = 'You are a helpful AI assistant with access to tools. Use the available tools to help the user with their tasks. When using file or terminal tools, operate only within the allowed sandbox directory. Be concise and helpful.';
-
 const state = {
-  // Step 1 — Bot & LLM Setup
+  provider: 'openrouter',
   telegram_token: '',
-  allowed_user_ids: '',
-  // Additional bots collected via "Add another bot" (§7.7).
-  // Each: { id, bot_token, allowed_user_id, persona }
-  extra_bots: [],
-  // On-disk [[bots]] ids from load-config (full save appends only new ids).
-  existing_bot_ids: [],
   openrouter_key: '',
-  model: 'moonshotai/kimi-k2.6',
-  max_tokens: '4096',
-  system_prompt: DEFAULT_PROMPT,
-  supports_vision: false,
-  base_url: 'https://openrouter.ai/api/v1',
-
-  // Step 2 — Location & Storage
-  location: 'Hong Kong',
-  db_path: 'rustfox.db',
-  skills_dir: '',
-  agents_dir: '',
-  home_dir: '',
-  ocr_model_dir: '',
-  query_rewriter_enabled: false,
-  max_iterations: 25,
-  empty_response_retry_limit: 3,
-
-  // Step 3 — Integrations
-  mcp_selections: {},
-  custom_mcp_servers: [],
-  langsmith_key: '',
-  langsmith_project: 'rustfox',
-  embedding_key: '',
-  embedding_base_url: 'https://openrouter.ai/api/v1',
-  embedding_model: 'qwen/qwen3-embedding-8b',
-  embedding_dimensions: 1536,
-  learning_skill_extraction_enabled: true,
-  learning_skill_extraction_threshold: 5,
-
-  // internal
-  _loaded: false,
+  ollama_model: '',
+  system_prompt: '',
+  ollama_running: false,
+  ollama_models: [],
 };
 
-// ── Step navigation ────────────────────────────────────────────────────────────
-// 4 wizard steps + 1 success page.  Step 5 is the "done" page, not a wizard step.
-const WIZARD_STEPS = 4;
-const TOTAL_STEPS  = 5;
-let currentStep    = 1;
+const WIZARD_STEPS = 2;
+const TOTAL_STEPS = 3;
+let currentStep = 1;
 
 function showStep(n) {
   document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
-  const el = document.getElementById('step-' + n);
+  const el = document.getElementById(n === TOTAL_STEPS ? 'step-done' : 'step-' + n);
   if (el) el.classList.add('active');
   currentStep = n;
   const btnNext = document.getElementById('btn-next');
   const btnBack = document.getElementById('btn-back');
-
   if (n === TOTAL_STEPS) {
     document.getElementById('progress-fill').style.width = '100%';
     document.getElementById('progress-label').textContent = 'Setup complete!';
@@ -774,19 +518,14 @@ function showStep(n) {
     btnNext.style.display = 'none';
     return;
   }
-
-  const pct = (n / WIZARD_STEPS * 100).toFixed(1);
-  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('progress-fill').style.width = ((n / WIZARD_STEPS) * 100) + '%';
   document.getElementById('progress-label').textContent = 'Step ' + n + ' of ' + WIZARD_STEPS;
   btnBack.style.display = n > 1 ? 'inline-block' : 'none';
   btnNext.style.display = 'inline-block';
   btnNext.disabled = false;
-  if (n === WIZARD_STEPS) btnNext.textContent = 'Save config.toml';
-  else btnNext.textContent = 'Continue →';
-
-  // Render preview when entering the review step
+  btnNext.textContent = n === WIZARD_STEPS ? 'Save config.toml' : 'Continue →';
   if (n === WIZARD_STEPS) {
-    collectAll();
+    collectStep();
     renderSummary();
     renderPreview();
   }
@@ -795,42 +534,18 @@ function showStep(n) {
 function prevStep() { if (currentStep > 1) showStep(currentStep - 1); }
 
 function nextStep() {
-  if (!validateStep(currentStep)) return;
-  collectStep(currentStep);
+  if (currentStep === 1 && !validateStep()) return;
+  collectStep();
   if (currentStep === WIZARD_STEPS) { saveConfig(); return; }
   showStep(currentStep + 1);
-}
-
-// ── Advanced section toggles ──────────────────────────────────────────────────
-function toggleAdvanced(headerEl) {
-  const section = headerEl.parentElement;
-  section.classList.toggle('collapsed');
-}
-
-function toggleShowAll() {
-  const showAll = document.getElementById('show-all-toggle').checked;
-  document.querySelectorAll('.advanced-section').forEach(s => {
-    if (showAll) s.classList.remove('collapsed');
-    else s.classList.add('collapsed');
-  });
-}
-
-// ── Validation ─────────────────────────────────────────────────────────────────
-function validateStep(n) {
-  let ok = true;
-  if (n === 1) {
-    ok = requireField('f-telegram-token') & ok;
-    ok = requireField('f-allowed-ids')    & ok;
-    ok = requireField('f-openrouter-key') & ok;
-  }
-  return !!ok;
 }
 
 function requireField(id) {
   const el = document.getElementById(id);
   if (!el) return true;
   const errEl = el.parentElement.querySelector('.error-msg');
-  if (!el.value.trim()) {
+  const value = (el.value || '').trim();
+  if (!value) {
     el.classList.add('error');
     if (errEl) errEl.classList.add('visible');
     return false;
@@ -840,7 +555,6 @@ function requireField(id) {
   return true;
 }
 
-// Clear the error state on the field the user is actively editing
 function clearFieldError(el) {
   if (!el) return;
   el.classList.remove('error');
@@ -848,119 +562,37 @@ function clearFieldError(el) {
   if (errEl) errEl.classList.remove('visible');
 }
 
-// ── Collect form values ────────────────────────────────────────────────────────
-function collectStep(n) {
-  if (n === 1) {
-    state.telegram_token   = (document.getElementById('f-telegram-token')?.value || '').trim();
-    state.allowed_user_ids = (document.getElementById('f-allowed-ids')?.value    || '').trim();
-    state.openrouter_key   = (document.getElementById('f-openrouter-key')?.value || '').trim();
-    state.model            = (document.getElementById('f-model')?.value          || state.model).trim();
-    state.max_tokens       = (document.getElementById('f-max-tokens')?.value     || state.max_tokens).toString().trim() || '4096';
-    state.system_prompt    = document.getElementById('f-system-prompt')?.value   || state.system_prompt;
-    state.supports_vision  = !!document.getElementById('f-supports-vision')?.checked;
-    state.base_url         = (document.getElementById('f-base-url')?.value       || state.base_url).trim() || 'https://openrouter.ai/api/v1';
-    collectExtraBotsFromDom();
+function validateStep() {
+  let ok = requireField('f-telegram-token') & requireField('f-system-prompt');
+  if (state.provider === 'ollama') {
+    if (!state.ollama_running) ok = 0;
+    ok = requireField('f-ollama-model') & ok;
+  } else {
+    ok = requireField('f-openrouter-key') & ok;
   }
-  if (n === 2) {
-    state.location                   = (document.getElementById('f-location')?.value              || state.location).trim();
-    state.db_path                    = (document.getElementById('f-db-path')?.value               || state.db_path).trim()     || 'rustfox.db';
-    state.skills_dir                 = (document.getElementById('f-skills-dir')?.value            || '').trim();
-    state.agents_dir                 = (document.getElementById('f-agents-dir')?.value            || '').trim();
-    state.home_dir                   = (document.getElementById('f-home-dir')?.value              || '').trim();
-    state.ocr_model_dir              = (document.getElementById('f-ocr-model-dir')?.value         || '').trim();
-    state.query_rewriter_enabled     = !!document.getElementById('f-query-rewriter')?.checked;
-    state.max_iterations             = parseInt(document.getElementById('f-max-iterations')?.value || state.max_iterations, 10) || 25;
-    state.empty_response_retry_limit = parseInt(document.getElementById('f-empty-retry')?.value     || state.empty_response_retry_limit, 10) || 3;
-  }
-  if (n === 3) {
-    state.langsmith_key                       = (document.getElementById('f-langsmith-key')?.value       || '').trim();
-    state.langsmith_project                   = (document.getElementById('f-langsmith-project')?.value   || 'rustfox').trim() || 'rustfox';
-    state.embedding_key                       = (document.getElementById('f-embedding-key')?.value       || '').trim();
-    state.embedding_base_url                  = (document.getElementById('f-embedding-base-url')?.value  || state.embedding_base_url).trim();
-    state.embedding_model                     = (document.getElementById('f-embedding-model')?.value     || state.embedding_model).trim();
-    state.embedding_dimensions                = parseInt(document.getElementById('f-embedding-dimensions')?.value || state.embedding_dimensions, 10) || 1536;
-    state.learning_skill_extraction_enabled   = !!document.getElementById('f-learning-extraction')?.checked;
-    state.learning_skill_extraction_threshold = parseInt(document.getElementById('f-learning-threshold')?.value || state.learning_skill_extraction_threshold, 10) || 5;
-  }
+  return !!ok;
 }
 
-function collectAll() {
-  // Pull values for every step so the review/TOML view reflects the current form.
-  for (let s = 1; s <= WIZARD_STEPS; s++) {
-    if (s === 4) continue; // Step 4 has no inputs of its own
-    try { collectStep(s); } catch (_) { /* fields may not exist for this view */ }
-  }
+function collectStep() {
+  const ollama = document.getElementById('f-provider-ollama');
+  state.provider = ollama && ollama.checked ? 'ollama' : 'openrouter';
+  state.telegram_token = (document.getElementById('f-telegram-token')?.value || '').trim();
+  state.openrouter_key = (document.getElementById('f-openrouter-key')?.value || '').trim();
+  state.ollama_model = (document.getElementById('f-ollama-model')?.value || '').trim();
+  state.system_prompt = (document.getElementById('f-system-prompt')?.value || '').trim();
 }
 
-// ── Extra bots (§7.7 multi-bot wizard) ─────────────────────────────────────────
-function addExtraBotRow(prefill) {
-  const b = prefill || { id: '', bot_token: '', allowed_user_id: '', persona: '' };
-  state.extra_bots.push(b);
-  renderExtraBots();
-}
-
-function removeExtraBotRow(i) {
-  state.extra_bots.splice(i, 1);
-  renderExtraBots();
-}
-
-function collectExtraBotsFromDom() {
-  const rows = document.querySelectorAll('#extra-bots-list .extra-bot-row');
-  const out = [];
-  rows.forEach((row) => {
-    const id = (row.querySelector('.eb-id')?.value || '').trim();
-    const bot_token = (row.querySelector('.eb-token')?.value || '').trim();
-    const allowed_user_id = (row.querySelector('.eb-uid')?.value || '').trim();
-    const persona = (row.querySelector('.eb-persona')?.value || '').trim() || id;
-    if (id || bot_token) {
-      out.push({ id, bot_token, allowed_user_id, persona });
-    }
-  });
-  state.extra_bots = out;
-}
-
-function renderExtraBots() {
-  const el = document.getElementById('extra-bots-list');
-  if (!el) return;
-  if (!state.extra_bots.length) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = state.extra_bots.map((b, i) => `
-    <div class="extra-bot-row" data-i="${i}" style="border:1px solid #2d3748;border-radius:8px;padding:0.75rem;margin-bottom:0.6rem;background:#151a27">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
-        <strong style="font-size:0.85rem;color:#90cdf4">Extra bot #${i + 1}</strong>
-        <button type="button" class="btn-guide" onclick="removeExtraBotRow(${i})">Remove</button>
-      </div>
-      <div class="field">
-        <label>Bot id</label>
-        <input class="eb-id" type="text" placeholder="researcher" value="${escHtml(b.id || '')}" oninput="clearFieldError(this)">
-      </div>
-      <div class="field">
-        <label>BotFather token</label>
-        <input class="eb-token" type="password" placeholder="456:BB..." value="${escHtml(b.bot_token || '')}" oninput="clearFieldError(this)">
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label>Allowed user id</label>
-          <input class="eb-uid" type="text" placeholder="same as primary" value="${escHtml(b.allowed_user_id || '')}">
-        </div>
-        <div class="field">
-          <label>Persona <span class="hint">— default = id</span></label>
-          <input class="eb-persona" type="text" placeholder="researcher" value="${escHtml(b.persona || '')}">
-        </div>
-      </div>
-    </div>`).join('');
-}
-
-// ── TOML generation ────────────────────────────────────────────────────────────
-function esc(s) {
-  // Escapes for TOML string values only (backslash and double-quote)
-  return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+function thinBody() {
+  return {
+    provider: state.provider,
+    openrouter_api_key: state.provider === 'openrouter' ? state.openrouter_key : '',
+    ollama_model: state.provider === 'ollama' ? state.ollama_model : '',
+    bot_token: state.telegram_token,
+    system_prompt: state.system_prompt,
+  };
 }
 
 function escHtml(s) {
-  // Escapes for HTML attributes and text content
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -968,282 +600,144 @@ function escHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
-function generateToml() {
-  const ids = state.allowed_user_ids.split(/[\s,]+/).filter(Boolean).join(', ');
-  const sysprompt = state.system_prompt.replace(/"""/g, '\\"\\"\\"');
-
-  let toml =
-    '# RustFox Configuration\n' +
-    '# Generated by setup wizard\n' +
-    '\n' +
-    '[telegram]\n' +
-    'bot_token = "' + esc(state.telegram_token) + '"\n' +
-    'allowed_user_ids = [' + ids + ']\n' +
-    '\n' +
-    '[openrouter]\n' +
-    'api_key = "' + esc(state.openrouter_key) + '"\n' +
-    'model = "' + esc(state.model) + '"\n' +
-    'base_url = "' + esc(state.base_url) + '"\n' +
-    'max_tokens = ' + (parseInt(state.max_tokens, 10) || 4096) + '\n' +
-    'supports_vision = ' + (state.supports_vision ? 'true' : 'false') + '\n' +
-    'system_prompt = """' + sysprompt + '"""\n' +
-    '\n' +
-    '[memory]\n' +
-    'database_path = "' + esc(state.db_path) + '"\n' +
-    'query_rewriter_enabled = ' + (state.query_rewriter_enabled ? 'true' : 'false') + '\n' +
-    '\n' +
-    (state.skills_dir ? '[skills]\ndirectory = "' + esc(state.skills_dir) + '"\n\n' : '') +
-    (state.agents_dir ? '[agents]\ndirectory = "' + esc(state.agents_dir) + '"\n\n' : '');
-
-  // [general] — emit commented hints for unset fields so the user knows they exist
-  const generalLines = [];
-  if (state.location) generalLines.push('location = "' + esc(state.location) + '"');
-  if (state.home_dir) generalLines.push('home = "' + esc(state.home_dir) + '"');
-  toml += '[general]\n';
-  if (generalLines.length) toml += generalLines.join('\n') + '\n';
-  else                     toml += '# location = "Your City, Country"\n# home = "/path/to/.rustfox"\n';
-  toml += '\n';
-
-  // [agent] — always emit so users can see the loop limits
-  toml += '[agent]\n';
-  toml += 'max_iterations = ' + (parseInt(state.max_iterations, 10) || 25) + '\n';
-  toml += 'empty_response_retry_limit = ' + (parseInt(state.empty_response_retry_limit, 10) || 3) + '\n';
-  toml += '\n';
-
-  // [embedding] — only emit if user provided an API key
-  if (state.embedding_key) {
-    toml += '[embedding]\n';
-    toml += 'api_key = "' + esc(state.embedding_key) + '"\n';
-    toml += 'base_url = "' + esc(state.embedding_base_url || 'https://openrouter.ai/api/v1') + '"\n';
-    toml += 'model = "' + esc(state.embedding_model || 'qwen/qwen3-embedding-8b') + '"\n';
-    toml += 'dimensions = ' + (parseInt(state.embedding_dimensions, 10) || 1536) + '\n';
-    toml += '\n';
-  }
-
-  // [langsmith] — only emit if user provided an API key
-  if (state.langsmith_key) {
-    toml += '[langsmith]\n';
-    toml += 'api_key = "' + esc(state.langsmith_key) + '"\n';
-    toml += 'project = "' + esc(state.langsmith_project || 'rustfox') + '"\n';
-    toml += 'base_url = "https://api.smith.langchain.com"\n';
-    toml += '\n';
-  }
-
-  // [ocr] — only emit if user overrode the default
-  if (state.ocr_model_dir) {
-    toml += '[ocr]\n';
-    toml += 'model_dir = "' + esc(state.ocr_model_dir) + '"\n';
-    toml += '\n';
-  }
-
-  // [learning] — only emit if the user explicitly enabled extraction
-  if (state.learning_skill_extraction_enabled) {
-    toml += '[learning]\n';
-    toml += 'skill_extraction_enabled = true\n';
-    toml += 'skill_extraction_threshold = ' + (parseInt(state.learning_skill_extraction_threshold, 10) || 5) + '\n';
-    toml += '\n';
-  }
-
-  // [[mcp_servers]] — preserved verbatim from the original wizard
-  for (const [name, sel] of Object.entries(state.mcp_selections)) {
-    if (!sel.selected) continue;
-    const tool = MCP_CATALOG.find(t => t.name === name);
-    if (!tool) continue;
-    toml += '[[mcp_servers]]\n';
-    toml += 'name = "' + name + '"\n';
-    if (tool.url) {
-      // HTTP-based MCP server (url + optional auth_token + optional OAuth refresh fields)
-      toml += 'url = "' + tool.url + '"\n';
-      const token = tool.authTokenVar && sel.env && sel.env[tool.authTokenVar];
-      if (token) {
-        toml += 'auth_token = "' + esc(token) + '"\n';
-      }
-      if (sel.refresh_token) {
-        toml += 'refresh_token = "' + esc(sel.refresh_token) + '"\n';
-      }
-      if (sel.expires_in) {
-        // Compute absolute expiry timestamp (now + expires_in seconds)
-        const expiresAt = Math.floor(Date.now() / 1000) + sel.expires_in;
-        toml += 'token_expires_at = ' + expiresAt + '\n';
-      }
-      if (sel.token_endpoint) {
-        toml += 'token_endpoint = "' + esc(sel.token_endpoint) + '"\n';
-      }
-      if (sel.oauth_client_id) {
-        toml += 'oauth_client_id = "' + esc(sel.oauth_client_id) + '"\n';
-      }
-      if (sel.oauth_client_secret) {
-        toml += 'oauth_client_secret = "' + esc(sel.oauth_client_secret) + '"\n';
-      }
-    } else {
-      // stdio-based MCP server (command + args + optional env)
-      const args = tool.args.map(a => '"' + esc(a) + '"').join(', ');
-      toml += 'command = "' + tool.runner + '"\n';
-      toml += 'args = [' + args + ']\n';
-      const envVars = tool.envVars || [];
-      if (envVars.length > 0) {
-        toml += '[mcp_servers.env]\n';
-        for (const k of envVars) {
-          toml += k + ' = "' + esc((sel.env && sel.env[k]) || (tool.envDefaults && tool.envDefaults[k]) || '') + '"\n';
-        }
-      }
-    }
-    toml += '\n';
-  }
-
-  for (const s of state.custom_mcp_servers) {
-    const args = s.args.map(a => '"' + esc(a) + '"').join(', ');
-    toml += '[[mcp_servers]]\n';
-    toml += 'name = "' + esc(s.name) + '"\n';
-    toml += 'command = "' + esc(s.command) + '"\n';
-    toml += 'args = [' + args + ']\n';
-    const envEntries = Object.entries(s.env).filter(([k]) => k.trim());
-    if (envEntries.length > 0) {
-      toml += '[mcp_servers.env]\n';
-      for (const [k, v] of envEntries) {
-        toml += k + ' = "' + esc(v) + '"\n';
-      }
-    }
-    toml += '\n';
-  }
-
-  return toml;
+function maskSecret(s) {
+  if (!s) return '';
+  if (s.length <= 8) return '••••';
+  return s.slice(0, 4) + '••••' + s.slice(-4);
 }
 
-function renderPreview() {
-  const pre = document.getElementById('config-preview');
-  if (pre) pre.textContent = generateToml();
+function useOpenRouter() {
+  document.getElementById('f-provider-openrouter').checked = true;
+  onProviderChange();
+}
+
+async function onProviderChange() {
+  const ollama = document.getElementById('f-provider-ollama').checked;
+  state.provider = ollama ? 'ollama' : 'openrouter';
+  document.getElementById('openrouter-fields').style.display = ollama ? 'none' : 'block';
+  document.getElementById('ollama-fields').style.display = ollama ? 'block' : 'none';
+  if (ollama) await loadOllama();
+}
+
+async function loadOllama() {
+  const down = document.getElementById('ollama-down');
+  const localWrap = document.getElementById('ollama-local-wrap');
+  const libraryWrap = document.getElementById('ollama-library-wrap');
+  down.style.display = 'none';
+  localWrap.style.display = 'none';
+  libraryWrap.style.display = 'none';
+  try {
+    const res = await fetch('/api/ollama/local');
+    const data = await res.json();
+    state.ollama_running = !!data.running;
+    state.ollama_models = data.models || [];
+    if (!data.running) {
+      down.textContent = data.message || 'Ollama is not running.';
+      down.style.display = 'block';
+      return;
+    }
+    const sel = document.getElementById('f-ollama-model');
+    const previous = sel.value;
+    sel.innerHTML = state.ollama_models.map(name =>
+      `<option value="${escHtml(name)}">${escHtml(name)}</option>`
+    ).join('');
+    if (previous && state.ollama_models.indexOf(previous) !== -1) sel.value = previous;
+    state.ollama_model = sel.value || '';
+    localWrap.style.display = 'block';
+    const lib = await fetch('/api/ollama/library');
+    const libData = await lib.json();
+    const have = new Set(state.ollama_models.map(n => String(n).split(':')[0]));
+    const choices = (libData.models || []).filter(n => !have.has(n));
+    const libSel = document.getElementById('f-ollama-library');
+    libSel.innerHTML = choices.map(name =>
+      `<option value="${escHtml(name)}">${escHtml(name)}</option>`
+    ).join('');
+  } catch (e) {
+    state.ollama_running = false;
+    down.textContent = 'Ollama is not running.';
+    down.style.display = 'block';
+  }
+}
+
+function showLibraryList() {
+  document.getElementById('ollama-library-wrap').style.display = 'block';
+}
+
+async function pullLibraryModel() {
+  const name = document.getElementById('f-ollama-library').value;
+  const status = document.getElementById('ollama-pull-status');
+  if (!name) return;
+  status.textContent = 'Pulling ' + name + '…';
+  try {
+    const res = await fetch('/api/ollama/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: name }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      status.textContent = data.error || 'Ollama is not running.';
+      return;
+    }
+    status.textContent = 'Pulled ' + name + '.';
+    await loadOllama();
+    const sel = document.getElementById('f-ollama-model');
+    const match = Array.from(sel.options).find(o => o.value === name || o.value.indexOf(name + ':') === 0);
+    if (match) sel.value = match.value;
+    state.ollama_model = sel.value;
+  } catch (e) {
+    status.textContent = 'Ollama is not running.';
+  }
 }
 
 function renderSummary() {
   const el = document.getElementById('summary');
   if (!el) return;
-
-  const val = (v, fallback) => (v && String(v).length) ? escHtml(v) : '<span class="summary-val muted">' + escHtml(fallback || '(not set)') + '</span>';
-  const row = (k, v, fallback) => `<div class="summary-row"><div class="summary-key">${escHtml(k)}</div><div class="summary-val">${val(v, fallback)}</div></div>`;
-  const section = (title, body) => `<div class="summary-section"><h3>${escHtml(title)}</h3><div class="summary-list">${body}</div></div>`;
-
-  let html = '';
-  collectExtraBotsFromDom();
-  const extraSummary = state.extra_bots.length
-    ? state.extra_bots.map((b, i) => row(
-        'Extra bot #' + (i + 1),
-        (b.id || '?') + ' / token ' + (b.bot_token ? maskSecret(b.bot_token) : '(missing)') +
-          ' / uid ' + (b.allowed_user_id || '(primary)') +
-          ' / persona ' + (b.persona || b.id || '?'),
-        null
-      )).join('')
-    : row('Extra bots', null, 'none (single-bot)');
-  html += section('Bot & LLM', [
-    row('Bot token',       state.telegram_token ? maskSecret(state.telegram_token) : null, 'missing'),
-    row('Allowed user IDs', state.allowed_user_ids || null, 'missing'),
-    extraSummary,
-    row('OpenRouter key',  state.openrouter_key ? maskSecret(state.openrouter_key) : null, 'missing'),
-    row('Model',           state.model),
-    row('Base URL',        state.base_url),
-    row('Max tokens',      state.max_tokens),
-    row('Supports vision', state.supports_vision ? 'yes' : 'no'),
-  ].join(''));
-
-  html += section('Location & Storage', [
-    row('Location',       state.location),
-
-    row('Database path',  state.db_path),
-    row('Skills dir',     state.skills_dir || '(default)'),
-    row('Agents dir',     state.agents_dir || '(default)'),
-    row('Home dir',       state.home_dir),
-    row('OCR model dir',  state.ocr_model_dir),
-    row('Query rewriting', state.query_rewriter_enabled ? 'enabled' : 'disabled'),
-    row('Max iterations', state.max_iterations),
-    row('Empty retries',  state.empty_response_retry_limit),
-  ].join(''));
-
-  const mcpCount = Object.values(state.mcp_selections).filter(s => s.selected).length + state.custom_mcp_servers.length;
-  html += section('Integrations', [
-    row('MCP servers enabled', mcpCount ? String(mcpCount) : null, 'none'),
-    row('LangSmith',  state.langsmith_key ? 'configured (key ' + maskSecret(state.langsmith_key) + ')' : null, 'not configured'),
-    row('Embedding',  state.embedding_key ? 'configured (model ' + escHtml(state.embedding_model || 'qwen/qwen3-embedding-8b') + ')' : null, 'not configured'),
-    row('Learning',   state.learning_skill_extraction_enabled ? 'skill extraction enabled' : null, 'not configured'),
-  ].join(''));
-
-  el.innerHTML = html;
+  const row = (k, v) => `<div class="summary-row"><div class="summary-key">${escHtml(k)}</div><div class="summary-val">${v}</div></div>`;
+  const provider = state.provider === 'ollama' ? 'Ollama' : 'OpenRouter';
+  const second = state.provider === 'ollama'
+    ? escHtml(state.ollama_model || '(pick a model)')
+    : escHtml(state.openrouter_key ? maskSecret(state.openrouter_key) : '(missing)');
+  el.innerHTML =
+    '<div class="summary-section"><h3>Setup</h3><div class="summary-list">' +
+    row('Provider', escHtml(provider)) +
+    row(state.provider === 'ollama' ? 'Ollama model' : 'OpenRouter key', second) +
+    row('Bot token', escHtml(state.telegram_token ? maskSecret(state.telegram_token) : '(missing)')) +
+    row('System prompt', escHtml(state.system_prompt || '(missing)')) +
+    '</div></div>';
 }
 
-function maskSecret(s) {
-  if (!s) return '';
-  const len = s.length;
-  if (len <= 8) return '••••';
-  return s.slice(0, 4) + '••••' + s.slice(-4);
+async function renderPreview() {
+  const pre = document.getElementById('config-preview');
+  if (!pre) return;
+  try {
+    const res = await fetch('/api/thin-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(thinBody()),
+    });
+    const data = await res.json();
+    pre.textContent = data.ok ? data.config : (data.error || 'Could not preview config.');
+  } catch (e) {
+    pre.textContent = 'Could not preview config.';
+  }
 }
 
-// ── Save ───────────────────────────────────────────────────────────────────────
 async function saveConfig() {
-  collectExtraBotsFromDom();
-  const config = generateToml();
   const btn = document.getElementById('btn-next');
   btn.disabled = true;
   try {
-    // Snapshot existing bot ids before save so we only append NEW bots.
-    // Server-side save-config merge-preserves untouched [[bots]] rows
-    // (tools/model/persona/allowlist) when they already exist.
-    const existingIds = new Set(state.existing_bot_ids || []);
-    try {
-      const lr = await fetch('/api/load-config');
-      if (lr.ok) {
-        const cfg = await lr.json();
-        for (const b of (cfg.bots || [])) {
-          if (b && b.id) existingIds.add(b.id);
-        }
-      }
-    } catch (_) { /* offline / first-run — treat as no existing bots */ }
-
-    const res = await fetch('/api/save-config', {
+    const res = await fetch('/api/thin-save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ config }),
+      body: JSON.stringify(thinBody()),
     });
     const data = await res.json();
     if (!data.ok) {
       btn.disabled = false;
-      alert('Server error saving config.');
+      alert(data.error || 'Server error saving config.');
       return;
     }
-
-    // Append each *new* extra bot via validate → bak → atomic (materializes
-    // [telegram] into [[bots]] on the first multi-bot add). Skip ids that
-    // already exist so we never wipe/rebuild secondary customizations.
-    const primaryUid = parseInt(String(state.allowed_user_ids).split(/[\s,]+/).filter(Boolean)[0] || '0', 10) || 0;
-    for (const b of state.extra_bots) {
-      if (!b.id || !b.bot_token) {
-        alert('Extra bot needs both id and BotFather token — skipped incomplete rows.');
-        continue;
-      }
-      if (existingIds.has(b.id)) continue; // already on disk — preserve
-      if (b.bot_token === '***') continue; // redacted existing token — never re-bind
-      const uid = parseInt(b.allowed_user_id || primaryUid, 10) || primaryUid;
-      if (!uid) {
-        alert('Extra bot `' + b.id + '` needs an allowed user id.');
-        btn.disabled = false;
-        return;
-      }
-      const addRes = await fetch('/api/add-bot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: b.id,
-          bot_token: b.bot_token,
-          allowed_user_id: uid,
-        }),
-      });
-      const addData = await addRes.json();
-      if (!addData.ok) {
-        btn.disabled = false;
-        alert('Failed to add bot `' + b.id + '`: ' + (addData.error || 'unknown error'));
-        return;
-      }
-      existingIds.add(b.id);
-    }
-
     showStep(TOTAL_STEPS);
   } catch (e) {
     btn.disabled = false;
@@ -1251,13 +745,8 @@ async function saveConfig() {
   }
 }
 
-// ── Install as background service ──────────────────────────────────────────────
 async function finishSetup() {
-  try {
-    await fetch('/api/shutdown', { method: 'POST' });
-  } catch (_) {
-    // Server may already be gone — that's fine
-  }
+  try { await fetch('/api/shutdown', { method: 'POST' }); } catch (_) {}
 }
 
 async function installService() {
@@ -1288,716 +777,100 @@ async function installService() {
   }
 }
 
-// ── MCP interactions ───────────────────────────────────────────────────────────
-function toggleTool(name, event) {
-  const cb = document.getElementById('mcp-cb-' + name);
-  if (event.target !== cb) cb.checked = !cb.checked;
-  const wrap = document.getElementById('mcp-wrap-' + name);
-  const envDiv = document.getElementById('mcp-env-' + name);
-  if (!state.mcp_selections[name]) state.mcp_selections[name] = { selected: false, env: {} };
-  state.mcp_selections[name].selected = cb.checked;
-  if (cb.checked) {
-    wrap.classList.add('selected');
-    if (envDiv) envDiv.classList.add('visible');
-  } else {
-    wrap.classList.remove('selected');
-    if (envDiv) envDiv.classList.remove('visible');
-  }
-}
-
-function setEnv(tool, key, val) {
-  if (!state.mcp_selections[tool]) state.mcp_selections[tool] = { selected: true, env: {} };
-  if (!state.mcp_selections[tool].env) state.mcp_selections[tool].env = {};
-  state.mcp_selections[tool].env[key] = val;
-}
-
-// ── Load existing config ────────────────────────────────────────────────────────
 async function loadExistingConfig() {
   try {
     const res = await fetch('/api/load-config');
     if (!res.ok) return;
     const cfg = await res.json();
     if (!cfg.exists) return;
-
-    // Populate scalar state fields (non-empty values win over defaults)
-    if (cfg.telegram_token)   state.telegram_token   = cfg.telegram_token;
-    if (cfg.allowed_user_ids) state.allowed_user_ids = cfg.allowed_user_ids;
-    if (cfg.openrouter_key)   state.openrouter_key   = cfg.openrouter_key;
-    if (cfg.model)            state.model            = cfg.model;
-    if (cfg.max_tokens)       state.max_tokens       = String(cfg.max_tokens);
-    if (cfg.system_prompt)    state.system_prompt    = cfg.system_prompt;
-    if (cfg.location)         state.location         = cfg.location;
-    if (cfg.db_path)          state.db_path          = cfg.db_path;
-    if (cfg.base_url)         state.base_url         = cfg.base_url;
-    if (typeof cfg.supports_vision === 'boolean') state.supports_vision = cfg.supports_vision;
-    if (cfg.skills_dir)       state.skills_dir       = cfg.skills_dir;
-    if (cfg.agents_dir)       state.agents_dir       = cfg.agents_dir;
-    if (cfg.home_dir)         state.home_dir         = cfg.home_dir;
-    if (cfg.ocr_model_dir)    state.ocr_model_dir    = cfg.ocr_model_dir;
-    if (typeof cfg.query_rewriter_enabled === 'boolean') state.query_rewriter_enabled = cfg.query_rewriter_enabled;
-    if (cfg.agent_max_iterations)              state.max_iterations             = cfg.agent_max_iterations;
-    if (cfg.agent_empty_response_retry_limit)  state.empty_response_retry_limit = cfg.agent_empty_response_retry_limit;
-    if (cfg.langsmith_key)     state.langsmith_key     = cfg.langsmith_key;
-    if (cfg.langsmith_project) state.langsmith_project = cfg.langsmith_project;
-    if (cfg.embedding_key)        state.embedding_key        = cfg.embedding_key;
-    if (cfg.embedding_base_url)   state.embedding_base_url   = cfg.embedding_base_url;
-    if (cfg.embedding_model)      state.embedding_model      = cfg.embedding_model;
-    if (cfg.embedding_dimensions) state.embedding_dimensions = cfg.embedding_dimensions;
-    if (typeof cfg.learning_skill_extraction_enabled === 'boolean') {
-      state.learning_skill_extraction_enabled = cfg.learning_skill_extraction_enabled;
-    }
-    if (cfg.learning_skill_extraction_threshold) state.learning_skill_extraction_threshold = cfg.learning_skill_extraction_threshold;
-
-    // Split MCP servers: catalog-matched vs custom
-    for (const s of (cfg.mcp_servers || [])) {
-      const inCatalog = MCP_CATALOG.find(c => c.name === s.name);
-      if (inCatalog) {
-        const env = Object.assign({}, s.env || {});
-        // For HTTP catalog entries, map auth_token back to the authTokenVar key
-        if (inCatalog.authTokenVar && s.auth_token) {
-          env[inCatalog.authTokenVar] = s.auth_token;
-        }
-        state.mcp_selections[s.name] = { selected: true, env };
-      } else {
-        state.custom_mcp_servers.push({
-          name: s.name,
-          command: s.command,
-          args: s.args || [],
-          env: s.env || {},
-        });
-      }
-    }
-
-    // Remember on-disk bot ids so full save only appends NEW extras
-    // (server merge-preserves existing [[bots]] customizations).
-    state.existing_bot_ids = (cfg.bots || []).map(b => b.id).filter(Boolean);
-
+    if (cfg.telegram_token && cfg.telegram_token !== '***') state.telegram_token = cfg.telegram_token;
+    if (cfg.openrouter_key && cfg.openrouter_key !== '***') state.openrouter_key = cfg.openrouter_key;
+    if (cfg.system_prompt) state.system_prompt = cfg.system_prompt;
     state._loaded = true;
-
-    // Sync state back to DOM form fields
-    syncStateToForm();
-  } catch (_) {
-    // Network error or JSON parse error — start with blank wizard
-  }
+  } catch (_) {}
 }
 
-function syncStateToForm() {
-  const map = {
-    'f-telegram-token':     state.telegram_token,
-    'f-allowed-ids':        state.allowed_user_ids,
-    'f-openrouter-key':     state.openrouter_key,
-    'f-model':              state.model,
-    'f-max-tokens':         state.max_tokens,
-    'f-system-prompt':      state.system_prompt,
-    'f-base-url':           state.base_url,
-    'f-location':           state.location,
-
-    'f-db-path':            state.db_path,
-    'f-skills-dir':         state.skills_dir,
-    'f-agents-dir':         state.agents_dir,
-    'f-home-dir':           state.home_dir,
-    'f-ocr-model-dir':      state.ocr_model_dir,
-    'f-max-iterations':     state.max_iterations,
-    'f-empty-retry':        state.empty_response_retry_limit,
-    'f-langsmith-key':      state.langsmith_key,
-    'f-langsmith-project':  state.langsmith_project,
-    'f-embedding-key':      state.embedding_key,
-    'f-embedding-base-url': state.embedding_base_url,
-    'f-embedding-model':    state.embedding_model,
-    'f-embedding-dimensions': state.embedding_dimensions,
-    'f-learning-threshold': state.learning_skill_extraction_threshold,
-  };
-  for (const [id, val] of Object.entries(map)) {
-    const el = document.getElementById(id);
-    if (el) el.value = String(val);
-  }
-  // Checkboxes
-  const cbMap = {
-    'f-supports-vision':    state.supports_vision,
-    'f-query-rewriter':     state.query_rewriter_enabled,
-    'f-learning-extraction': state.learning_skill_extraction_enabled,
-  };
-  for (const [id, val] of Object.entries(cbMap)) {
-    const el = document.getElementById(id);
-    if (el) el.checked = !!val;
-  }
-  // Re-render MCP selections
-  renderMcpCatalog();
-}
-
-// ── Custom MCP servers ──────────────────────────────────────────────────────
-
-function renderCustomMcpCards() {
-  const el = document.getElementById('custom-mcp-cards');
-  if (!el) return;
-  if (state.custom_mcp_servers.length === 0) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = state.custom_mcp_servers.map((s, i) => {
-    const cmd = escHtml(s.command) + (s.args.length ? ' ' + s.args.map(escHtml).join(' ') : '');
-    const envKeys = Object.keys(s.env);
-    return `<div class="custom-card">
-  <div class="custom-card-body">
-    <div class="custom-card-name">${escHtml(s.name)}</div>
-    <div class="custom-card-cmd">${cmd}</div>
-    ${envKeys.length ? `<div class="custom-card-env">ENV: ${envKeys.map(escHtml).join(', ')}</div>` : ''}
-  </div>
-  <button class="btn-remove" onclick="removeCustomServer(${i})" title="Remove">&#x2715;</button>
-</div>`;
-  }).join('');
-}
-
-function removeCustomServer(i) {
-  state.custom_mcp_servers.splice(i, 1);
-  renderCustomMcpCards();
-}
-
-function addCustomEnvRow() {
-  const container = document.getElementById('custom-env-rows');
-  const row = document.createElement('div');
-  row.className = 'env-add-row';
-  row.innerHTML = '<input type="text" placeholder="KEY" style="flex:1"><input type="text" placeholder="value" style="flex:2">';
-  container.appendChild(row);
-}
-
-function syncCustomCmd() {
-  const preset = document.getElementById('custom-cmd-preset').value;
-  const cmdInput = document.getElementById('custom-cmd');
-  if (preset !== 'custom') cmdInput.value = preset;
-  cmdInput.readOnly = preset !== 'custom';
-}
-
-function addCustomServer() {
-  const nameInput = document.getElementById('custom-name');
-  const name = nameInput.value.trim();
-  if (!name) {
-    nameInput.classList.add('error');
-    return;
-  }
-  nameInput.classList.remove('error');
-
-  const command = document.getElementById('custom-cmd').value.trim() || 'npx';
-  const argsRaw = document.getElementById('custom-args').value.trim();
-  const args = argsRaw ? argsRaw.split(/\s+/) : [];
-
-  const env = {};
-  document.getElementById('custom-env-rows').querySelectorAll('.env-add-row').forEach(row => {
-    const inputs = row.querySelectorAll('input');
-    const k = inputs[0]?.value.trim();
-    const v = inputs[1]?.value.trim();
-    if (k) env[k] = v || '';
-  });
-
-  state.custom_mcp_servers.push({ name, command, args, env });
-  renderCustomMcpCards();
-
-  // Reset form
-  nameInput.value = '';
-  document.getElementById('custom-args').value = '';
-  document.getElementById('custom-env-rows').innerHTML = '';
-}
-
-// ── Render MCP catalog (moved into Step 3) ────────────────────────────────────
-function renderMcpCatalog() {
-  const container = document.getElementById('mcp-catalog');
-  if (!container) return;
-  const categories = [...new Set(MCP_CATALOG.map(t => t.category))];
-  let html = '';
-  for (const cat of categories) {
-    html += `<div class="mcp-category"><h3>${cat}</h3>`;
-    for (const tool of MCP_CATALOG.filter(t => t.category === cat)) {
-      const cmd = tool.url
-        ? 'HTTP · ' + tool.url
-        : (tool.runner + ' ' + (tool.args || []).join(' '));
-      const envVars = tool.url
-        ? (tool.authTokenVar ? [tool.authTokenVar] : [])
-        : (tool.envVars || []);
-      const envHtml = envVars.map(k => {
-        const existingVal = state.mcp_selections[tool.name]?.env?.[k] || (tool.envDefaults && tool.envDefaults[k]) || '';
-        const placeholder = tool.url ? 'access token (autofilled after OAuth or paste manually)' : k;
-        return `<div class="env-row" onclick="event.stopPropagation()">
-          <div class="mcp-env-label">${k}</div>
-          <input type="text" id="mcp-env-input-${tool.name}-${k}" placeholder="${placeholder}" value="${escHtml(existingVal)}"
-                 oninput="setEnv('${tool.name}','${k}',this.value)">
-        </div>`;
-      }).join('');
-      let guideHtml = '';
-      if (tool.setupGuide === '__OAUTH_GUIDE_BUTTON__') {
-        guideHtml = `<button class="btn-guide" onclick="event.stopPropagation();openOAuthModal()" type="button">&#9432; OAuth Setup Guide</button>`;
-      } else if (tool.setupGuide === '__THREADS_GUIDE_BUTTON__') {
-        guideHtml = `<button class="btn-guide" onclick="event.stopPropagation();openThreadsModal()" type="button">&#9432; Threads Setup Guide</button>`;
-      } else if (tool.setupGuide === '__NOTION_OAUTH_BUTTON__') {
-        guideHtml = `<div class="oauth-connect-row" onclick="event.stopPropagation()">
-          <button class="btn-oauth-connect" id="oauth-btn-${tool.name}" type="button"
-                  onclick="connectOAuth('${tool.name}','${tool.url}','${tool.authTokenVar}')">
-            🔐 Connect with Notion
-          </button>
-          <span class="oauth-connect-status" id="oauth-status-${tool.name}"></span>
-          <button class="btn-guide" onclick="openNotionModal()" type="button" style="margin-left:auto">&#9432; How it works</button>
-        </div>`;
-      } else if (tool.setupGuide) {
-        guideHtml = `<div class="mcp-setup-guide" onclick="event.stopPropagation()">${tool.setupGuide}</div>`;
-      }
-      const hasExtras = envVars.length || tool.setupGuide;
-      const linkHtml = tool.link
-        ? `<a class="mcp-tool-link" href="${tool.link}" target="_blank" rel="noopener" onclick="event.stopPropagation()">docs ↗</a>`
-        : '';
-      html += `<div class="mcp-tool ${state.mcp_selections[tool.name]?.selected ? 'selected' : ''}"
-     id="mcp-wrap-${tool.name}" onclick="toggleTool('${tool.name}', event)">
-  <div class="mcp-tool-header">
-    <input type="checkbox" id="mcp-cb-${tool.name}"
-      ${state.mcp_selections[tool.name]?.selected ? 'checked' : ''}
-      onclick="event.stopPropagation();toggleTool('${tool.name}',event)">
-    <span class="mcp-tool-name">${tool.name}</span>
-    ${linkHtml}
-  </div>
-  <div class="mcp-tool-desc">${tool.desc}</div>
-  <div class="mcp-tool-cmd">${cmd}</div>
-  ${hasExtras ? `<div class="mcp-env-fields ${state.mcp_selections[tool.name]?.selected ? 'visible' : ''}" id="mcp-env-${tool.name}">${guideHtml}${envHtml}</div>` : ''}
-</div>`;
-    }
-    html += `</div>`;
-  }
-  container.innerHTML = html;
-}
-
-// ── Build HTML ─────────────────────────────────────────────────────────────────
 function buildSteps() {
   const c = document.getElementById('steps-container');
-
-  // ── Step 1: Bot & LLM Setup ─────────────────────────────────────────────────
-  c.innerHTML += `<div class="step" id="step-1">
-  <h2>🤖 Bot &amp; LLM Setup</h2>
-  <p class="subtitle">The three essentials — get these right and RustFox will work.</p>
-
+  c.innerHTML = `<div class="step" id="step-1">
+  <h2>🤖 Setup</h2>
+  <p class="subtitle">Four fields. OpenRouter is the default. Everything else stays a safe default.</p>
+  <div class="field">
+    <label>Provider</label>
+    <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+      <input type="radio" name="provider" id="f-provider-openrouter" value="openrouter" checked onchange="onProviderChange()">
+      <span>OpenRouter <span class="hint">— default</span></span>
+    </label>
+    <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
+      <input type="radio" name="provider" id="f-provider-ollama" value="ollama" onchange="onProviderChange()">
+      <span>Ollama <span class="hint">— local option</span></span>
+    </label>
+  </div>
+  <div id="openrouter-fields">
+    <div class="field">
+      <label>OpenRouter API Key <span class="hint">— <a href="https://openrouter.ai/keys" target="_blank" rel="noopener" style="color:#f6851b;text-decoration:none">openrouter.ai/keys</a></span></label>
+      <input type="password" id="f-openrouter-key" placeholder="sk-or-..." value="${escHtml(state.openrouter_key)}" oninput="clearFieldError(this)">
+      <div class="error-msg">API key is required.</div>
+    </div>
+  </div>
+  <div id="ollama-fields" style="display:none">
+    <p id="ollama-down" class="error-msg visible" style="display:none">Ollama is not running.</p>
+    <button type="button" class="btn-secondary" id="ollama-back" onclick="useOpenRouter()" style="margin-bottom:0.75rem">Use OpenRouter</button>
+    <div id="ollama-local-wrap" style="display:none">
+      <div class="field">
+        <label>Ollama model <span class="hint">— detected on this machine</span></label>
+        <select id="f-ollama-model"></select>
+        <div class="error-msg">Pick a detected model.</div>
+      </div>
+      <button type="button" class="btn-secondary" onclick="showLibraryList()">Pull a model that is not on this machine</button>
+      <div id="ollama-library-wrap" style="display:none;margin-top:0.75rem">
+        <div class="field">
+          <label>Ollama library <span class="hint">— one list, pulled after you pick</span></label>
+          <select id="f-ollama-library"></select>
+        </div>
+        <button type="button" class="btn-secondary" onclick="pullLibraryModel()">Pull</button>
+        <p id="ollama-pull-status" class="hint"></p>
+      </div>
+    </div>
+  </div>
   <div class="field">
     <label>Bot Token <span class="hint">— from @BotFather on Telegram</span></label>
-    <input type="password" id="f-telegram-token" placeholder="1234567890:ABC-..."
-           value="${escHtml(state.telegram_token)}" oninput="clearFieldError(this)">
+    <input type="password" id="f-telegram-token" placeholder="1234567890:ABC-..." value="${escHtml(state.telegram_token)}" oninput="clearFieldError(this)">
     <div class="error-msg">Bot token is required.</div>
   </div>
   <div class="field">
-    <label>Allowed User IDs <span class="hint">— comma-separated, from @userinfobot</span></label>
-    <input type="text" id="f-allowed-ids" placeholder="123456789, 987654321"
-           value="${escHtml(state.allowed_user_ids)}" oninput="clearFieldError(this)">
-    <div class="error-msg">At least one user ID is required.</div>
+    <label>System prompt <span class="hint">— one sentence</span></label>
+    <input type="text" id="f-system-prompt" placeholder="Be brief and kind." value="${escHtml(state.system_prompt)}" oninput="clearFieldError(this)">
+    <div class="error-msg">A sentence is required.</div>
   </div>
-  <div class="field">
-    <label>OpenRouter API Key <span class="hint">— <a href="https://openrouter.ai/keys" target="_blank" rel="noopener" style="color:#f6851b;text-decoration:none">openrouter.ai/keys</a></span></label>
-    <input type="password" id="f-openrouter-key" placeholder="sk-or-..."
-           value="${escHtml(state.openrouter_key)}" oninput="clearFieldError(this)">
-    <div class="error-msg">API key is required.</div>
-  </div>
-
-  <div class="field" style="margin-top:1.25rem">
-    <label>Multi-bot <span class="hint">— optional second (and further) Telegram identities in one process</span></label>
-    <p style="font-size:0.8rem;color:#a0aec0;margin:0.35rem 0 0.75rem">
-      “Add another bot” appends <code>[[bots]]</code> via validate → <code>config.toml.bak</code> → atomic write
-      (same path as Telegram <code>/agents</code>). First multi-bot add rewrites legacy <code>[telegram]</code> into <code>[[bots]]</code>.
-    </p>
-    <div id="extra-bots-list"></div>
-    <button type="button" class="btn-guide" onclick="addExtraBotRow()" style="margin-top:0.5rem">＋ Add another bot</button>
-  </div>
-
-  <div class="advanced-section collapsed" data-section="llm">
-    <button class="advanced-header" type="button" onclick="toggleAdvanced(this)">
-      <span>▼ Advanced LLM settings</span>
-      <span class="chevron">▾</span>
-    </button>
-    <div class="advanced-body">
-      <div class="field">
-        <label>System Prompt</label>
-        <textarea id="f-system-prompt">${escHtml(state.system_prompt)}</textarea>
-      </div>
-      <div class="field">
-        <label>Model <span class="hint">— <a href="https://openrouter.ai/models" target="_blank" rel="noopener" style="color:#f6851b;text-decoration:none">openrouter.ai/models</a></span></label>
-        <input type="text" id="f-model" value="${escHtml(state.model || 'moonshotai/kimi-k2.6')}">
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label>Max Tokens</label>
-          <input type="number" id="f-max-tokens" value="${escHtml(state.max_tokens || '4096')}" min="1">
-        </div>
-        <div class="field" style="display:flex;flex-direction:column;justify-content:center">
-          <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
-            <input type="checkbox" id="f-supports-vision" ${state.supports_vision ? 'checked' : ''}>
-            <span>Supports vision (image inputs)</span>
-          </label>
-        </div>
-      </div>
-      <div class="field">
-        <label>API Base URL</label>
-        <input type="text" id="f-base-url" value="${escHtml(state.base_url || 'https://openrouter.ai/api/v1')}">
-      </div>
-    </div>
-  </div>
-</div>`;
-
-  // ── Step 2: Location & Storage ──────────────────────────────────────────────
-  c.innerHTML += `<div class="step" id="step-2">
-  <h2>🌍 Location &amp; Storage</h2>
-  <p class="subtitle">Tells the AI where you are and where to keep files &amp; memory.</p>
-
-  <div class="field">
-    <label>Your Location <span class="hint">— gives the AI your timezone &amp; regional context</span></label>
-    <input type="text" id="f-location" placeholder="Hong Kong" value="${escHtml(state.location)}">
-  </div>
-
-  <div class="advanced-section collapsed" data-section="storage">
-    <button class="advanced-header" type="button" onclick="toggleAdvanced(this)">
-      <span>▼ Advanced storage &amp; agent settings</span>
-      <span class="chevron">▾</span>
-    </button>
-    <div class="advanced-body">
-      <div class="field">
-        <label>Memory Database Path <span class="hint">— SQLite file for persistent memory</span></label>
-        <input type="text" id="f-db-path" value="${escHtml(state.db_path)}">
-      </div>
-      <div class="field">
-        <label>Skills Directory <span class="hint">— leave blank to use the default</span></label>
-        <input type="text" id="f-skills-dir" placeholder="skills" value="${escHtml(state.skills_dir)}">
-      </div>
-      <div class="field">
-        <label>Agents Directory <span class="hint">— leave blank to use the default</span></label>
-        <input type="text" id="f-agents-dir" placeholder="agents" value="${escHtml(state.agents_dir)}">
-      </div>
-      <div class="field">
-        <label>Home Directory <span class="hint">— overrides the default <code>~/.rustfox</code></span></label>
-        <input type="text" id="f-home-dir" placeholder="/path/to/.rustfox" value="${escHtml(state.home_dir)}">
-      </div>
-      <div class="field">
-        <label>OCR Model Directory <span class="hint">— where OCR model files are cached</span></label>
-        <input type="text" id="f-ocr-model-dir" placeholder="~/.cache/ocrs" value="${escHtml(state.ocr_model_dir)}">
-      </div>
-      <div class="field">
-        <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
-          <input type="checkbox" id="f-query-rewriter" ${state.query_rewriter_enabled ? 'checked' : ''}>
-          <span>Enable RAG query rewriting <span class="hint">— rewrites ambiguous follow-ups (extra LLM call)</span></span>
-        </label>
-      </div>
-      <h3>🤖 Agent Loop</h3>
-      <div class="field-row">
-        <div class="field">
-          <label>Max Iterations <span class="hint">— cap on tool-call round-trips per turn</span></label>
-          <input type="number" id="f-max-iterations" value="${state.max_iterations || 25}" min="1">
-        </div>
-        <div class="field">
-          <label>Empty Response Retry Limit</label>
-          <input type="number" id="f-empty-retry" value="${state.empty_response_retry_limit || 3}" min="0">
-        </div>
-      </div>
-    </div>
-  </div>
-</div>`;
-
-  // ── Step 3: Integrations ────────────────────────────────────────────────────
-  c.innerHTML += `<div class="step" id="step-3">
-  <h2>🧩 Integrations</h2>
-  <p class="subtitle">Enable the tools your bot should have access to. All are optional.</p>
-
-  <div class="mcp-prereqs">
-    <strong>MCP server prerequisites</strong> — these run as child processes outside RustFox.<br>
-    Tools marked <code>uvx</code> need <strong><a href="https://docs.astral.sh/uv/getting-started/installation/" target="_blank" rel="noopener">uv</a></strong> installed &nbsp;(<code>curl -LsSf https://astral.sh/uv/install.sh | sh</code>).<br>
-    Tools marked <code>npx</code> need <strong><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a></strong> installed &nbsp;(<a href="https://nodejs.org/en/download/" target="_blank" rel="noopener">nodejs.org/en/download</a>).<br>
-    Click <em>docs ↗</em> on any tool to read its full documentation before enabling it.
-  </div>
-
-  <div id="mcp-catalog"></div>
-
-  <div class="mcp-more">
-    Want more tools? Browse the <a href="https://github.com/modelcontextprotocol/servers" target="_blank" rel="noopener">MCP server registry</a>
-    or <a href="https://mcp.so/" target="_blank" rel="noopener">mcp.so</a> and add them manually in <code>config.toml</code>.
-  </div>
-
-  <div class="custom-mcp-section">
-    <h3>Custom Servers</h3>
-    <div id="custom-mcp-cards"></div>
-    <div class="custom-add-form">
-      <h4>Add Custom Server</h4>
-      <div class="field">
-        <label>Name</label>
-        <input type="text" id="custom-name" placeholder="my-server">
-      </div>
-      <div class="field">
-        <label>Command</label>
-        <div class="cmd-row">
-          <select id="custom-cmd-preset" onchange="syncCustomCmd()">
-            <option value="npx">npx</option>
-            <option value="uvx">uvx</option>
-            <option value="custom">custom...</option>
-          </select>
-          <input type="text" id="custom-cmd" value="npx" style="flex:1">
-        </div>
-      </div>
-      <div class="field">
-        <label>Args <span class="hint">&#8212; space-separated</span></label>
-        <input type="text" id="custom-args" placeholder="-y my-mcp-package">
-      </div>
-      <div class="field">
-        <label>Env Vars <span class="hint">&#8212; optional</span></label>
-        <div id="custom-env-rows"></div>
-        <button type="button" class="btn-secondary" onclick="addCustomEnvRow()" style="margin-top:0.4rem;padding:0.3rem 0.75rem;font-size:0.8rem">+ Add env var</button>
-      </div>
-      <button type="button" class="btn-primary" onclick="addCustomServer()">Add Server</button>
-    </div>
-  </div>
-
-  <div class="advanced-section collapsed" data-section="integrations">
-    <button class="advanced-header" type="button" onclick="toggleAdvanced(this)">
-      <span>▼ Advanced: LangSmith, Embedding API &amp; Learning</span>
-      <span class="chevron">▾</span>
-    </button>
-    <div class="advanced-body">
-      <h3>📊 LangSmith <span class="hint" style="font-weight:400">— optional observability</span></h3>
-      <div class="field">
-        <label>API Key</label>
-        <input type="password" id="f-langsmith-key" placeholder="ls__..." value="${escHtml(state.langsmith_key)}">
-      </div>
-      <div class="field">
-        <label>Project Name</label>
-        <input type="text" id="f-langsmith-project" placeholder="rustfox" value="${escHtml(state.langsmith_project || 'rustfox')}">
-      </div>
-
-      <h3>🔍 Embedding API <span class="hint" style="font-weight:400">— for memory / RAG</span></h3>
-      <div class="field">
-        <label>API Key</label>
-        <input type="password" id="f-embedding-key" placeholder="sk-..." value="${escHtml(state.embedding_key)}">
-      </div>
-      <div class="field">
-        <label>Base URL</label>
-        <input type="text" id="f-embedding-base-url" value="${escHtml(state.embedding_base_url || 'https://openrouter.ai/api/v1')}">
-      </div>
-      <div class="field">
-        <label>Model</label>
-        <input type="text" id="f-embedding-model" value="${escHtml(state.embedding_model || 'qwen/qwen3-embedding-8b')}">
-      </div>
-      <div class="field">
-        <label>Dimensions</label>
-        <input type="number" id="f-embedding-dimensions" value="${state.embedding_dimensions || 1536}" min="1">
-      </div>
-
-      <h3>🧠 Learning <span class="hint" style="font-weight:400">— automatic skill extraction</span></h3>
-      <div class="field">
-        <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
-          <input type="checkbox" id="f-learning-extraction" ${state.learning_skill_extraction_enabled ? 'checked' : ''}>
-          <span>Enable skill extraction from tool calls</span>
-        </label>
-      </div>
-      <div class="field">
-        <label>Extraction Threshold <span class="hint">— minimum tool calls before extraction runs</span></label>
-        <input type="number" id="f-learning-threshold" value="${state.learning_skill_extraction_threshold || 5}" min="1">
-      </div>
-    </div>
-  </div>
-</div>`;
-
-  // ── Step 4: Review & Save ────────────────────────────────────────────────────
-  c.innerHTML += `<div class="step" id="step-4">
+</div>
+<div class="step" id="step-2">
   <h2>✅ Review &amp; Save</h2>
-  <p class="subtitle">Quick summary of what will be written. Toggle the raw TOML preview to verify.</p>
+  <p class="subtitle">These four answers are what gets written. Everything else stays a safe default.</p>
   <div id="summary"></div>
   <details style="margin-top:1.25rem">
     <summary style="cursor:pointer;color:#a0aec0;font-size:0.85rem;font-weight:600">📋 Show raw TOML</summary>
     <pre id="config-preview" style="margin-top:0.75rem"></pre>
   </details>
-</div>`;
-
-  // ── Step 5: Success ─────────────────────────────────────────────────────────
-  c.innerHTML += `<div class="step" id="step-5">
+</div>
+<div class="step" id="step-done">
   <h1 style="margin-bottom:0.5rem">🎉 You're all set!</h1>
-  <p class="subtitle">
-    <code>config.toml</code> has been saved to the project root.<br>
-    Start your bot with:
-  </p>
+  <p class="subtitle"><code>config.toml</code> has been saved. Start your bot with:</p>
   <pre style="margin-bottom:2rem;text-align:center;font-size:0.95rem;color:#e2e8f0">cargo run --bin rustfox</pre>
   <div id="service-install-section" style="margin-top: 1.5rem; text-align: center;">
-    <button id="btn-install-service" class="btn-primary" onclick="installService()">
-      Install as background service
-    </button>
+    <button id="btn-install-service" class="btn-primary" onclick="installService()">Install as background service</button>
     <p id="service-install-status" class="success-msg" style="margin-top: 0.75rem;"></p>
     <div style="margin-top: 1rem;">
-      <button class="btn-secondary" onclick="finishSetup()">
-        Close &amp; finish →
-      </button>
+      <button class="btn-secondary" onclick="finishSetup()">Close &amp; finish →</button>
     </div>
   </div>
-  <p style="color:#718096;font-size:0.85rem;margin-bottom:1.25rem;margin-top:2rem;text-align:center">
-    If you find RustFox useful, consider supporting the project:
-  </p>
-  <div style="display:flex;flex-direction:column;gap:0.875rem;align-items:center">
-    <a href="https://buymeacoffee.com/chinkan.ai" target="_blank" rel="noopener">
-      <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-yellow?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" style="height:40px">
-    </a>
-    <a href="https://github.com/sponsors/chinkan" target="_blank" rel="noopener">
-      <img src="https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="GitHub Sponsors" style="height:40px">
-    </a>
-  </div>
 </div>`;
-
-  // Render MCP catalog and custom server cards into their containers
-  renderMcpCatalog();
-  renderCustomMcpCards();
-}
-
-// ── OAuth Modal ─────────────────────────────────────────────────────────────────
-function openOAuthModal() {
-  document.getElementById('oauth-modal').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function closeOAuthModal(event) {
-  // Close when clicking the overlay backdrop (not the modal box itself)
-  if (event && event.target !== document.getElementById('oauth-modal')) return;
-  document.getElementById('oauth-modal').classList.remove('open');
-  document.body.style.overflow = '';
-}
-
-function openThreadsModal() {
-  document.getElementById('threads-modal').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function closeThreadsModal(event) {
-  if (event && event.target !== document.getElementById('threads-modal')) return;
-  document.getElementById('threads-modal').classList.remove('open');
-  document.body.style.overflow = '';
-}
-
-function openNotionModal() {
-  document.getElementById('notion-modal').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function closeNotionModal(event) {
-  if (event && event.target !== document.getElementById('notion-modal')) return;
-  document.getElementById('notion-modal').classList.remove('open');
-  document.body.style.overflow = '';
-}
-
-document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') {
-    document.getElementById('oauth-modal').classList.remove('open');
-    document.getElementById('threads-modal').classList.remove('open');
-    document.getElementById('notion-modal').classList.remove('open');
-    document.body.style.overflow = '';
-  }
-});
-
-// ── Generic MCP OAuth 2.0 connect ──────────────────────────────────────────────
-// Launches the authorization popup, polls for the token, then auto-fills the
-// env field and marks the tool as selected.
-async function connectOAuth(serverName, mcpUrl, authTokenVar) {
-  const btn    = document.getElementById('oauth-btn-' + serverName);
-  const status = document.getElementById('oauth-status-' + serverName);
-
-  btn.disabled = true;
-  status.textContent = '⏳ Starting authorization…';
-  status.style.color = '#718096';
-
-  let oauthState = null;
-  let pollTimer  = null;
-  let timeoutTimer = null;
-
-  function cleanup() {
-    if (pollTimer)    clearInterval(pollTimer);
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-    btn.disabled = false;
-  }
-
-  try {
-    // Step 1: Discover + register + get auth URL from the Rust server.
-    const startRes = await fetch(
-      '/api/oauth/start?server=' + encodeURIComponent(serverName) +
-      '&url='    + encodeURIComponent(mcpUrl)
-    );
-    if (!startRes.ok) {
-      const msg = await startRes.text();
-      throw new Error(msg || 'oauth/start failed (' + startRes.status + ')');
-    }
-    const { state: oauthSt, auth_url } = await startRes.json();
-    oauthState = oauthSt;
-
-    // Step 2: Open the authorization URL in a popup.
-    const popup = window.open(
-      auth_url,
-      'mcp_oauth_' + serverName,
-      'width=640,height=720,scrollbars=yes,resizable=yes'
-    );
-    if (!popup) {
-      throw new Error('Popup was blocked — please allow popups for this page and try again.');
-    }
-    status.textContent = '⏳ Waiting for authorization in popup…';
-
-    // Step 3: Poll until the Rust callback handler has stored the token.
-    pollTimer = setInterval(async () => {
-      try {
-        const pollRes = await fetch('/api/oauth/token?state=' + encodeURIComponent(oauthState));
-        if (!pollRes.ok) return;
-        const { ready, token, refresh_token, expires_in, token_endpoint, oauth_client_id, oauth_client_secret } = await pollRes.json();
-        if (ready && token) {
-          cleanup();
-          if (popup && !popup.closed) popup.close();
-
-          // Populate the env entry in wizard state.
-          if (!state.mcp_selections[serverName]) {
-            state.mcp_selections[serverName] = { selected: true, env: {} };
-          }
-          if (!state.mcp_selections[serverName].env) {
-            state.mcp_selections[serverName].env = {};
-          }
-          state.mcp_selections[serverName].env[authTokenVar] = token;
-          state.mcp_selections[serverName].selected = true;
-
-          // Store OAuth refresh metadata so the TOML generator can include it.
-          if (refresh_token) state.mcp_selections[serverName].refresh_token = refresh_token;
-          if (expires_in) state.mcp_selections[serverName].expires_in = expires_in;
-          if (token_endpoint) state.mcp_selections[serverName].token_endpoint = token_endpoint;
-          if (oauth_client_id) state.mcp_selections[serverName].oauth_client_id = oauth_client_id;
-          if (oauth_client_secret) state.mcp_selections[serverName].oauth_client_secret = oauth_client_secret;
-
-          // Update the visible token input field.
-          const input = document.getElementById('mcp-env-input-' + serverName + '-' + authTokenVar);
-          if (input) input.value = token;
-
-          // Ensure the tool card shows as selected/checked.
-          const cb   = document.getElementById('mcp-cb-' + serverName);
-          const wrap = document.getElementById('mcp-wrap-' + serverName);
-          const env  = document.getElementById('mcp-env-' + serverName);
-          if (cb)   cb.checked = true;
-          if (wrap) wrap.classList.add('selected');
-          if (env)  env.classList.add('visible');
-
-          status.textContent = '✅ Authorized!';
-          status.style.color = '#48bb78';
-          btn.textContent    = '🔄 Re-authorize';
-        }
-      } catch (err) { console.debug('OAuth poll error:', err); }
-    }, 1500);
-
-    // Abort after 5 minutes.
-    timeoutTimer = setTimeout(() => {
-      if (status.textContent.startsWith('✅')) return;
-      cleanup();
-      if (popup && !popup.closed) popup.close();
-      status.textContent = '✗ Timed out. Please try again.';
-      status.style.color = '#fc8181';
-    }, 300000);
-
-  } catch (err) {
-    cleanup();
-    status.textContent = '✗ ' + err.message;
-    status.style.color = '#fc8181';
-  }
 }
 
 async function init() {
   await loadExistingConfig();
   buildSteps();
-  renderExtraBots();
-  if (state._loaded) {
-    document.getElementById('existing-banner').style.display = 'block';
-  }
+  if (state._loaded) document.getElementById('existing-banner').style.display = 'block';
   showStep(1);
 }
 init();
