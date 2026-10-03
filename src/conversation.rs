@@ -127,9 +127,13 @@ impl ConversationManager {
             tool_calls: None,
             tool_call_id: None,
         };
-        self.memory
-            .save_message(&self.conversation_id, &user_msg)
-            .await?;
+        // Scheduled runs persist the prompt and the result together, once,
+        // from the job runner (failure / cancel / max-iterations included).
+        if incoming.schedule_id.is_none() {
+            self.memory
+                .save_message(&self.conversation_id, &user_msg)
+                .await?;
+        }
 
         Ok(image_parts)
     }

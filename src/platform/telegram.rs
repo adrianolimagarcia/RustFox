@@ -2219,6 +2219,7 @@ pub async fn handle_message(
         user_name,
         text,
         attachments,
+        schedule_id: None,
     };
 
     // Process through agent — moves stream_token_tx and tool_event_tx

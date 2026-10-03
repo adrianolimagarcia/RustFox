@@ -1,3 +1,4 @@
+pub mod history;
 pub mod reminders;
 pub mod reruns;
 pub mod schedule;

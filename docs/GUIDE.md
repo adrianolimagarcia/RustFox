@@ -111,7 +111,7 @@ persona = "researcher"
 
 ### Per-bot schedules
 
-Every schedule row has a required `bot_id` (the `[[bots]]` id). There is no global cron and no schedule shared between bots. A run uses that bot's prompt, tools, and conversation with the owner (the chat stored on the row) and writes the result there. Portal and `list_scheduled_tasks` show only the current bot. Disable and delete affect only that bot. An approval reply is not sent on a bot that did not own the run. Rows saved before `bot_id` existed are assigned to `default` and logged, not dropped.
+Every schedule row has a required `bot_id` (the `[[bots]]` id). There is no global cron and no schedule shared between bots. A run uses that bot's prompt and tools. It writes the prompt and the result into the owning bot's conversation with the owner, and every written segment includes the schedule id. Failure, cancel, and max-iterations write a result turn, not only the prompt. A task opened from the portal is stored as user `web` and platform `portal`; that segment is also written into the owning bot's Telegram conversation (the allowlisted Telegram user id kept on the row as `chat_id`, opened with the same legacy-claim rule as a Telegram reply) so the next reply in that chat can see the prompt and the result. There is no approval gate before the run. Portal and `list_scheduled_tasks` show only the current bot. Disable and delete affect only that bot. An approval reply is not sent on a bot that did not own the run. Rows saved before `bot_id` existed are assigned to `default` and logged, not dropped.
 
 ```toml
 [[bots]]

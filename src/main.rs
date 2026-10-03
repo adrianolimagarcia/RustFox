@@ -452,10 +452,34 @@ async fn main() -> Result<()> {
                 tracing::warn!("Failed to persist scheduled task run record: {}", e);
             }
 
-            let response = match agent
+            let processed = agent
                 .process_message_outcome(&req.incoming, None, None, ToolUiMode::Minimal)
+                .await;
+
+            // Prompt + result, including failure / cancel / max-iterations,
+            // with the schedule id. Portal rows also land in the owning bot's
+            // Telegram conversation. No approval gate: the run already finished.
+            if let Ok(Some(task)) = req.task_store.get_by_id(&req.task_id).await {
+                let result_body = match &processed {
+                    Ok(outcome) => outcome.text.clone(),
+                    Err(err) => format!("Scheduled task failed: {err:#}"),
+                };
+                if let Err(e) = rustfox::scheduler::history::write_schedule_segment(
+                    &agent.memory,
+                    &task,
+                    &agent.config.bots,
+                    &result_body,
+                )
                 .await
-            {
+                {
+                    tracing::warn!(
+                        "Failed to write schedule {} conversation segment: {e:#}",
+                        req.task_id
+                    );
+                }
+            }
+
+            let response = match processed {
                 Ok(outcome) => {
                     // Read the stop reason before moving the text out.
                     let hit_iteration_cap = outcome.is_max_iterations();

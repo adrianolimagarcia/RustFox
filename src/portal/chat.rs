@@ -78,6 +78,7 @@ pub async fn send(
         user_name: user.clone(),
         text: text.clone(),
         attachments: vec![],
+        schedule_id: None,
     };
 
     // Bridge: agent output channels → single SSE event channel.

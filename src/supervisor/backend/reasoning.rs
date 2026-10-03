@@ -34,6 +34,7 @@ impl ReasoningBackend {
                     user_name: "supervisor".into(),
                     text: prompt,
                     attachments: Vec::new(),
+                    schedule_id: None,
                 };
                 agent
                     .process_message(&incoming, None, None, ToolUiMode::Minimal)

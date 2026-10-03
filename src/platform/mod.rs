@@ -83,6 +83,12 @@ pub struct IncomingMessage {
     pub text: String,
     /// Attached files, if any
     pub attachments: Vec<Attachment>,
+    /// Schedule that produced this turn, when the message is a scheduled run.
+    ///
+    /// `None` for ordinary chat. When set, `process_message` does not persist
+    /// the turn; the job runner writes the prompt and the result (success,
+    /// failure, cancel, and max-iterations) with this id on the segment.
+    pub schedule_id: Option<String>,
 }
 
 #[cfg(test)]
