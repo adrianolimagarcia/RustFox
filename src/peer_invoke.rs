@@ -107,6 +107,42 @@ pub fn stack_key_for_invoke(name: &str, source: &Option<InvokeSource>) -> String
     }
 }
 
+/// Where tool-call status and results should be delivered.
+///
+/// A peer invoke of a `[[bots]]` persona routes to **that** bot. Other
+/// subagents stay on the caller bot so a secondary bot is not funneled
+/// through the shim/main sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDelivery {
+    pub bot_id: String,
+    pub user_id: String,
+    pub chat_id: String,
+    /// Persist the peer turn (tool calls included) on this bot's conversation.
+    pub record_on_bot: bool,
+}
+
+pub fn tool_delivery_for_invoke(
+    caller_bot_id: &str,
+    source: Option<&InvokeSource>,
+    user_id: &str,
+    chat_id: &str,
+) -> ToolDelivery {
+    match source {
+        Some(InvokeSource::BotPersona { bot_id, .. }) => ToolDelivery {
+            bot_id: bot_id.clone(),
+            user_id: user_id.to_string(),
+            chat_id: chat_id.to_string(),
+            record_on_bot: true,
+        },
+        _ => ToolDelivery {
+            bot_id: crate::platform::normalize_bot_id(caller_bot_id).to_string(),
+            user_id: user_id.to_string(),
+            chat_id: chat_id.to_string(),
+            record_on_bot: false,
+        },
+    }
+}
+
 /// Rewrite the invoke stack key when the target is the **current** bot on the
 /// stack — by `bot_id` or that bot's `persona` — so AgentRegistry / SkillRegistry
 /// packs named like the caller's persona hard-reject as self (same cycle path).
@@ -396,6 +432,26 @@ mod tests {
         assert!(is_hard_invoke_error(&err), "unexpected: {err}");
         // Peer bot_id from another root is fine.
         assert!(guard_peer_invoke(&["qa".into()], &key).is_ok());
+    }
+
+    #[test]
+    fn tool_delivery_peer_bot_is_not_caller_main() {
+        let source = InvokeSource::BotPersona {
+            bot_id: "researcher".into(),
+            persona: "researcher".into(),
+        };
+        let d = tool_delivery_for_invoke("main", Some(&source), "42", "42");
+        assert_eq!(d.bot_id, "researcher");
+        assert!(d.record_on_bot);
+        assert_eq!(d.user_id, "42");
+        assert_eq!(d.chat_id, "42");
+    }
+
+    #[test]
+    fn tool_delivery_non_bot_stays_on_caller_not_forced_main() {
+        let d = tool_delivery_for_invoke("researcher", None, "7", "7");
+        assert_eq!(d.bot_id, "researcher");
+        assert!(!d.record_on_bot);
     }
 
     #[test]

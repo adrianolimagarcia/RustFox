@@ -10,7 +10,6 @@ use tracing::warn;
 
 use crate::cancel_registry::CancelRegistry;
 use crate::llm::{FunctionDefinition, ToolDefinition};
-use crate::platform::sender::PlatformSender;
 use crate::tool_registry::{ToolContext, ToolHandler, ToolResult, ToolUiMode};
 
 /// Controls how command execution messages are sent to Telegram.
@@ -26,22 +25,16 @@ enum SendMode {
 pub struct CommandTool {
     sandbox_dir: PathBuf,
     cancel_registry: Arc<CancelRegistry>,
-    sender: Arc<dyn PlatformSender>,
     /// Optional Slice 3 bridge: inject `secret_env` names into child env.
     secret_bridge: Option<Arc<crate::secret_store::SecretBridge>>,
     secret_env_names: Vec<String>,
 }
 
 impl CommandTool {
-    pub fn new(
-        sandbox_dir: PathBuf,
-        cancel_registry: Arc<CancelRegistry>,
-        sender: Arc<dyn PlatformSender>,
-    ) -> Self {
+    pub fn new(sandbox_dir: PathBuf, cancel_registry: Arc<CancelRegistry>) -> Self {
         Self {
             sandbox_dir,
             cancel_registry,
-            sender,
             secret_bridge: None,
             secret_env_names: Vec::new(),
         }
@@ -138,7 +131,7 @@ impl CommandTool {
             ToolUiMode::Verbose => {
                 let status_text =
                     format!("💻 Running: `{}`\n\n```\n⏳ Starting...\n```", escaped_cmd);
-                let id = self
+                let id = ctx
                     .sender
                     .show_cancel_button(&ctx.chat_id, &status_text, &cmd_id)
                     .await?;
@@ -146,7 +139,7 @@ impl CommandTool {
             }
             ToolUiMode::Minimal => {
                 let status_text = format!("⏳ Running: `{}`", escaped_cmd);
-                let id = self
+                let id = ctx
                     .sender
                     .show_cancel_button(&ctx.chat_id, &status_text, &cmd_id)
                     .await?;
@@ -211,7 +204,7 @@ impl CommandTool {
                         let capped = crate::utils::strings::truncate_tail(&output_buffer, 3500);
                         let text = format!("💻 Running: `{}`\n\n```\n{}\n```", escaped_cmd, capped);
                         if let Some(mid) = &msg_id {
-                            if let Err(e) = self.sender.edit_message(&ctx.chat_id, mid, &text).await {
+                            if let Err(e) = ctx.sender.edit_message(&ctx.chat_id, mid, &text).await {
                                 warn!("Failed to update running message: {e}");
                             }
                         }
@@ -271,11 +264,11 @@ impl CommandTool {
                             None => format!("❌ Cancelled: `{}`", escaped_cmd),
                             Some(b) => format!("❌ Cancelled: `{}`\n\n{}", escaped_cmd, b),
                         };
-                        let _ = self.sender.edit_message(&ctx.chat_id, mid, &text).await;
+                        let _ = ctx.sender.edit_message(&ctx.chat_id, mid, &text).await;
                     }
                     SendMode::Minimal => {
                         // Delete the minimal message
-                        let _ = self.sender.delete_message(&ctx.chat_id, mid).await;
+                        let _ = ctx.sender.delete_message(&ctx.chat_id, mid).await;
                     }
                     // Silent mode sends no message; nothing to clean up.
                     SendMode::Silent => {}
@@ -299,11 +292,11 @@ impl CommandTool {
                             escaped_cmd,
                             body.unwrap_or_default()
                         );
-                        let _ = self.sender.edit_message(&ctx.chat_id, mid, &text).await;
+                        let _ = ctx.sender.edit_message(&ctx.chat_id, mid, &text).await;
                     }
                     SendMode::Minimal => {
                         // Delete the minimal message
-                        let _ = self.sender.delete_message(&ctx.chat_id, mid).await;
+                        let _ = ctx.sender.delete_message(&ctx.chat_id, mid).await;
                     }
                     // Silent mode sends no message; nothing to clean up.
                     SendMode::Silent => {}
@@ -411,12 +404,8 @@ mod tests {
         let store = FakeSecretStore::with_secrets([("MY_SECRET", "inject-me-VALUE-zz9")]).unwrap();
         let pending = Arc::new(PendingSecretRegistry::default());
         let bridge = Arc::new(SecretBridge::new(Arc::new(store), pending));
-        let tool = CommandTool::new(
-            dir.path().to_path_buf(),
-            Arc::new(CancelRegistry::new()),
-            Arc::new(NopSender),
-        )
-        .with_secrets(bridge.clone(), vec!["MY_SECRET".into()]);
+        let tool = CommandTool::new(dir.path().to_path_buf(), Arc::new(CancelRegistry::new()))
+            .with_secrets(bridge.clone(), vec!["MY_SECRET".into()]);
 
         // Write env value to a file so we can assert injection even after result redaction.
         let result = tool
@@ -451,12 +440,8 @@ mod tests {
             names2.lock().unwrap().push(format!("{name}|{url}"));
         }));
 
-        let tool = CommandTool::new(
-            dir.path().to_path_buf(),
-            Arc::new(CancelRegistry::new()),
-            Arc::new(NopSender),
-        )
-        .with_secrets(bridge, vec!["MISSING_KEY".into()]);
+        let tool = CommandTool::new(dir.path().to_path_buf(), Arc::new(CancelRegistry::new()))
+            .with_secrets(bridge, vec!["MISSING_KEY".into()]);
 
         let result = tool
             .execute(
@@ -479,13 +464,78 @@ mod tests {
         assert!(!dir.path().join("should-not-run").exists());
     }
 
+    struct CountingSender {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PlatformSender for CountingSender {
+        async fn send_message(
+            &self,
+            _: &str,
+            _: &str,
+            _: MessageFormat,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn send_file(
+            &self,
+            _: &str,
+            _: &Path,
+            _: Option<&str>,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn show_cancel_button(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<PlatformMessageId> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok("9:1".into())
+        }
+        async fn edit_message(
+            &self,
+            _: &str,
+            _: &PlatformMessageId,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str, _: &PlatformMessageId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn notify_shutdown(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_status_uses_call_context_sender() {
+        let dir = tempdir().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut context = ctx(dir.path());
+        context.tool_ui_mode = ToolUiMode::Minimal;
+        context.sender = Arc::new(CountingSender {
+            hits: Arc::clone(&hits),
+        });
+        let tool = CommandTool::new(dir.path().to_path_buf(), Arc::new(CancelRegistry::new()));
+        let result = tool
+            .execute("execute_command", json!({ "command": "true" }), context)
+            .await
+            .unwrap();
+        assert!(result.contains("Exit code: 0"), "{result}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "tool status must go through ToolContext.sender (the owning bot)"
+        );
+    }
+
     #[test]
     fn resolve_spawn_secret_env_empty_when_no_bridge() {
-        let tool = CommandTool::new(
-            PathBuf::from("."),
-            Arc::new(CancelRegistry::new()),
-            Arc::new(NopSender),
-        );
+        let tool = CommandTool::new(PathBuf::from("."), Arc::new(CancelRegistry::new()));
         let map = tool.resolve_spawn_secret_env().unwrap();
         assert!(map.is_empty());
     }
