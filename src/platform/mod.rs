@@ -50,6 +50,20 @@ pub fn user_on_allowlist(allowed_user_ids: &[u64], user_id: u64) -> bool {
     allowed_user_ids.contains(&user_id)
 }
 
+/// Fresh thin-setup writes `[0]` so the bot is unowned until the first real sender.
+pub fn allowlist_is_unowned(allowed_user_ids: &[u64]) -> bool {
+    allowed_user_ids.len() == 1 && allowed_user_ids[0] == 0
+}
+
+/// Message gate. The unowned sentinel admits the first positive Telegram user id
+/// so that sender can claim the bot. `0` is not a user. Callbacks stay strict.
+pub fn user_may_send_message(allowed_user_ids: &[u64], user_id: u64) -> bool {
+    if allowlist_is_unowned(allowed_user_ids) {
+        return user_id > 0;
+    }
+    user_on_allowlist(allowed_user_ids, user_id)
+}
+
 /// A message received from any platform
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

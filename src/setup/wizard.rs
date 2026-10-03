@@ -374,6 +374,7 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .route("/api/ollama/local", get(ollama_local))
         .route("/api/ollama/library", get(ollama_library))
         .route("/api/ollama/pull", post(ollama_pull))
+        .route("/api/openrouter/models", get(openrouter_models))
         .route("/api/add-bot", post(add_bot))
         .route("/api/install-service", post(install_service))
         .route("/api/shutdown", post(shutdown_server))
@@ -455,6 +456,8 @@ struct ThinRequest {
     #[serde(default)]
     openrouter_api_key: String,
     #[serde(default)]
+    openrouter_model: String,
+    #[serde(default)]
     ollama_model: String,
     #[serde(default)]
     bot_token: String,
@@ -474,6 +477,7 @@ fn thin_answers(body: &ThinRequest) -> Result<super::thin::ThinAnswers> {
     Ok(super::thin::ThinAnswers {
         provider: super::thin::ThinProvider::parse(&body.provider)?,
         openrouter_api_key: body.openrouter_api_key.clone(),
+        openrouter_model: body.openrouter_model.clone(),
         ollama_model: body.ollama_model.clone(),
         bot_token: body.bot_token.clone(),
         system_prompt: body.system_prompt.clone(),
@@ -522,8 +526,50 @@ async fn ollama_local(State(st): State<WizardState>) -> Json<serde_json::Value> 
     }))
 }
 
-async fn ollama_library() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "models": super::thin::OLLAMA_LIBRARY }))
+#[derive(Debug, Deserialize)]
+struct LibraryQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn load_ollama_library(client: &reqwest::Client, query: &str) -> super::thin::LibraryLoad {
+    let url = super::thin::library_request_url(query);
+    let reached = match client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "RustFox-setup")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => return super::thin::library_from_http(true, &body, query),
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    super::thin::library_from_http(reached, "", query)
+}
+
+/// Ollama library names from `https://ollama.com/library`. `q` filters that
+/// catalog (Ollama's `/search` is paginated, so it is not the source of truth).
+/// A failed fetch is an error and an empty list — never a hardcoded catalog.
+async fn ollama_library(
+    State(st): State<WizardState>,
+    Query(query): Query<LibraryQuery>,
+) -> Json<serde_json::Value> {
+    let load = load_ollama_library(&st.http_client, &query.q).await;
+    Json(serde_json::json!({
+        "ok": load.ok,
+        "models": load.models,
+        "error": load.error,
+    }))
+}
+
+async fn openrouter_models() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "models": super::thin::OPENROUTER_MODELS,
+        "default": super::thin::OPENROUTER_DEFAULT_MODEL,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,7 +583,14 @@ async fn ollama_pull(
     State(st): State<WizardState>,
     Json(body): Json<OllamaPullRequest>,
 ) -> Json<serde_json::Value> {
-    let payload = match super::thin::pull_request_body(&body.model) {
+    let library = load_ollama_library(&st.http_client, "").await;
+    if !library.ok {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": library.error.unwrap_or(super::thin::OLLAMA_LIBRARY_UNAVAILABLE),
+        }));
+    }
+    let payload = match super::thin::pull_request_body(&body.model, &library.models) {
         Ok(body) => body,
         Err(e) => {
             return Json(serde_json::json!({ "ok": false, "error": e.to_string() }));
@@ -1023,9 +1076,20 @@ async fn run_cli(config_dir: &Path) -> Result<()> {
             println!("  0) Pull from the Ollama library");
             let pick = read_line("Pick a number: ")?;
             if pick == "0" {
-                let library = super::thin::library_choices(&detect.models);
+                let filter = read_line("Filter the Ollama library (empty shows the library): ")?;
+                let loaded = load_ollama_library(&client, &filter).await;
+                if !loaded.ok {
+                    bail!(
+                        "{}",
+                        loaded
+                            .error
+                            .unwrap_or(super::thin::OLLAMA_LIBRARY_UNAVAILABLE)
+                    );
+                }
+                let library =
+                    super::thin::library_not_already_local(&loaded.models, &detect.models);
                 if library.is_empty() {
-                    bail!("every featured Ollama library model is already local");
+                    bail!("no Ollama library models match that filter");
                 }
                 println!("Ollama library:");
                 for (i, name) in library.iter().enumerate() {
@@ -1037,8 +1101,8 @@ async fn run_cli(config_dir: &Path) -> Result<()> {
                     .ok()
                     .filter(|n| (1..=library.len()).contains(n))
                     .context("pick a model from the Ollama library list")?;
-                let name = library[idx - 1];
-                let payload = super::thin::pull_request_body(name)?;
+                let name = library[idx - 1].clone();
+                let payload = super::thin::pull_request_body(&name, &loaded.models)?;
                 let resp = client
                     .post(super::thin::OLLAMA_PULL_URL)
                     .json(&payload)
@@ -1053,7 +1117,7 @@ async fn run_cli(config_dir: &Path) -> Result<()> {
                 ollama_model = again
                     .models
                     .into_iter()
-                    .find(|m| m == name || m.starts_with(&format!("{name}:")))
+                    .find(|m| *m == name || m.starts_with(&format!("{name}:")))
                     .unwrap_or_else(|| format!("{name}:latest"));
             } else {
                 let idx: usize = pick
@@ -1066,8 +1130,33 @@ async fn run_cli(config_dir: &Path) -> Result<()> {
         }
     }
 
+    let mut openrouter_model = String::new();
     if provider == super::thin::ThinProvider::OpenRouter {
         or_key = read_line("OpenRouter API key: ")?;
+        println!("OpenRouter model:");
+        for (i, name) in super::thin::OPENROUTER_MODELS.iter().enumerate() {
+            let mark = if *name == super::thin::OPENROUTER_DEFAULT_MODEL {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("  {}) {name}{mark}", i + 1);
+        }
+        let prompt = format!(
+            "Pick a number [{}]: ",
+            super::thin::OPENROUTER_DEFAULT_MODEL
+        );
+        let pick = read_line(&prompt)?;
+        openrouter_model = if pick.is_empty() {
+            super::thin::OPENROUTER_DEFAULT_MODEL.to_string()
+        } else {
+            let idx: usize = pick
+                .parse()
+                .ok()
+                .filter(|n| (1..=super::thin::OPENROUTER_MODELS.len()).contains(n))
+                .context("pick an OpenRouter model")?;
+            super::thin::OPENROUTER_MODELS[idx - 1].to_string()
+        };
     }
     let tg_token = read_line("Telegram bot token: ")?;
     let sentence = read_line("System prompt (one sentence): ")?;
@@ -1075,6 +1164,7 @@ async fn run_cli(config_dir: &Path) -> Result<()> {
     let config = super::thin::render_config(&super::thin::ThinAnswers {
         provider,
         openrouter_api_key: or_key,
+        openrouter_model,
         ollama_model,
         bot_token: tg_token,
         system_prompt: sentence,

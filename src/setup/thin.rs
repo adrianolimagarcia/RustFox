@@ -1,12 +1,14 @@
-//! Thin setup: four fields, safe defaults.
+//! Thin setup.
 //!
 //! Provider is OpenRouter (the default) or Ollama. OpenRouter asks for an
-//! API key and keeps the schema's default model. Ollama never asks for a
-//! base URL or a typed model id: a running daemon's tags are the choices,
-//! and a model that is not already local is picked from one library list
-//! and pulled once. Bot token and one system-prompt sentence are the other
-//! two fields. Tools and MCP are not questions. Sandbox-safe tools stay on
-//! because the written config does not set a tool whitelist.
+//! API key and a model chosen from a short list (no typed model id).
+//! Ollama never asks for a base URL or a typed model id: a running daemon's
+//! tags are the already-local choices, and a model that is not local is
+//! picked from the Ollama library page (`https://ollama.com/library`,
+//! filtered locally — `/search` is paginated) and pulled once after that pick. Bot token and one
+//! system-prompt sentence are the other fields. Tools and MCP are not
+//! questions. Sandbox-safe tools stay on because the written config does
+//! not set a tool whitelist.
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -19,18 +21,26 @@ pub const OLLAMA_PROVIDER_BASE: &str = "http://127.0.0.1:11434/v1";
 
 pub const OLLAMA_NOT_RUNNING: &str = "Ollama is not running.";
 
-/// Featured library names (default tag). One list: no sizes, no quantizations,
-/// no repo browser. Each name is a model on the Ollama library.
-pub const OLLAMA_LIBRARY: &[&str] = &[
-    "llama3.2",
-    "llama3.1",
-    "qwen2.5",
-    "qwen3",
-    "gemma3",
-    "mistral",
-    "phi3",
-    "deepseek-r1",
+/// Ollama's public library page. One HTML page lists the catalog. Search is a
+/// filter over that page: `https://ollama.com/search?q=` is real but paginated
+/// (about 20 names per page), so it is not the source of truth.
+pub const OLLAMA_LIBRARY_URL: &str = "https://ollama.com/library";
+pub const OLLAMA_LIBRARY_UNAVAILABLE: &str = "Could not load the Ollama library.";
+
+/// Short OpenRouter pick list. Each id is either the schema default or was
+/// present on `https://openrouter.ai/api/v1/models` when this list was set.
+/// Do not grow it into a typed model id.
+pub const OPENROUTER_MODELS: &[&str] = &[
+    "moonshotai/kimi-k2.6",
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "google/gemini-2.5-flash",
+    "qwen/qwen3-32b",
 ];
+/// Same string as `config::default_model`. Kept here so the wizard can select
+/// it without calling a private function. It is the first list entry.
+pub const OPENROUTER_DEFAULT_MODEL: &str = "moonshotai/kimi-k2.6";
 
 /// Sandbox-safe builtins. A missing whitelist keeps these on (install default).
 pub const SANDBOX_SAFE_TOOLS: &[&str] =
@@ -63,17 +73,28 @@ impl ThinProvider {
     }
 }
 
-/// The only questions the wizard asks, in order.
-pub fn wizard_fields(provider: ThinProvider) -> [&'static str; 4] {
+/// Questions the wizard asks, in order. OpenRouter adds a model pick.
+/// There is still no allowlist, tools, or MCP question.
+pub fn wizard_fields(provider: ThinProvider) -> Vec<&'static str> {
     match provider {
-        ThinProvider::OpenRouter => [
+        ThinProvider::OpenRouter => vec![
             "provider",
             "openrouter_api_key",
+            "openrouter_model",
             "bot_token",
             "system_prompt",
         ],
-        ThinProvider::Ollama => ["provider", "ollama_model", "bot_token", "system_prompt"],
+        ThinProvider::Ollama => {
+            vec!["provider", "ollama_model", "bot_token", "system_prompt"]
+        }
     }
+}
+
+/// The catalog request. `query` is not sent to Ollama search; [`filter_library`]
+/// applies it after the library page is parsed, so a match past search page 1
+/// is still offered.
+pub fn library_request_url(_query: &str) -> String {
+    OLLAMA_LIBRARY_URL.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,32 +148,107 @@ fn model_base(name: &str) -> &str {
     name.split(':').next().unwrap_or(name).trim()
 }
 
-/// Library names that are not already present locally. One list, no tags.
-pub fn library_choices(local: &[String]) -> Vec<&'static str> {
-    let have: Vec<&str> = local.iter().map(|n| model_base(n)).collect();
-    OLLAMA_LIBRARY
+/// Names linked as `/library/{name}` in an Ollama library or search page.
+/// Tags and quantization paths are not names: the href is the library id.
+pub fn library_names_from_html(html: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = html.as_bytes();
+    let needle = b"/library/";
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        let start = i + needle.len();
+        let mut end = start;
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if end > start {
+            let name = &html[start..end];
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+        i = end.max(start);
+    }
+    names
+}
+
+/// Case-insensitive substring filter. Empty query keeps the loaded list.
+pub fn filter_library(names: &[String], query: &str) -> Vec<String> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return names.to_vec();
+    }
+    names
         .iter()
-        .copied()
-        .filter(|name| !have.iter().any(|h| h == name))
+        .filter(|name| name.to_ascii_lowercase().contains(&query))
+        .cloned()
         .collect()
 }
 
-/// Rejects a typed id, a tag/quantization, and anything outside the one list.
-/// Does not pull.
-pub fn validate_library_pick(name: &str) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryLoad {
+    pub ok: bool,
+    pub models: Vec<String>,
+    /// Set only when the library page could not be loaded. Never a fallback list.
+    pub error: Option<&'static str>,
+}
+
+/// `reached_ok` is a successful library/search response. Failure does not
+/// invent names.
+pub fn library_from_http(reached_ok: bool, body: &str, query: &str) -> LibraryLoad {
+    if !reached_ok {
+        return LibraryLoad {
+            ok: false,
+            models: Vec::new(),
+            error: Some(OLLAMA_LIBRARY_UNAVAILABLE),
+        };
+    }
+    LibraryLoad {
+        ok: true,
+        models: filter_library(&library_names_from_html(body), query),
+        error: None,
+    }
+}
+
+/// Library names whose base is not already installed. No pull.
+pub fn library_not_already_local(library: &[String], local: &[String]) -> Vec<String> {
+    let have: Vec<&str> = local.iter().map(|n| model_base(n)).collect();
+    library
+        .iter()
+        .filter(|name| !have.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Rejects a typed id, a tag/quantization, and anything not in this response.
+/// Does not pull. `library_results` is the parsed Ollama page, not a built-in list.
+pub fn validate_library_pick(name: &str, library_results: &[String]) -> Result<()> {
     let name = name.trim();
     if name.is_empty() || name.contains(':') || name.contains('/') || name.contains(' ') {
         bail!("pick a model from the Ollama library list");
     }
-    if !OLLAMA_LIBRARY.contains(&name) {
+    if !library_results.iter().any(|item| item == name) {
         bail!("pick a model from the Ollama library list");
     }
     Ok(())
 }
 
-pub fn pull_request_body(name: &str) -> Result<Value> {
-    validate_library_pick(name)?;
+pub fn pull_request_body(name: &str, library_results: &[String]) -> Result<Value> {
+    validate_library_pick(name, library_results)?;
     Ok(serde_json::json!({ "name": name.trim(), "stream": false }))
+}
+
+pub fn openrouter_model_allowed(model: &str) -> bool {
+    OPENROUTER_MODELS.contains(&model.trim())
 }
 
 /// A detected local name, or a library name after it has been pulled
@@ -166,6 +262,7 @@ pub fn ollama_choice_allowed(chosen: &str, local: &[String]) -> bool {
 pub struct ThinAnswers {
     pub provider: ThinProvider,
     pub openrouter_api_key: String,
+    pub openrouter_model: String,
     pub ollama_model: String,
     pub bot_token: String,
     pub system_prompt: String,
@@ -199,6 +296,11 @@ pub fn render_config(answers: &ThinAnswers) -> Result<String> {
                 bail!("OpenRouter API key is required");
             }
             openrouter.insert("api_key".into(), toml::Value::String(key.to_string()));
+            let model = answers.openrouter_model.trim();
+            if !openrouter_model_allowed(model) {
+                bail!("pick an OpenRouter model");
+            }
+            openrouter.insert("model".into(), toml::Value::String(model.to_string()));
         }
         ThinProvider::Ollama => {
             let model = answers.ollama_model.trim();
@@ -298,6 +400,7 @@ mod tests {
         ThinAnswers {
             provider: ThinProvider::OpenRouter,
             openrouter_api_key: "sk-or-test".into(),
+            openrouter_model: "openai/gpt-4o".into(),
             ollama_model: String::new(),
             bot_token: "123:abc".into(),
             system_prompt: "Be brief and kind.".into(),
@@ -311,10 +414,9 @@ mod tests {
     }
 
     #[test]
-    fn wizard_asks_only_the_four_fields() {
+    fn wizard_asks_provider_key_or_model_token_and_sentence() {
         for provider in [ThinProvider::OpenRouter, ThinProvider::Ollama] {
             let fields = wizard_fields(provider);
-            assert_eq!(fields.len(), 4);
             assert_eq!(fields[0], "provider");
             assert!(fields.contains(&"bot_token"));
             assert!(fields.contains(&"system_prompt"));
@@ -335,8 +437,12 @@ mod tests {
                 );
             }
         }
-        assert!(wizard_fields(ThinProvider::OpenRouter).contains(&"openrouter_api_key"));
-        assert!(!wizard_fields(ThinProvider::OpenRouter).contains(&"ollama_model"));
+        let openrouter = wizard_fields(ThinProvider::OpenRouter);
+        assert!(openrouter.contains(&"openrouter_api_key"));
+        assert!(openrouter.contains(&"openrouter_model"));
+        assert!(!openrouter.contains(&"ollama_model"));
+        assert_eq!(openrouter.len(), 5);
+        assert_eq!(wizard_fields(ThinProvider::Ollama).len(), 4);
         assert!(wizard_fields(ThinProvider::Ollama).contains(&"ollama_model"));
         assert!(!wizard_fields(ThinProvider::Ollama).contains(&"openrouter_api_key"));
         assert!(ThinProvider::parse("").unwrap() == ThinProvider::OpenRouter);
@@ -354,8 +460,9 @@ mod tests {
         let cfg = parse(&text);
         assert_eq!(cfg.openrouter.api_key, "sk-or-test");
         assert_eq!(cfg.openrouter.system_prompt, "Be brief and kind.");
-        // Model omitted so the schema default stays the OpenRouter model.
-        assert_eq!(cfg.openrouter.model, "moonshotai/kimi-k2.6");
+        // The chosen pick is written, not left to the schema default.
+        assert_eq!(cfg.openrouter.model, "openai/gpt-4o");
+        assert_ne!(cfg.openrouter.model, OPENROUTER_DEFAULT_MODEL);
         assert_eq!(cfg.openrouter.base_url, "https://openrouter.ai/api/v1");
         assert!(cfg.provider.is_empty());
         assert!(cfg.mcp_servers.is_empty());
@@ -371,10 +478,23 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_default_selection_is_on_the_list_and_rejected_ids_fail() {
+        assert!(OPENROUTER_MODELS.contains(&OPENROUTER_DEFAULT_MODEL));
+        assert!(OPENROUTER_MODELS.len() >= 4 && OPENROUTER_MODELS.len() <= 8);
+        let mut answers = openrouter_answers();
+        answers.openrouter_model = OPENROUTER_DEFAULT_MODEL.into();
+        let cfg = parse(&render_config(&answers).unwrap());
+        assert_eq!(cfg.openrouter.model, OPENROUTER_DEFAULT_MODEL);
+        answers.openrouter_model = "not/a-real-model".into();
+        assert!(render_config(&answers).is_err());
+    }
+
+    #[test]
     fn ollama_config_uses_detected_model_and_fixed_base() {
         let answers = ThinAnswers {
             provider: ThinProvider::Ollama,
             openrouter_api_key: String::new(),
+            openrouter_model: String::new(),
             ollama_model: "llama3.2:latest".into(),
             bot_token: "123:abc".into(),
             system_prompt: "Speak plainly.".into(),
@@ -421,21 +541,51 @@ mod tests {
         assert!(ollama_choice_allowed("llama3.2:latest", &up.models));
         assert!(!ollama_choice_allowed("typed-by-hand", &up.models));
 
-        let library = library_choices(&up.models);
-        assert!(!library.contains(&"llama3.2"));
-        assert!(library.contains(&"mistral"));
-        for name in &library {
-            assert!(!name.contains(':'));
-            assert!(!name.contains('/'));
-        }
-        assert!(validate_library_pick("llama3.2:q4_K_M").is_err());
-        assert!(validate_library_pick("huggingface/foo").is_err());
-        assert!(validate_library_pick("not-a-library-model").is_err());
-        let body = pull_request_body("mistral").unwrap();
-        assert_eq!(body["name"], "mistral");
+        // Library names come from the fetched page, not a built-in eight.
+        let html = r#"
+            <a href="/library/orca-mini">orca</a>
+            <a href="/library/tinyllama">tiny</a>
+            <a href="/library/orca-mini">dup</a>
+            <a href="/library/llama3.2:q4_K_M">ignored tag path is not a name char wait</a>
+        "#;
+        // The tag-like href still stops at ':' so it must not become a quant pick.
+        let load = library_from_http(true, html, "");
+        assert!(load.ok);
+        assert!(load.error.is_none());
+        assert_eq!(
+            load.models,
+            vec![
+                "orca-mini".to_string(),
+                "tinyllama".to_string(),
+                "llama3.2".to_string()
+            ]
+        );
+        let filtered = library_from_http(true, html, "orca");
+        assert_eq!(filtered.models, vec!["orca-mini".to_string()]);
+        let not_local = library_not_already_local(&load.models, &up.models);
+        assert!(!not_local.iter().any(|n| n == "llama3.2"));
+        assert!(not_local.iter().any(|n| n == "orca-mini"));
+
+        let failed = library_from_http(false, html, "llama");
+        assert!(!failed.ok);
+        assert!(
+            failed.models.is_empty(),
+            "must not fall back to a hardcoded list"
+        );
+        assert_eq!(failed.error, Some(OLLAMA_LIBRARY_UNAVAILABLE));
+
+        assert_eq!(library_request_url(""), OLLAMA_LIBRARY_URL);
+        // Search filters the full library page. It does not call paginated /search.
+        assert_eq!(library_request_url("llama 3"), OLLAMA_LIBRARY_URL);
+
+        let body = pull_request_body("orca-mini", &load.models).unwrap();
+        assert_eq!(body["name"], "orca-mini");
         assert_eq!(body["stream"], false);
-        // Detecting tags does not build a pull. Pull exists only after a pick.
-        assert!(pull_request_body("").is_err());
+        // Not in this response, even if it used to be a hardcoded name.
+        assert!(pull_request_body("mistral", &load.models).is_err());
+        assert!(pull_request_body("orca-mini:q4_K_M", &load.models).is_err());
+        assert!(pull_request_body("huggingface/foo", &load.models).is_err());
+        assert!(pull_request_body("", &load.models).is_err());
     }
 
     #[test]
@@ -474,8 +624,10 @@ mod tests {
         assert!(html.contains("id=\"f-telegram-token\""));
         assert!(html.contains("id=\"f-system-prompt\""));
         assert!(html.contains("id=\"f-openrouter-key\""));
+        assert!(html.contains("<select id=\"f-openrouter-model\""));
         assert!(html.contains("<select id=\"f-ollama-model\""));
         assert!(html.contains("<select id=\"f-ollama-library\""));
+        assert!(html.contains("id=\"f-ollama-search\""));
         assert!(html.contains("Ollama is not running."));
         assert!(html.contains("Use OpenRouter"));
         assert!(!html.contains("id=\"f-allowed-ids\""));

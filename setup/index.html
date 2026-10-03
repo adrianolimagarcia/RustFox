@@ -494,6 +494,7 @@ const state = {
   provider: 'openrouter',
   telegram_token: '',
   openrouter_key: '',
+  openrouter_model: '',
   ollama_model: '',
   system_prompt: '',
   ollama_running: false,
@@ -568,7 +569,7 @@ function validateStep() {
     if (!state.ollama_running) ok = 0;
     ok = requireField('f-ollama-model') & ok;
   } else {
-    ok = requireField('f-openrouter-key') & ok;
+    ok = requireField('f-openrouter-key') & requireField('f-openrouter-model') & ok;
   }
   return !!ok;
 }
@@ -578,6 +579,7 @@ function collectStep() {
   state.provider = ollama && ollama.checked ? 'ollama' : 'openrouter';
   state.telegram_token = (document.getElementById('f-telegram-token')?.value || '').trim();
   state.openrouter_key = (document.getElementById('f-openrouter-key')?.value || '').trim();
+  state.openrouter_model = (document.getElementById('f-openrouter-model')?.value || '').trim();
   state.ollama_model = (document.getElementById('f-ollama-model')?.value || '').trim();
   state.system_prompt = (document.getElementById('f-system-prompt')?.value || '').trim();
 }
@@ -586,6 +588,7 @@ function thinBody() {
   return {
     provider: state.provider,
     openrouter_api_key: state.provider === 'openrouter' ? state.openrouter_key : '',
+    openrouter_model: state.provider === 'openrouter' ? state.openrouter_model : '',
     ollama_model: state.provider === 'ollama' ? state.ollama_model : '',
     bot_token: state.telegram_token,
     system_prompt: state.system_prompt,
@@ -644,19 +647,65 @@ async function loadOllama() {
     if (previous && state.ollama_models.indexOf(previous) !== -1) sel.value = previous;
     state.ollama_model = sel.value || '';
     localWrap.style.display = 'block';
-    const lib = await fetch('/api/ollama/library');
-    const libData = await lib.json();
-    const have = new Set(state.ollama_models.map(n => String(n).split(':')[0]));
-    const choices = (libData.models || []).filter(n => !have.has(n));
-    const libSel = document.getElementById('f-ollama-library');
-    libSel.innerHTML = choices.map(name =>
-      `<option value="${escHtml(name)}">${escHtml(name)}</option>`
-    ).join('');
+    await loadLibrary(document.getElementById('f-ollama-search')?.value || '');
   } catch (e) {
     state.ollama_running = false;
     down.textContent = 'Ollama is not running.';
     down.style.display = 'block';
   }
+}
+
+let libraryTimer = null;
+function scheduleLibrarySearch() {
+  clearTimeout(libraryTimer);
+  libraryTimer = setTimeout(() => {
+    const q = document.getElementById('f-ollama-search');
+    loadLibrary(q ? q.value : '');
+  }, 250);
+}
+
+async function loadLibrary(query) {
+  const err = document.getElementById('ollama-library-error');
+  const libSel = document.getElementById('f-ollama-library');
+  if (!libSel) return;
+  if (err) err.style.display = 'none';
+  let libData = null;
+  try {
+    const lib = await fetch('/api/ollama/library?q=' + encodeURIComponent(query || ''));
+    libData = await lib.json();
+  } catch (e) {
+    libData = { ok: false, models: [], error: 'Could not load the Ollama library.' };
+  }
+  if (!libData || libData.ok === false) {
+    libSel.innerHTML = '';
+    if (err) {
+      err.textContent = (libData && libData.error) || 'Could not load the Ollama library.';
+      err.style.display = 'block';
+    }
+    return;
+  }
+  const have = new Set(state.ollama_models.map(n => String(n).split(':')[0]));
+  const choices = (libData.models || []).filter(n => !have.has(n));
+  libSel.innerHTML = choices.map(name =>
+    `<option value="${escHtml(name)}">${escHtml(name)}</option>`
+  ).join('');
+}
+
+async function loadOpenRouterModels() {
+  const sel = document.getElementById('f-openrouter-model');
+  if (!sel) return;
+  const res = await fetch('/api/openrouter/models');
+  const data = await res.json();
+  const models = data.models || [];
+  const fallback = data.default || '';
+  sel.innerHTML = models.map(name =>
+    `<option value="${escHtml(name)}">${escHtml(name)}</option>`
+  ).join('');
+  const want = state.openrouter_model && models.indexOf(state.openrouter_model) !== -1
+    ? state.openrouter_model
+    : fallback;
+  if (want) sel.value = want;
+  state.openrouter_model = sel.value || '';
 }
 
 function showLibraryList() {
@@ -698,10 +747,14 @@ function renderSummary() {
   const second = state.provider === 'ollama'
     ? escHtml(state.ollama_model || '(pick a model)')
     : escHtml(state.openrouter_key ? maskSecret(state.openrouter_key) : '(missing)');
+  const modelRow = state.provider === 'ollama'
+    ? ''
+    : row('OpenRouter model', escHtml(state.openrouter_model || '(pick a model)'));
   el.innerHTML =
     '<div class="summary-section"><h3>Setup</h3><div class="summary-list">' +
     row('Provider', escHtml(provider)) +
     row(state.provider === 'ollama' ? 'Ollama model' : 'OpenRouter key', second) +
+    modelRow +
     row('Bot token', escHtml(state.telegram_token ? maskSecret(state.telegram_token) : '(missing)')) +
     row('System prompt', escHtml(state.system_prompt || '(missing)')) +
     '</div></div>';
@@ -785,6 +838,7 @@ async function loadExistingConfig() {
     if (!cfg.exists) return;
     if (cfg.telegram_token && cfg.telegram_token !== '***') state.telegram_token = cfg.telegram_token;
     if (cfg.openrouter_key && cfg.openrouter_key !== '***') state.openrouter_key = cfg.openrouter_key;
+    if (cfg.model) state.openrouter_model = cfg.model;
     if (cfg.system_prompt) state.system_prompt = cfg.system_prompt;
     state._loaded = true;
   } catch (_) {}
@@ -794,7 +848,7 @@ function buildSteps() {
   const c = document.getElementById('steps-container');
   c.innerHTML = `<div class="step" id="step-1">
   <h2>🤖 Setup</h2>
-  <p class="subtitle">Four fields. OpenRouter is the default. Everything else stays a safe default.</p>
+  <p class="subtitle">OpenRouter is the default. Pick a model from the list. Everything else stays a safe default.</p>
   <div class="field">
     <label>Provider</label>
     <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
@@ -812,6 +866,11 @@ function buildSteps() {
       <input type="password" id="f-openrouter-key" placeholder="sk-or-..." value="${escHtml(state.openrouter_key)}" oninput="clearFieldError(this)">
       <div class="error-msg">API key is required.</div>
     </div>
+    <div class="field">
+      <label>OpenRouter model <span class="hint">— pick one, no typed id</span></label>
+      <select id="f-openrouter-model"></select>
+      <div class="error-msg">Pick an OpenRouter model.</div>
+    </div>
   </div>
   <div id="ollama-fields" style="display:none">
     <p id="ollama-down" class="error-msg visible" style="display:none">Ollama is not running.</p>
@@ -825,7 +884,9 @@ function buildSteps() {
       <button type="button" class="btn-secondary" onclick="showLibraryList()">Pull a model that is not on this machine</button>
       <div id="ollama-library-wrap" style="display:none;margin-top:0.75rem">
         <div class="field">
-          <label>Ollama library <span class="hint">— one list, pulled after you pick</span></label>
+          <label>Ollama library <span class="hint">— from ollama.com, pulled after you pick</span></label>
+          <input type="text" id="f-ollama-search" placeholder="Search the library" oninput="scheduleLibrarySearch()">
+          <p id="ollama-library-error" class="error-msg visible" style="display:none"></p>
           <select id="f-ollama-library"></select>
         </div>
         <button type="button" class="btn-secondary" onclick="pullLibraryModel()">Pull</button>
@@ -870,6 +931,7 @@ function buildSteps() {
 async function init() {
   await loadExistingConfig();
   buildSteps();
+  try { await loadOpenRouterModels(); } catch (_) {}
   if (state._loaded) document.getElementById('existing-banner').style.display = 'block';
   showStep(1);
 }

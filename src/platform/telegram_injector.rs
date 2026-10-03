@@ -263,7 +263,7 @@ impl UpdateInjector {
 pub fn message_passes_allowlist(allowed_user_ids: &[u64], msg: &Message) -> bool {
     msg.from
         .as_ref()
-        .is_some_and(|u| user_on_allowlist(allowed_user_ids, u.id.0))
+        .is_some_and(|u| crate::platform::user_may_send_message(allowed_user_ids, u.id.0))
 }
 
 /// Same predicate as the model-callback `filter_map` in `telegram::run`.
@@ -418,9 +418,17 @@ impl UpdateInjector {
         let msg = Self::message_from_update(update)
             .cloned()
             .context("message route but Update has no Message")?;
-        super::telegram::handle_message(bot, msg, agent, self.bot_id.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("handle_message failed: {e}"))?;
+        super::telegram::handle_message(
+            bot,
+            msg,
+            agent,
+            self.bot_id.clone(),
+            super::telegram::LiveAllowlist(Arc::new(std::sync::RwLock::new(
+                self.allowed_user_ids.clone(),
+            ))),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("handle_message failed: {e}"))?;
         Ok(HandlerRoute::Message)
     }
 }
@@ -468,6 +476,20 @@ mod tests {
         let bad = text_update(99, "hello");
         assert_eq!(inj.route(&bad), HandlerRoute::RejectedAllowlist);
         assert!(inj.extract_incoming(&bad).is_none());
+    }
+
+    #[test]
+    fn unowned_sentinel_admits_a_real_sender_message_only() {
+        let first = text_update(99, "hello");
+        let msg = UpdateInjector::message_from_update(&first).unwrap();
+        assert!(message_passes_allowlist(&[0], msg));
+        assert!(!message_passes_allowlist(&[42], msg));
+        let inj = UpdateInjector::new([0u64]);
+        assert_eq!(inj.route(&first), HandlerRoute::Message);
+        // A callback is not a claim. User 0 is not on a real allowlist of [42].
+        assert!(!crate::platform::user_may_send_message(&[0], 0));
+        assert!(crate::platform::user_may_send_message(&[0], 99));
+        assert!(!crate::platform::allowlist_is_unowned(&[42]));
     }
 
     #[test]

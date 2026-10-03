@@ -285,6 +285,11 @@ pub async fn notify_secret_request(
     }
 }
 
+/// In-memory copy of this dispatcher's allowlist. The first real sender
+/// replaces the unowned sentinel `[0]` here after the config file is persisted.
+#[derive(Clone)]
+pub struct LiveAllowlist(pub Arc<std::sync::RwLock<Vec<u64>>>);
+
 /// Run the Telegram bot platform for a single `[[bots]]` entry.
 ///
 /// `bot_id` is the stable config id used for conversation isolation and
@@ -319,10 +324,17 @@ pub async fn run(
         Err(e) => warn!(error = %e, "Failed to register Telegram commands"),
     }
 
+    let live_allowlist = LiveAllowlist(Arc::new(std::sync::RwLock::new(allowed_user_ids)));
+
     let message_handler = Update::filter_message()
         .filter_map({
-            let allowed = allowed_user_ids.clone();
+            let live = live_allowlist.clone();
             move |msg: Message| {
+                let allowed = live
+                    .0
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 if crate::platform::telegram_injector::message_passes_allowlist(&allowed, &msg) {
                     Some(msg)
                 } else {
@@ -334,8 +346,13 @@ pub async fn run(
 
     let callback_handler = Update::filter_callback_query()
         .filter_map({
-            let allowed = allowed_user_ids.clone();
+            let live = live_allowlist.clone();
             move |q: CallbackQuery| {
+                let allowed = live
+                    .0
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 if crate::platform::telegram_injector::callback_passes_allowlist(&allowed, &q) {
                     Some(q)
                 } else {
@@ -361,7 +378,7 @@ pub async fn run(
         .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![agent, bot_id])
+        .dependencies(dptree::deps![agent, bot_id, live_allowlist])
         // Commands (like /btw) bypass per-chat serialization for true concurrency.
         // Regular messages keep per-chat ordering to avoid race conditions.
         .distribution_function(|upd: &Update| {
@@ -1211,6 +1228,7 @@ pub async fn handle_message(
     msg: Message,
     agent: Arc<Agent>,
     bot_id: String,
+    allowlist: LiveAllowlist,
 ) -> ResponseResult<()> {
     let user = match msg.from.as_ref() {
         Some(user) => user,
@@ -1218,6 +1236,32 @@ pub async fn handle_message(
     };
 
     let user_id = user.id.0;
+    // First real Telegram message claims allowed_user_ids = [0]. Callbacks do not.
+    match crate::config_edit::claim_unowned_bot(&agent.config_path, &bot_id, user_id) {
+        Ok(crate::config_edit::UnownedClaim::Claimed) => {
+            if let Ok(mut guard) = allowlist.0.write() {
+                *guard = vec![user_id];
+            }
+            info!(bot_id = %bot_id, user_id, "claimed unowned bot allowlist");
+        }
+        Ok(crate::config_edit::UnownedClaim::Rejected) => {
+            info!(bot_id = %bot_id, user_id, "rejected sender after allowlist claim");
+            return Ok(());
+        }
+        Ok(crate::config_edit::UnownedClaim::Unchanged) => {}
+        Err(e) => {
+            let unowned = allowlist
+                .0
+                .read()
+                .map(|guard| crate::platform::allowlist_is_unowned(&guard))
+                .unwrap_or(false);
+            if unowned {
+                warn!(bot_id = %bot_id, error = %e, "failed to persist allowlist claim");
+                return Ok(());
+            }
+            warn!(bot_id = %bot_id, error = %e, "allowlist claim check failed");
+        }
+    }
     let user_name = user.first_name.clone();
     let mut msg_format = load_message_format(&agent.memory, &user_id.to_string()).await;
 
