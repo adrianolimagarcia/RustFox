@@ -518,7 +518,12 @@ mod tests {
         }
     }
 
-    async fn build_tools() -> (SchedulingTools, ScheduledTaskStore, Arc<FakeScheduling>) {
+    async fn build_tools() -> (
+        SchedulingTools,
+        ScheduledTaskStore,
+        Arc<FakeScheduling>,
+        RerunQueue,
+    ) {
         let memory = MemoryStore::open_in_memory().unwrap();
         let store = ScheduledTaskStore::new(memory.connection());
         let rerun_queue = RerunQueue::new(memory.connection());
@@ -542,9 +547,9 @@ mod tests {
             job_tx,
             bot,
             telegram_bots,
-            rerun_queue,
+            rerun_queue.clone(),
         );
-        (tools, store, fake)
+        (tools, store, fake, rerun_queue)
     }
 
     /// Regression (issue #109, Bug 2): `schedule_task` must persist the live
@@ -552,7 +557,7 @@ mod tests {
     /// `scheduler_job_id = NULL`, so a cancel could never disarm the job.
     #[tokio::test]
     async fn schedule_task_persists_scheduler_job_id() {
-        let (tools, store, fake) = build_tools().await;
+        let (tools, store, fake, _queue) = build_tools().await;
         let ctx = make_ctx("80180742");
 
         let out = tools
@@ -588,7 +593,7 @@ mod tests {
     /// cron expression (which is what the tool used to write).
     #[tokio::test]
     async fn schedule_task_stores_real_next_run_timestamp() {
-        let (tools, store, _fake) = build_tools().await;
+        let (tools, store, _fake, _queue) = build_tools().await;
 
         tools
             .execute(
@@ -626,7 +631,7 @@ mod tests {
     /// "No active scheduled tasks.".
     #[tokio::test]
     async fn list_from_scheduled_run_context_is_not_empty() {
-        let (tools, store, _fake) = build_tools().await;
+        let (tools, store, _fake, _queue) = build_tools().await;
 
         // Create the task under the owner, then list as the composite run id.
         tools
@@ -660,7 +665,7 @@ mod tests {
     /// live job is actually removed (not just the DB status flipped).
     #[tokio::test]
     async fn cancel_scheduled_task_disarms_live_job() {
-        let (tools, store, fake) = build_tools().await;
+        let (tools, store, fake, _queue) = build_tools().await;
         let ctx = make_ctx("80180742");
         tools
             .execute(
@@ -706,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_scheduled_tasks_is_scoped_to_the_current_bot() {
-        let (tools, _store, _fake) = build_tools().await;
+        let (tools, _store, _fake, _queue) = build_tools().await;
         tools
             .execute(
                 "schedule_task",
@@ -720,10 +725,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut other = make_ctx("owner");
-        other.bot_id = "researcher".into();
+        let other = || {
+            let mut ctx = make_ctx("owner");
+            ctx.bot_id = "researcher".into();
+            ctx
+        };
         let hidden = tools
-            .execute("list_scheduled_tasks", json!({}), other)
+            .execute("list_scheduled_tasks", json!({}), other())
             .await
             .unwrap();
         assert!(
@@ -737,6 +745,151 @@ mod tests {
         assert!(
             mine.contains("alpha"),
             "current bot must see its cron: {mine}"
+        );
+    }
+
+    /// A bot that does not own the row cannot cancel it, read its history,
+    /// rerun it, or retry/cancel its dead-letter row.
+    #[tokio::test]
+    async fn other_bot_cannot_cancel_history_rerun_or_dead_letter() {
+        let (tools, store, fake, queue) = build_tools().await;
+        tools
+            .execute(
+                "schedule_task",
+                json!({
+                    "trigger_type": "recurring",
+                    "trigger_value": "0 0 4 * * *",
+                    "prompt": "owner only",
+                    "description": "owned"
+                }),
+                make_ctx("owner"),
+            )
+            .await
+            .unwrap();
+        let task = store
+            .list_active_for_bot(crate::platform::DEFAULT_BOT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        store
+            .insert_run(
+                "run-owned",
+                &task.id,
+                "2026-10-03T00:00:00",
+                Some("owner-only-history"),
+                None,
+                "completed",
+            )
+            .await
+            .unwrap();
+        let queue_id = queue
+            .enqueue_manual(&task.id, "run-owned", "stalled")
+            .await
+            .unwrap();
+
+        let other = || {
+            let mut ctx = make_ctx("owner");
+            ctx.bot_id = "researcher".into();
+            ctx
+        };
+
+        let cancel = tools
+            .execute(
+                "cancel_scheduled_task",
+                json!({ "task_id": task.id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            cancel.contains("Task not found"),
+            "other bot must not cancel: {cancel}"
+        );
+        assert!(!cancel.contains("Cancelled task"));
+        assert!(
+            fake.disarmed.lock().await.is_empty(),
+            "other bot must not disarm the live job"
+        );
+        assert_eq!(
+            store.get_by_id(&task.id).await.unwrap().unwrap().status,
+            "active"
+        );
+
+        let history = tools
+            .execute(
+                "get_scheduled_task_history",
+                json!({ "task_id": task.id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            history.contains("Task not found"),
+            "other bot must not read history: {history}"
+        );
+        assert!(!history.contains("owner-only-history"));
+
+        let rerun = tools
+            .execute(
+                "rerun_scheduled_task",
+                json!({ "task_id": task.id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rerun.contains("Task not found"),
+            "other bot must not rerun: {rerun}"
+        );
+        assert!(!rerun.contains("Re-run scheduled"));
+
+        let retry = tools
+            .execute(
+                "task_reruns",
+                json!({ "action": "retry", "queue_id": queue_id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            retry.contains("No actionable queue row"),
+            "other bot must not retry the dead-letter row: {retry}"
+        );
+        assert!(!retry.contains("Queued"));
+
+        let qcancel = tools
+            .execute(
+                "task_reruns",
+                json!({ "action": "cancel", "queue_id": queue_id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            qcancel.contains("No actionable queue row"),
+            "other bot must not cancel the dead-letter row: {qcancel}"
+        );
+        assert!(!qcancel.contains("will not run again"));
+
+        let row = queue.get(&queue_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            crate::scheduler::reruns::RerunState::AwaitingUser
+        );
+
+        let own_history = tools
+            .execute(
+                "get_scheduled_task_history",
+                json!({ "task_id": task.id }),
+                make_ctx("owner"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            own_history.contains("owner-only-history"),
+            "owner must still see the run: {own_history}"
         );
     }
 }
