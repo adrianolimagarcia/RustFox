@@ -137,7 +137,7 @@ await page.waitForTimeout(900)
 txt = await bodyText()
 check('tasks: runs panel lists completed + failed', txt.includes('completed') && txt.includes('failed') && txt.includes('timeout after 60s'))
 // toggle: disable → row stays but flips to paused + Enable offered;
-// enable → restart hint + back to running (full round-trip through the API)
+// enable → live re-arm notice + enabled badge (full round-trip through the API)
 const rowsBefore = await page.locator('tbody tr').count()
 await page.getByRole('button', { name: 'Disable', exact: true }).first().click()
 await page.waitForTimeout(1200)
@@ -147,7 +147,7 @@ check('tasks: paused row offers Enable', (await page.getByRole('button', { name:
 await page.getByRole('button', { name: 'Enable', exact: true }).first().click()
 await page.waitForTimeout(1200)
 txt = await bodyText()
-check('tasks: enable shows restart hint + running badge', txt.includes('re-arms on next restart') && !txt.includes(' paused'))
+check('tasks: enable shows re-armed live + enabled badge', txt.includes('Re-armed live') && txt.includes('enabled') && !txt.includes('re-arms on next restart') && !txt.includes(' paused'))
 await page.screenshot({ path: SHOT('06-tasks') })
 
 // ==================== 8. CHAT page (history + SSE stream + persistence) ====================
