@@ -234,7 +234,8 @@ pub struct PortalState {
     pub pending_secrets: Arc<crate::secret_store::PendingSecretRegistry>,
     /// In-flight Google OAuth `state` values. The callback is public, so a
     /// matching state is the only proof the tap started here.
-    pub google_oauth_states: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub google_oauth_states:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::google_mcp::PendingLogin>>>,
 }
 
 impl PortalState {
@@ -261,7 +262,7 @@ impl PortalState {
             started_at: std::time::Instant::now(),
             secret_store: Arc::new(crate::secret_store::FakeSecretStore::new()),
             pending_secrets: Arc::new(crate::secret_store::PendingSecretRegistry::default()),
-            google_oauth_states: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            google_oauth_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -351,7 +352,11 @@ pub fn router(state: PortalState) -> Router {
         .route("/tasks/{id}/disable", post(tasks_admin::task_disable))
         .route("/stats", get(data::stats))
         .route("/settings", get(settings::get_settings))
-        .route("/connectors/google", post(google::start))
+        .route(
+            "/connectors/google",
+            get(google::status).post(google::start),
+        )
+        .route("/connectors/google/client-id", post(google::set_client_id))
         .route("/settings", axum::routing::patch(settings::patch_settings))
         .route("/soul", get(settings::get_soul))
         .route("/soul", axum::routing::put(settings::put_soul))

@@ -61,13 +61,100 @@ pub fn redirect_uri(portal_port: u16) -> String {
     format!("http://127.0.0.1:{portal_port}/api/connectors/google/callback")
 }
 
-/// Browser login URL. No server name, MCP URL, or command is a query the user types.
-pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> Result<String> {
+/// Compile-time desktop client id. Empty when the variable was unset at
+/// `rustc` time (source builds and PR CI). Release builds set it from the
+/// Actions secret; the id is never hard-coded in this repo.
+pub fn baked_client_id() -> &'static str {
+    option_env!("RUSTFOX_GOOGLE_OAUTH_CLIENT_ID")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("")
+}
+
+/// SecretStore name for a developer-supplied desktop client id. Not a wizard
+/// field. The value is not written to `config.toml`.
+pub const ADVANCED_CLIENT_ID_SECRET: &str = "google.oauth.client_id";
+
+/// SecretStore name for a refresh token, when Google returns one.
+pub const REFRESH_SECRET_NAME: &str = "google.mcp.refresh";
+
+/// In-flight tap. Holds the PKCE verifier and the client id used to start it.
+/// Not logged.
+#[derive(Clone)]
+pub struct PendingLogin {
+    pub client_id: String,
+    pub verifier: String,
+}
+
+/// Advanced setting wins when it is non-empty. Otherwise the baked id.
+/// `None` means Google is hidden.
+pub fn resolve_client_id(baked: &str, advanced: Option<&str>) -> Option<String> {
+    if let Some(id) = advanced.map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(id.to_string());
+    }
+    let baked = baked.trim();
+    if baked.is_empty() {
+        None
+    } else {
+        Some(baked.to_string())
+    }
+}
+
+pub fn load_advanced_client_id(store: &dyn SecretStore) -> Result<Option<String>> {
+    match store.get(ADVANCED_CLIENT_ID_SECRET)? {
+        Some(value) => {
+            let id = value.expose().trim().to_string();
+            if id.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(id))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn store_advanced_client_id(store: &dyn SecretStore, client_id: &str) -> Result<()> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
-        bail!("Google sign-in is not configured");
+        store.delete(ADVANCED_CLIENT_ID_SECRET)?;
+    } else {
+        store.set(ADVANCED_CLIENT_ID_SECRET, client_id)?;
     }
-    if state.trim().is_empty() {
+    Ok(())
+}
+
+pub fn client_id_for_store(store: &dyn SecretStore) -> Result<Option<String>> {
+    let advanced = load_advanced_client_id(store)?;
+    Ok(resolve_client_id(baked_client_id(), advanced.as_deref()))
+}
+
+pub fn new_code_verifier() -> String {
+    use base64::Engine;
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn code_challenge_s256(verifier: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// Public PKCE authorize URL. No client secret is included.
+pub fn authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Result<String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        bail!("client id is empty");
+    }
+    if state.trim().is_empty() || code_challenge.trim().is_empty() {
         bail!("OAuth state is empty");
     }
     let mut url = reqwest::Url::parse(AUTHORIZE_URL).context("authorize URL")?;
@@ -79,10 +166,42 @@ pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> Result
             .append_pair("response_type", "code")
             .append_pair("scope", &SCOPES.join(" "))
             .append_pair("state", state)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256")
             .append_pair("access_type", "offline")
             .append_pair("prompt", "consent");
     }
     Ok(url.into())
+}
+
+/// Token-endpoint form for a public desktop client. There is no `client_secret`.
+pub fn token_form<'a>(
+    code: &'a str,
+    client_id: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("code", code),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("grant_type", "authorization_code"),
+        ("code_verifier", code_verifier),
+    ]
+}
+
+/// JSON the portal returns for a tap. Hidden means `{"offered": false}` and
+/// nothing else.
+pub fn tap_body(offered: bool, authorize_url: Option<&str>) -> serde_json::Value {
+    if offered {
+        serde_json::json!({
+            "offered": true,
+            "service": SERVICE_LABEL,
+            "authorizeUrl": authorize_url.unwrap_or(""),
+        })
+    } else {
+        serde_json::json!({ "offered": false })
+    }
 }
 
 /// Access token returned by Google's token endpoint. Refresh tokens, when
@@ -193,7 +312,7 @@ pub fn finish_google_login(
     }
     store.set(SECRET_NAME, access)?;
     if let Some(refresh) = token.refresh_token.as_deref() {
-        store.set("google.mcp.refresh", refresh)?;
+        store.set(REFRESH_SECRET_NAME, refresh)?;
     }
     persist_secret_ref(config_path)?;
     let runtime = runtime_config(access)?;
@@ -262,12 +381,16 @@ model = "moonshotai/kimi-k2.6"
 
     #[test]
     fn wizard_fields_do_not_ask_about_mcp() {
+        let html = include_str!("../setup/index.html");
+        assert!(!html.contains("id=\"f-google"));
+        assert!(!html.to_ascii_lowercase().contains("google client"));
         for provider in [ThinProvider::OpenRouter, ThinProvider::Ollama] {
             let fields = wizard_fields(provider);
             assert!(
-                fields
-                    .iter()
-                    .all(|field| !field.to_ascii_lowercase().contains("mcp")),
+                fields.iter().all(|field| {
+                    let name = field.to_ascii_lowercase();
+                    !name.contains("mcp") && !name.contains("google") && !name.contains("tool")
+                }),
                 "{fields:?}"
             );
             assert!(!fields.contains(&"command"));
@@ -276,22 +399,80 @@ model = "moonshotai/kimi-k2.6"
     }
 
     #[test]
-    fn authorize_url_is_the_official_google_endpoint() {
+    fn baked_id_is_offered_with_pkce_and_no_client_secret() {
+        let id = resolve_client_id("test-client-id", None).unwrap();
+        assert_eq!(id, "test-client-id");
+        let verifier = "pkce-verifier-fixture-value-32b";
+        let challenge = code_challenge_s256(verifier);
+        let url = authorize_url(&id, &redirect_uri(8090), "state-1", &challenge).unwrap();
+        assert!(url.starts_with(AUTHORIZE_URL), "{url}");
+        assert!(url.contains("client_id=test-client-id"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains(&format!("code_challenge={challenge}")));
+        assert!(url.contains("gmail.readonly"));
+        assert!(url.contains("gmail.compose"));
+        assert!(!url.contains("client_secret"));
+        assert!(!url.contains("fit"));
+        let redirect = redirect_uri(8090);
+        let form = token_form("code-1", &id, &redirect, verifier);
+        assert!(form
+            .iter()
+            .any(|(k, v)| *k == "code_verifier" && *v == verifier));
+        assert!(form.iter().all(|(k, _)| *k != "client_secret"));
+        assert_eq!(built_in_services(), &["Google"]);
+    }
+
+    #[test]
+    fn no_id_hides_google_without_the_old_error() {
+        assert!(resolve_client_id("", None).is_none());
+        let body = tap_body(false, None).to_string();
+        assert!(body.contains("\"offered\":false") || body.contains("\"offered\": false"));
+        assert!(!body.to_ascii_lowercase().contains("not configured"));
+        assert!(!body.contains("Google"));
+        assert!(!body.contains("client_secret"));
+        // Failure text must not include a baked value if one was compiled in.
+        if !baked_client_id().is_empty() {
+            panic!("source tests must be compiled without a baked client id");
+        }
+    }
+
+    #[test]
+    fn advanced_setting_id_is_used_and_not_written_to_config() {
+        let store = FakeSecretStore::new();
+        assert!(client_id_for_store(&store).unwrap().is_none());
+        store_advanced_client_id(&store, "test-client-id").unwrap();
+        assert_eq!(
+            client_id_for_store(&store).unwrap().as_deref(),
+            Some("test-client-id")
+        );
+        let id = resolve_client_id("other-baked", Some("test-client-id")).unwrap();
+        assert_eq!(id, "test-client-id");
         let url = authorize_url(
-            "test-client.apps.googleusercontent.com",
+            &id,
             &redirect_uri(8090),
-            "state-1",
+            "state-2",
+            &code_challenge_s256("verifier-2-verifier-2-verifier-2"),
         )
         .unwrap();
+        assert!(url.contains("client_id=test-client-id"));
+        assert!(!url.contains("other-baked"));
+        store_advanced_client_id(&store, "").unwrap();
+        assert!(load_advanced_client_id(&store).unwrap().is_none());
+    }
+
+    #[test]
+    fn authorize_url_is_the_official_google_endpoint() {
+        let challenge = code_challenge_s256("pkce-verifier-fixture-value-32b");
+        let url =
+            authorize_url("test-client-id", &redirect_uri(8090), "state-1", &challenge).unwrap();
         assert!(url.starts_with(AUTHORIZE_URL), "{url}");
-        assert!(url.contains("client_id=test-client.apps.googleusercontent.com"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("gmail.readonly"));
         assert!(url.contains("gmail.compose"));
         assert!(url.contains("redirect_uri="));
         assert!(!url.contains("npx"));
         assert!(!url.contains("uvx"));
-        assert!(authorize_url("", "http://127.0.0.1/cb", "s").is_err());
+        assert!(authorize_url("", "http://127.0.0.1/cb", "s", "c").is_err());
     }
 
     #[test]

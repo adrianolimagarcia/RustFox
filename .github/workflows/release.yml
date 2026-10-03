@@ -53,6 +53,9 @@ jobs:
       - name: Build web portal (embed via include_dir!)
         run: cd web && npm ci && npm run build
       - name: Build
+        env:
+          # Release artifacts only. The value stays in the Actions secret.
+          RUSTFOX_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.RUSTFOX_GOOGLE_OAUTH_CLIENT_ID }}
         run: cargo build --release
 
       - name: Stage release files
