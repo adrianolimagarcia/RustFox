@@ -425,6 +425,27 @@ impl MemoryStore {
         }
     }
 
+    /// Recent user/assistant messages for Memory browse (empty query).
+    /// FTS cannot MATCH an empty string, so browse lists rows directly.
+    pub async fn recent_messages(&self, limit: usize) -> Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT role, content, tool_calls, tool_call_id
+             FROM messages
+             WHERE role IN ('user', 'assistant')
+               AND (is_summarized IS NULL OR is_summarized = 0)
+               AND content IS NOT NULL
+               AND length(trim(content)) > 0
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )?;
+        let messages = stmt
+            .query_map(rusqlite::params![limit as i64], parse_message_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list recent messages")?;
+        Ok(messages)
+    }
+
     /// Return all messages in a conversation that have not yet been summarized.
     /// Returns tuples of (message_id, role, content).
     pub async fn get_unsummarized_messages(

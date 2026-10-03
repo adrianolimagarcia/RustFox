@@ -1451,6 +1451,110 @@ async fn memory_search_smoke() {
     );
 }
 
+fn kinds_of(body: &Value) -> Vec<&str> {
+    body.as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["kind"].as_str().unwrap_or(""))
+        .collect()
+}
+
+fn texts_of(body: &Value) -> String {
+    body.as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn memory_browse_lists_conversations_and_splits_fact_knowledge() {
+    use rustfox::llm::{ChatMessage, MessageContent};
+
+    let f = fixture(with_token_token()).await;
+    f.state
+        .memory
+        .remember("fact", "city", "beta-fact-value", None)
+        .await
+        .unwrap();
+    f.state
+        .memory
+        .remember("knowledge", "note", "alpha-knowledge-value", None)
+        .await
+        .unwrap();
+    let conv = f
+        .state
+        .memory
+        .get_or_create_conversation("web", "default", "portal-user")
+        .await
+        .unwrap();
+    f.state
+        .memory
+        .save_message(
+            &conv,
+            &ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::from_text("pong browse message")),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    async fn search(app: &axum::Router, path: &str) -> Value {
+        let res = app
+            .clone()
+            .oneshot(bearer(get(path), TEST_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        body_json(res).await
+    }
+
+    let conv_only = search(&f.app, "/api/memory/search?q=&kind=conversation").await;
+    let conv_text = texts_of(&conv_only);
+    assert!(conv_text.contains("pong browse"), "{conv_text}");
+    assert_eq!(kinds_of(&conv_only), vec!["conversation"]);
+
+    let all = search(&f.app, "/api/memory/search?q=").await;
+    let all_text = texts_of(&all);
+    assert!(
+        all_text.contains("pong browse"),
+        "all missing messages: {all_text}"
+    );
+    assert!(
+        all_text.contains("beta-fact-value"),
+        "all missing fact: {all_text}"
+    );
+    assert!(
+        all_text.contains("alpha-knowledge-value"),
+        "all missing knowledge: {all_text}"
+    );
+    let all_kinds = kinds_of(&all);
+    assert!(all_kinds.contains(&"conversation"));
+    assert!(all_kinds.contains(&"fact"));
+    assert!(all_kinds.contains(&"knowledge"));
+
+    let explicit_all = search(&f.app, "/api/memory/search?q=&kind=all").await;
+    assert!(texts_of(&explicit_all).contains("pong browse"));
+
+    let facts = search(&f.app, "/api/memory/search?q=&kind=fact").await;
+    let fact_text = texts_of(&facts);
+    assert!(fact_text.contains("beta-fact-value"), "{fact_text}");
+    assert!(!fact_text.contains("alpha-knowledge-value"), "{fact_text}");
+    assert!(!fact_text.contains("pong browse"), "{fact_text}");
+    assert!(kinds_of(&facts).iter().all(|k| *k == "fact"));
+
+    let knowledge = search(&f.app, "/api/memory/search?q=&kind=knowledge").await;
+    let know_text = texts_of(&knowledge);
+    assert!(know_text.contains("alpha-knowledge-value"), "{know_text}");
+    assert!(!know_text.contains("beta-fact-value"), "{know_text}");
+    assert!(!know_text.contains("pong browse"), "{know_text}");
+    assert!(kinds_of(&knowledge).iter().all(|k| *k == "knowledge"));
+}
+
 // ---------------------------------------------------------------------------
 // Static serving (SPA + fallback)
 // ---------------------------------------------------------------------------

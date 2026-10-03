@@ -110,6 +110,72 @@ pub struct MemoryQuery {
     pub limit: Option<usize>,
 }
 
+/// `None` and `all` are the Memory page "All" tag (the client omits kind).
+fn wants_knowledge(kind: Option<&str>) -> bool {
+    matches!(kind, None | Some("all") | Some("fact") | Some("knowledge"))
+}
+
+fn wants_conversation(kind: Option<&str>) -> bool {
+    matches!(kind, None | Some("all") | Some("conversation"))
+}
+
+/// Fact and knowledge share the `knowledge` table; the tag splits on category.
+fn category_matches_kind(category: &str, kind: Option<&str>) -> bool {
+    match kind {
+        Some("fact") => category == "fact",
+        Some("knowledge") => category != "fact",
+        _ => true,
+    }
+}
+
+fn knowledge_kind_label(category: &str) -> &'static str {
+    if category == "fact" {
+        "fact"
+    } else {
+        "knowledge"
+    }
+}
+
+fn push_knowledge_items(
+    items: &mut Vec<serde_json::Value>,
+    entries: Vec<crate::memory::knowledge::KnowledgeEntry>,
+    kind: Option<&str>,
+    limit: usize,
+) {
+    for (rank, e) in entries.into_iter().enumerate() {
+        if !category_matches_kind(&e.category, kind) {
+            continue;
+        }
+        items.push(json!({
+            "id": e.id,
+            "kind": knowledge_kind_label(&e.category),
+            "text": format!("{}: {} — {}", e.category, e.key, e.value),
+            "score": 1.0 - (rank as f64 / (limit.max(1) as f64 + 1.0)),
+            "createdAt": null,
+        }));
+    }
+}
+
+fn push_conversation_items(
+    items: &mut Vec<serde_json::Value>,
+    msgs: Vec<crate::llm::ChatMessage>,
+    limit: usize,
+) {
+    for (rank, m) in msgs.into_iter().enumerate() {
+        let text = m.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        items.push(json!({
+            "id": format!("msg-{rank}"),
+            "kind": "conversation",
+            "text": format!("[{}] {}", m.role, truncate_chars(&text, 400)),
+            "score": 0.9 - (rank as f64 / (limit.max(1) as f64 + 1.0)),
+            "createdAt": null,
+        }));
+    }
+}
+
 /// GET /api/memory/search — hybrid knowledge + message search.
 pub async fn memory_search(
     State(state): State<PortalState>,
@@ -120,62 +186,42 @@ pub async fn memory_search(
     let mut items = Vec::new();
 
     // Empty query = browse mode (the Memory page loads with q="" on mount;
-    // an empty FTS MATCH is a syntax error, so list recent knowledge instead).
+    // an empty FTS MATCH is a syntax error). List recent rows instead.
     if q.q.trim().is_empty() {
-        if matches!(want_kind, None | Some("fact") | Some("knowledge")) {
+        if wants_knowledge(want_kind) {
             let entries = state
                 .memory
                 .recent_knowledge(limit)
                 .await
                 .map_err(PortalError::from)?;
-            for (rank, e) in entries.into_iter().enumerate() {
-                items.push(json!({
-                    "id": e.id,
-                    "kind": if e.category == "fact" { "fact" } else { "knowledge" },
-                    "text": format!("{}: {} — {}", e.category, e.key, e.value),
-                    "score": 1.0 - (rank as f64 / (limit.max(1) as f64 + 1.0)),
-                    "createdAt": null,
-                }));
-            }
+            push_knowledge_items(&mut items, entries, want_kind, limit);
+        }
+        if wants_conversation(want_kind) {
+            let msgs = state
+                .memory
+                .recent_messages(limit)
+                .await
+                .map_err(PortalError::from)?;
+            push_conversation_items(&mut items, msgs, limit);
         }
         return Ok(Json(serde_json::Value::Array(items)));
     }
 
-    if matches!(want_kind, None | Some("fact") | Some("knowledge")) {
+    if wants_knowledge(want_kind) {
         let entries = state
             .memory
             .search_knowledge(&q.q, limit)
             .await
             .map_err(PortalError::from)?;
-        for (rank, e) in entries.into_iter().enumerate() {
-            items.push(json!({
-                "id": e.id,
-                "kind": if e.category == "fact" { "fact" } else { "knowledge" },
-                "text": format!("{}: {} — {}", e.category, e.key, e.value),
-                "score": 1.0 - (rank as f64 / (limit.max(1) as f64 + 1.0)),
-                "createdAt": null, // KnowledgeEntry has no timestamp column
-            }));
-        }
+        push_knowledge_items(&mut items, entries, want_kind, limit);
     }
-    if matches!(want_kind, None | Some("conversation")) {
+    if wants_conversation(want_kind) {
         let msgs = state
             .memory
             .search_messages(&q.q, limit)
             .await
             .map_err(PortalError::from)?;
-        for (rank, m) in msgs.into_iter().enumerate() {
-            let text = m.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
-            if text.trim().is_empty() {
-                continue;
-            }
-            items.push(json!({
-                "id": format!("msg-{rank}"),
-                "kind": "conversation",
-                "text": format!("[{}] {}", m.role, truncate_chars(&text, 400)),
-                "score": 0.9 - (rank as f64 / (limit.max(1) as f64 + 1.0)),
-                "createdAt": null,
-            }));
-        }
+        push_conversation_items(&mut items, msgs, limit);
     }
     Ok(Json(serde_json::Value::Array(items)))
 }
