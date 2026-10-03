@@ -87,6 +87,28 @@ persona = "researcher"
 
 Shared sections (`[sandbox]`, `[skills]`, `[agents]`, MCP, providers) stay install-wide. See [`config.example.toml`](../config.example.toml) for the commented researcher example. Conversation history is keyed by `(platform, bot_id, user_id)`.
 
+### Fully silent tool calls
+
+The default is unchanged. While a tool runs, that bot may still show a `Working…` bubble or a `Running: …` line. When the tool finishes, the completed tool message is removed. The final assistant reply still posts.
+
+`fully_silent` is an opt-in on the **bot that is speaking** (`[[bots]]`). It is not a setup-wizard question and not a per-chat `/verbose` setting. When it is `true`, that bot's Telegram turn posts no tool-call UI: no in-progress bubble, no completed tool bubble, and no raw `Running:` line. The final assistant reply still posts. Single-bot and multi-bot both follow the speaking bot. Another bot does not inherit the flag.
+
+```toml
+[[bots]]
+id = "main"
+bot_token = "secret:bot.main.token"
+allowed_user_ids = [123456789]
+persona = "main"
+fully_silent = true
+
+[[bots]]
+id = "researcher"
+bot_token = "secret:bot.researcher.token"
+allowed_user_ids = [123456789]
+persona = "researcher"
+# fully_silent stays off here. Researcher still shows Working / Running.
+```
+
 ### Per-bot schedules
 
 Every schedule row has a required `bot_id` (the `[[bots]]` id). There is no global cron and no schedule shared between bots. A run uses that bot's prompt, tools, and conversation with the owner (the chat stored on the row) and writes the result there. Portal and `list_scheduled_tasks` show only the current bot. Disable and delete affect only that bot. An approval reply is not sent on a bot that did not own the run. Rows saved before `bot_id` existed are assigned to `default` and logged, not dropped.

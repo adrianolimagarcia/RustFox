@@ -259,6 +259,7 @@ mod tests {
             system_prompt_file: None,
             model: None,
             tools: None,
+            fully_silent: false,
         }
     }
 

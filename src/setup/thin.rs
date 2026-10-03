@@ -637,5 +637,21 @@ mod tests {
         assert!(!html.contains("id=\"mcp-catalog\""));
         assert!(!html.contains("id=\"step-3\""));
         assert!(!html.contains("Show all settings"));
+        assert!(!html.contains("fully_silent"));
+        assert!(!html.to_ascii_lowercase().contains("silent"));
+    }
+
+    #[test]
+    fn wizard_does_not_ask_about_fully_silent() {
+        for provider in [ThinProvider::OpenRouter, ThinProvider::Ollama] {
+            let joined = wizard_fields(provider).join(" ");
+            assert!(
+                !joined.contains("silent") && !joined.contains("fully_silent"),
+                "{provider:?} wizard asked about silent tools: {joined}"
+            );
+        }
+        let rendered = render_config(&openrouter_answers()).unwrap();
+        assert!(!rendered.contains("fully_silent"));
+        assert!(!rendered.contains("silent"));
     }
 }

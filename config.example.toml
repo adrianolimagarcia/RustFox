@@ -26,6 +26,10 @@ allowed_user_ids = [123456789]
 # bot_token = "secret:bot.main.token"   # wizard/bind write secret refs; migrate is safety net
 # allowed_user_ids = [123456789]
 # persona = "main"                 # agents/<persona>/AGENT.md + optional SOUL.md overlay
+# # fully_silent = false           # default. Completed tool messages are removed;
+#                                 # Working / Running may still show while a tool runs.
+#                                 # true = this bot only: no Working, no Running, no tool bubble.
+#                                 # Not a wizard question. Not per-chat. Other bots do not inherit it.
 # # system_prompt_file = "prompts/main.md"  # optional; wins over AGENT.md when set
 # # model = "moonshotai/kimi-k2.6"
 # # tools = ["read_file", "write_file", "execute_command", "invoke_agent"]
@@ -38,6 +42,7 @@ allowed_user_ids = [123456789]
 # bot_token = "secret:bot.researcher.token"
 # allowed_user_ids = [123456789]
 # persona = "researcher"
+# # fully_silent is per bot. Leave it off here even if main sets it true.
 # # Optional overrides (wired on the main Telegram path):
 # # model = "moonshotai/kimi-k2.6"
 # # tools = ["read_file", "list_files",

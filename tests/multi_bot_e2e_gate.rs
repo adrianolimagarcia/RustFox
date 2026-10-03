@@ -186,6 +186,7 @@ fn e2e_gate_peer_resolves_bot_persona() {
         system_prompt_file: None,
         model: None,
         tools: None,
+        fully_silent: false,
     }];
     assert_eq!(
         resolve_invoke_source("researcher", false, false, &bots),
