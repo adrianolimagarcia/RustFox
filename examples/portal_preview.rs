@@ -306,6 +306,7 @@ user_name = "web"
             created_at: "2026-09-01T00:00:00Z".into(),
             next_run_at: Some("2026-09-23T00:00:00Z".into()),
             deleted_at: None,
+            bot_id: "default".into(),
         })
         .await?;
     task_store
@@ -323,6 +324,7 @@ user_name = "web"
             created_at: "2026-09-20T00:00:00Z".into(),
             next_run_at: Some("2026-09-23T12:00:00Z".into()),
             deleted_at: None,
+            bot_id: "default".into(),
         })
         .await?;
     task_store
