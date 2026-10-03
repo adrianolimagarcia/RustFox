@@ -140,6 +140,9 @@ pub struct Agent {
     pub cancel_registry: Arc<CancelRegistry>,
     pub tool_registry: ToolRegistry,
     pub sender: Arc<dyn PlatformSender>,
+    /// Per-`[[bots]]` outbound senders. Tool-call UI must use the bot that
+    /// owns the turn, not always the shim (`sender` remains the fallback).
+    pub bot_senders: Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn PlatformSender>>>>,
     /// Telegram bot handle — captured by scheduled-task fire closures
     /// (`build_fire_closure`). Cloned from main's Arc so every arm path
     /// dispatches to the same bot without threading it through handlers.
@@ -325,6 +328,7 @@ impl Agent {
             cancel_registry,
             tool_registry,
             sender,
+            bot_senders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             bot,
             cancel_token_registry: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_injections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -339,6 +343,52 @@ impl Agent {
     /// portal cancel can reach [`Supervisor::cancel_for_session`].
     pub async fn attach_supervisor(&self, supervisor: Arc<crate::supervisor::Supervisor>) {
         *self.supervisor.write().await = Some(supervisor);
+    }
+
+    /// Register one [`PlatformSender`] per bot id (Telegram token).
+    pub async fn set_bot_senders(&self, map: HashMap<String, Arc<dyn PlatformSender>>) {
+        *self.bot_senders.write().await = map;
+    }
+
+    /// Sender for `bot_id`, or the shim sender when that bot was not registered
+    /// (single-bot installs and unit tests).
+    pub async fn sender_for_bot(&self, bot_id: &str) -> Arc<dyn PlatformSender> {
+        let id = crate::platform::normalize_bot_id(bot_id);
+        let guard = self.bot_senders.read().await;
+        if let Some(sender) = guard.get(id) {
+            return Arc::clone(sender);
+        }
+        Arc::clone(&self.sender)
+    }
+
+    /// Append a peer-invoke turn (user prompt, tool calls, tool results, reply)
+    /// onto the invoked bot's conversation so it is not only in the caller's loop.
+    async fn record_invoked_bot_turn(
+        &self,
+        delivery: &crate::peer_invoke::ToolDelivery,
+        messages: &[ChatMessage],
+    ) {
+        if !delivery.record_on_bot || delivery.user_id.is_empty() {
+            return;
+        }
+        let bot_id = crate::platform::normalize_bot_id(&delivery.bot_id);
+        let claim = Config::bot_claims_legacy_default(&self.config.bots, bot_id);
+        let conversation_id = match self
+            .memory
+            .get_or_create_conversation_with_claim("telegram", bot_id, &delivery.user_id, claim)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(bot_id = %bot_id, error = %e, "peer tool-call record: conversation open failed");
+                return;
+            }
+        };
+        for msg in messages.iter().filter(|m| m.role != "system") {
+            if let Err(e) = self.memory.save_message(&conversation_id, msg).await {
+                warn!(bot_id = %bot_id, error = %e, "peer tool-call record: save failed");
+            }
+        }
     }
 
     /// Build the system prompt for a bot identity, incorporating loaded skills
@@ -1025,20 +1075,22 @@ impl Agent {
         // Register cancel token for /stop support
         let cancel_token = self.register_cancel_token(bot_id, user_id).await;
 
-        // Build make_ctx closure for ToolContext construction
+        // Build make_ctx closure for ToolContext construction.
+        // Tool UI (execute_command, send_file) goes out on this bot, not the shim.
+        let turn_sender = self.sender_for_bot(bot_id).await;
         let make_ctx = {
             let sandbox_dir = self.config.sandbox.allowed_directory.clone();
             let home_dir = self.config.resolved_home.clone();
-            let sender = self.sender.clone();
+            let sender = Arc::clone(&turn_sender);
             let cancel_registry = self.cancel_registry.clone();
             let mode = tool_ui_mode;
-            move |_user_id: &str, _chat_id: &str| ToolContext {
+            move |uid: &str, cid: &str| ToolContext {
                 sandbox_dir: sandbox_dir.clone(),
                 home_dir: home_dir.clone(),
                 sender: sender.clone(),
                 cancel_registry: cancel_registry.clone(),
-                user_id: _user_id.to_string(),
-                chat_id: _chat_id.to_string(),
+                user_id: uid.to_string(),
+                chat_id: cid.to_string(),
                 tool_ui_mode: mode,
             }
         };
@@ -1077,11 +1129,13 @@ impl Agent {
         let special_handler = {
             let self_weak = self.self_weak.clone();
             let parent_stack = root_stack.clone();
-            move |name: &str, args: &Value, _user_id: &str, _chat_id: &str| {
+            move |name: &str, args: &Value, user_id: &str, chat_id: &str| {
                 let name_owned = name.to_string();
                 let args_owned = args.clone();
                 let self_weak = self_weak.clone();
                 let parent_stack = parent_stack.clone();
+                let user_id = user_id.to_string();
+                let chat_id = chat_id.to_string();
                 Box::pin(async move {
                     match name_owned.as_str() {
                         "invoke_agent" => {
@@ -1091,7 +1145,12 @@ impl Agent {
                             };
                             Some(
                                 agent
-                                    .handle_invoke_agent_tool(&args_owned, parent_stack)
+                                    .handle_invoke_agent_tool(
+                                        &args_owned,
+                                        parent_stack,
+                                        &user_id,
+                                        &chat_id,
+                                    )
                                     .await,
                             )
                         }
@@ -1170,8 +1229,26 @@ impl Agent {
                                     let t = task.tools.clone();
                                     let a = agent.clone();
                                     let stack = parent_stack.clone();
+                                    let user_id = user_id.clone();
+                                    let chat_id = chat_id.clone();
                                     Box::pin(async move {
-                                        a.run_subagent(None, &sp, &p, m.as_deref(), t, stack).await
+                                        let caller = stack
+                                            .first()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or(crate::platform::DEFAULT_BOT_ID);
+                                        let delivery = crate::peer_invoke::tool_delivery_for_invoke(
+                                            caller, None, &user_id, &chat_id,
+                                        );
+                                        a.run_subagent(
+                                            None,
+                                            &sp,
+                                            &p,
+                                            m.as_deref(),
+                                            t,
+                                            stack,
+                                            delivery,
+                                        )
+                                        .await
                                     })
                                 })
                                 .collect();
@@ -1207,7 +1284,7 @@ impl Agent {
             Some(cancel_token.clone()),
             Some(chain_run_id.clone()),
             Some(&self.langsmith),
-            self.sender.as_ref() as &dyn PlatformSender,
+            turn_sender.as_ref() as &dyn PlatformSender,
             Box::new(make_ctx),
             Some(Box::new(special_handler)),
         )
@@ -1534,6 +1611,8 @@ impl Agent {
         &self,
         args: &Value,
         invoke_stack: Vec<String>,
+        user_id: &str,
+        chat_id: &str,
     ) -> String {
         let agent_name = match args["bot"]
             .as_str()
@@ -1608,6 +1687,12 @@ impl Agent {
         );
 
         let child_stack = crate::peer_invoke::push_invoke_stack(&invoke_stack, &stack_key);
+        let caller = invoke_stack
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or(crate::platform::DEFAULT_BOT_ID);
+        let delivery =
+            crate::peer_invoke::tool_delivery_for_invoke(caller, source.as_ref(), user_id, chat_id);
         let result = self
             .run_subagent(
                 Some(&agent_name),
@@ -1616,6 +1701,7 @@ impl Agent {
                 model_override.as_deref(),
                 tools_override,
                 child_stack,
+                delivery,
             )
             .await;
         crate::peer_invoke::format_via_attribution(&via_label, &result)
@@ -1630,6 +1716,7 @@ impl Agent {
     /// with ambient system context (timestamp, user model, location) via
     /// `build_subagent_system_prompt`.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_subagent(
         &self,
         skill_name: Option<&str>,
@@ -1638,6 +1725,7 @@ impl Agent {
         model_override: Option<&str>,
         tools_override: Option<Vec<String>>,
         invoke_stack: Vec<String>,
+        delivery: crate::peer_invoke::ToolDelivery,
     ) -> String {
         // --- Ad-hoc mode (no predefined skill/agent) ---
         if skill_name.is_none() {
@@ -1691,7 +1779,7 @@ impl Agent {
                 },
             ];
 
-            return self
+            let text = self
                 .run_subagent_loop(
                     &mut messages,
                     &subagent_tools,
@@ -1701,8 +1789,11 @@ impl Agent {
                     "_ad_hoc_",
                     None,
                     invoke_stack,
+                    &delivery,
                 )
                 .await;
+            self.record_invoked_bot_turn(&delivery, &messages).await;
+            return text;
         }
 
         // --- Predefined agent path ---
@@ -1854,17 +1945,21 @@ impl Agent {
             },
         ];
 
-        self.run_subagent_loop(
-            &mut messages,
-            &subagent_tools,
-            &allowed_tools,
-            &resolved_model,
-            max_iter,
-            skill_name,
-            None,
-            invoke_stack,
-        )
-        .await
+        let text = self
+            .run_subagent_loop(
+                &mut messages,
+                &subagent_tools,
+                &allowed_tools,
+                &resolved_model,
+                max_iter,
+                skill_name,
+                None,
+                invoke_stack,
+                &delivery,
+            )
+            .await;
+        self.record_invoked_bot_turn(&delivery, &messages).await;
+        text
     }
 
     /// Shared mini-agentic loop used by both ad-hoc and predefined subagents.
@@ -1882,6 +1977,7 @@ impl Agent {
         label: &'a str,
         cancel_token: Option<CancellationToken>,
         invoke_stack: Vec<String>,
+        delivery: &'a crate::peer_invoke::ToolDelivery,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
         Box::pin(async move {
             // Build special_tool_handler for invoke_agent/spawn_agents (circular
@@ -1889,11 +1985,13 @@ impl Agent {
             let special_handler = {
                 let self_weak = self.self_weak.clone();
                 let parent_stack = invoke_stack.clone();
-                move |name: &str, args: &Value, _user_id: &str, _chat_id: &str| {
+                move |name: &str, args: &Value, user_id: &str, chat_id: &str| {
                     let name_owned = name.to_string();
                     let args_owned = args.clone();
                     let self_weak = self_weak.clone();
                     let parent_stack = parent_stack.clone();
+                    let user_id = user_id.to_string();
+                    let chat_id = chat_id.to_string();
                     Box::pin(async move {
                         match name_owned.as_str() {
                             "invoke_agent" => {
@@ -1903,7 +2001,12 @@ impl Agent {
                                 };
                                 Some(
                                     agent
-                                        .handle_invoke_agent_tool(&args_owned, parent_stack)
+                                        .handle_invoke_agent_tool(
+                                            &args_owned,
+                                            parent_stack,
+                                            &user_id,
+                                            &chat_id,
+                                        )
                                         .await,
                                 )
                             }
@@ -1983,9 +2086,27 @@ impl Agent {
                                         let t = task.tools.clone();
                                         let a = agent.clone();
                                         let stack = parent_stack.clone();
+                                        let user_id = user_id.clone();
+                                        let chat_id = chat_id.clone();
                                         Box::pin(async move {
-                                            a.run_subagent(None, &sp, &p, m.as_deref(), t, stack)
-                                                .await
+                                            let caller = stack
+                                                .first()
+                                                .map(|s| s.as_str())
+                                                .unwrap_or(crate::platform::DEFAULT_BOT_ID);
+                                            let delivery =
+                                                crate::peer_invoke::tool_delivery_for_invoke(
+                                                    caller, None, &user_id, &chat_id,
+                                                );
+                                            a.run_subagent(
+                                                None,
+                                                &sp,
+                                                &p,
+                                                m.as_deref(),
+                                                t,
+                                                stack,
+                                                delivery,
+                                            )
+                                            .await
                                         })
                                     })
                                     .collect();
@@ -2007,18 +2128,21 @@ impl Agent {
                 }
             };
 
+            let turn_sender = self.sender_for_bot(&delivery.bot_id).await;
             let make_ctx = {
                 let sandbox_dir = self.config.sandbox.allowed_directory.clone();
                 let home_dir = self.config.resolved_home.clone();
-                let sender = self.sender.clone();
+                let sender = Arc::clone(&turn_sender);
                 let cancel_registry = self.cancel_registry.clone();
+                let user_id = delivery.user_id.clone();
+                let chat_id = delivery.chat_id.clone();
                 move |_user_id: &str, _chat_id: &str| ToolContext {
                     sandbox_dir: sandbox_dir.clone(),
                     home_dir: home_dir.clone(),
                     sender: sender.clone(),
                     cancel_registry: cancel_registry.clone(),
-                    user_id: String::new(),
-                    chat_id: String::new(),
+                    user_id: user_id.clone(),
+                    chat_id: chat_id.clone(),
                     tool_ui_mode: crate::tool_registry::ToolUiMode::Minimal,
                 }
             };
@@ -2039,7 +2163,7 @@ impl Agent {
                 recovery_nudge: None,
             };
 
-            let outcome = crate::loop_runner::AgenticLoop::new(
+            let loop_runner = crate::loop_runner::AgenticLoop::new(
                 &self.llm,
                 &self.tool_registry,
                 &self.mcp,
@@ -2047,16 +2171,19 @@ impl Agent {
                 cancel_token,
                 None,
                 None,
-                self.sender.as_ref() as &dyn PlatformSender,
+                turn_sender.as_ref() as &dyn PlatformSender,
                 Box::new(make_ctx),
                 Some(Box::new(special_handler)),
-            )
-            .run(
-                &mut crate::loop_runner::MessageContainer::Plain(std::mem::take(messages)),
-                "",
-                "",
-            )
-            .await;
+            );
+            let mut container =
+                crate::loop_runner::MessageContainer::Plain(std::mem::take(messages));
+            let outcome = loop_runner
+                .run(&mut container, &delivery.user_id, &delivery.chat_id)
+                .await;
+
+            if let crate::loop_runner::MessageContainer::Plain(restored) = container {
+                *messages = restored;
+            }
 
             match outcome {
                 Ok(crate::loop_runner::LoopOutcome::FinalResponse(text)) => text,

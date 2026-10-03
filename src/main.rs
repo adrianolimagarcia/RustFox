@@ -378,7 +378,6 @@ async fn main() -> Result<()> {
         rustfox::command_tool::CommandTool::new(
             config.sandbox.allowed_directory.clone(),
             cancel_registry.clone(),
-            sender.clone(),
         )
         .with_secrets(
             std::sync::Arc::clone(&secret_bridge),
@@ -911,6 +910,20 @@ async fn main() -> Result<()> {
 
     // Run N Telegram dispatchers (one per [[bots]] entry) with signal-driven
     // graceful shutdown. Each run() notifies its own allowlist on startup.
+    // Tool-call UI must leave on the bot that owns the turn, not only the shim.
+    {
+        let mut senders: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn rustfox::platform::sender::PlatformSender>,
+        > = std::collections::HashMap::new();
+        for (id, dispatch_bot, _) in &bot_runtimes {
+            let adapter =
+                rustfox::platform::telegram::TelegramAdapter::new(dispatch_bot.as_ref().clone());
+            senders.insert(id.clone(), std::sync::Arc::new(adapter));
+        }
+        agent.set_bot_senders(senders).await;
+    }
+
     info!("Starting {} Telegram dispatcher(s)...", bot_runtimes.len());
 
     let shutdown_bots = bot_runtimes.clone();
