@@ -22,6 +22,7 @@ pub struct SchedulingTools {
     ops: Arc<dyn SchedulingOps>,
     job_tx: UnboundedSender<ScheduledJobRequest>,
     bot: Arc<Bot>,
+    telegram_bots: Arc<std::sync::RwLock<std::collections::HashMap<String, Arc<Bot>>>>,
     rerun_queue: RerunQueue,
 }
 
@@ -32,6 +33,7 @@ impl SchedulingTools {
         ops: Arc<dyn SchedulingOps>,
         job_tx: UnboundedSender<ScheduledJobRequest>,
         bot: Arc<Bot>,
+        telegram_bots: Arc<std::sync::RwLock<std::collections::HashMap<String, Arc<Bot>>>>,
         rerun_queue: RerunQueue,
     ) -> Self {
         Self {
@@ -40,7 +42,18 @@ impl SchedulingTools {
             ops,
             job_tx,
             bot,
+            telegram_bots,
             rerun_queue,
+        }
+    }
+
+    async fn rerun_owned_by(&self, queue_id: &str, bot_id: &str) -> anyhow::Result<bool> {
+        let Some(row) = self.rerun_queue.get(queue_id).await? else {
+            return Ok(false);
+        };
+        match self.task_store.get_by_id(&row.task_id).await? {
+            Some(task) => Ok(task.bot_id == bot_id),
+            None => Ok(false),
         }
     }
 }
@@ -53,7 +66,7 @@ impl ToolHandler for SchedulingTools {
                 tool_type: "function".to_string(),
                 function: FunctionDefinition {
                     name: "schedule_task".to_string(),
-                    description: "Schedule a task to run at a future time.".to_string(),
+                    description: "Schedule a task for the current bot. Every schedule has that bot's id; there is no global or shared cron.".to_string(),
                     parameters: json!({
                         "type": "object",
                         "properties": {
@@ -70,7 +83,7 @@ impl ToolHandler for SchedulingTools {
                 tool_type: "function".to_string(),
                 function: FunctionDefinition {
                     name: "list_scheduled_tasks".to_string(),
-                    description: "List all active scheduled tasks for the current user."
+                    description: "List active scheduled tasks for the current bot only."
                         .to_string(),
                     parameters: json!({ "type": "object", "properties": {} }),
                 },
@@ -176,12 +189,17 @@ impl ToolHandler for SchedulingTools {
 
                 let task_id = Uuid::new_v4().to_string();
                 let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                let bot_id = ctx.bot_id.trim().to_string();
+                if bot_id.is_empty() {
+                    anyhow::bail!("schedule_task requires the current bot_id");
+                }
                 let task = ScheduledTask {
                     id: task_id.clone(),
                     scheduler_job_id: None,
                     user_id: ctx.user_id.clone(),
                     chat_id: ctx.chat_id.clone(),
                     platform: "telegram".to_string(),
+                    bot_id,
                     trigger_type: trigger_type.clone(),
                     trigger_value: trigger_value.clone(),
                     prompt: prompt_text.clone(),
@@ -219,15 +237,8 @@ impl ToolHandler for SchedulingTools {
                 }
             }
             "list_scheduled_tasks" => {
-                // Owner-scoped listing (issue #109, Bug 1): the run-scoped
-                // composite id ("{owner}:{task_id}") used during execution, a
-                // portal-created task ("web"), and system rows are all visible
-                // — and a scheduled run's self-listing is non-empty.
-                match self
-                    .task_store
-                    .list_active_for_owner_scope(&ctx.user_id)
-                    .await
-                {
+                // Current bot only. Another bot's crons are not listed.
+                match self.task_store.list_active_for_bot(&ctx.bot_id).await {
                     Ok(tasks) if tasks.is_empty() => Ok("No active scheduled tasks.".to_string()),
                     Ok(tasks) => {
                         let tasks: Vec<ScheduledTask> = tasks;
@@ -250,6 +261,9 @@ impl ToolHandler for SchedulingTools {
                 // "cancelled" recurring task kept firing forever.
                 match self.task_store.get_by_id(task_id).await {
                     Ok(Some(task)) => {
+                        if task.bot_id != ctx.bot_id {
+                            return Ok(format!("Task not found: {task_id}"));
+                        }
                         self.ops.disarm_task(&task).await;
                     }
                     Ok(None) => {}
@@ -262,6 +276,11 @@ impl ToolHandler for SchedulingTools {
             }
             "get_scheduled_task_history" => {
                 let task_id = args["task_id"].as_str().context("Missing 'task_id'")?;
+                match self.task_store.get_by_id(task_id).await {
+                    Ok(Some(task)) if task.bot_id == ctx.bot_id => {}
+                    Ok(_) => return Ok(format!("Task not found: {task_id}")),
+                    Err(e) => return Ok(format!("Failed to get history: {}", e)),
+                }
                 let runs: Vec<crate::scheduler::reminders::ScheduledTaskRun> =
                     match self.task_store.get_task_runs(task_id, 50).await {
                         Ok(r) => r,
@@ -289,13 +308,14 @@ impl ToolHandler for SchedulingTools {
             "rerun_scheduled_task" => {
                 let task_id = args["task_id"].as_str().context("Missing 'task_id'")?;
                 let task = match self.task_store.get_by_id(task_id).await {
-                    Ok(Some(t)) => t,
-                    Ok(None) => return Ok(format!("Task not found: {task_id}")),
+                    Ok(Some(t)) if t.bot_id == ctx.bot_id => t,
+                    Ok(_) => return Ok(format!("Task not found: {task_id}")),
                     Err(e) => return Ok(format!("Task not found: {}", e)),
                 };
                 let fire = crate::agent::Agent::build_fire_closure(
                     self.job_tx.clone(),
                     Arc::clone(&self.bot),
+                    Arc::clone(&self.telegram_bots),
                     self.task_store.clone(),
                     &task,
                 );
@@ -313,6 +333,15 @@ impl ToolHandler for SchedulingTools {
                 match action {
                     "list" => {
                         let rows = self.rerun_queue.list_active().await?;
+                        let mut rows = rows;
+                        let mut owned = Vec::new();
+                        for row in rows.drain(..) {
+                            match self.task_store.get_by_id(&row.task_id).await {
+                                Ok(Some(task)) if task.bot_id == ctx.bot_id => owned.push(row),
+                                _ => {}
+                            }
+                        }
+                        let rows = owned;
                         if rows.is_empty() {
                             return Ok("No scheduled tasks are waiting on you.".to_string());
                         }
@@ -340,6 +369,11 @@ impl ToolHandler for SchedulingTools {
                         let id = args["queue_id"]
                             .as_str()
                             .context("Missing 'queue_id' for retry")?;
+                        if !self.rerun_owned_by(id, &ctx.bot_id).await? {
+                            return Ok(format!(
+                                "No actionable queue row `{id}` (already done, or never existed)."
+                            ));
+                        }
                         if self.rerun_queue.retry(id).await? {
                             Ok(format!(
                                 "Queued `{id}` for another attempt — the watchdog will pick it up within the hour."
@@ -354,6 +388,11 @@ impl ToolHandler for SchedulingTools {
                         let id = args["queue_id"]
                             .as_str()
                             .context("Missing 'queue_id' for cancel")?;
+                        if !self.rerun_owned_by(id, &ctx.bot_id).await? {
+                            return Ok(format!(
+                                "No actionable queue row `{id}` (already done, or never existed)."
+                            ));
+                        }
                         if self.rerun_queue.cancel(id).await? {
                             Ok(format!("Cancelled `{id}` — it will not run again."))
                         } else {
@@ -474,17 +513,29 @@ mod tests {
             cancel_registry: Arc::new(CancelRegistry::new()),
             user_id: user_id.to_string(),
             chat_id: "555".to_string(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
             tool_ui_mode: ToolUiMode::Minimal,
         }
     }
 
-    async fn build_tools() -> (SchedulingTools, ScheduledTaskStore, Arc<FakeScheduling>) {
+    async fn build_tools() -> (
+        SchedulingTools,
+        ScheduledTaskStore,
+        Arc<FakeScheduling>,
+        RerunQueue,
+    ) {
         let memory = MemoryStore::open_in_memory().unwrap();
         let store = ScheduledTaskStore::new(memory.connection());
         let rerun_queue = RerunQueue::new(memory.connection());
         let scheduler = Arc::new(Scheduler::new().await.unwrap());
         let (job_tx, _job_rx) = tokio::sync::mpsc::unbounded_channel();
         let bot = Arc::new(teloxide::Bot::new("TEST_TOKEN"));
+        let mut bots = std::collections::HashMap::new();
+        bots.insert(
+            crate::platform::DEFAULT_BOT_ID.to_string(),
+            Arc::clone(&bot),
+        );
+        let telegram_bots = Arc::new(std::sync::RwLock::new(bots));
         let fake = Arc::new(FakeScheduling {
             store: Some(store.clone()),
             ..Default::default()
@@ -495,9 +546,10 @@ mod tests {
             fake.clone() as Arc<dyn SchedulingOps>,
             job_tx,
             bot,
-            rerun_queue,
+            telegram_bots,
+            rerun_queue.clone(),
         );
-        (tools, store, fake)
+        (tools, store, fake, rerun_queue)
     }
 
     /// Regression (issue #109, Bug 2): `schedule_task` must persist the live
@@ -505,7 +557,7 @@ mod tests {
     /// `scheduler_job_id = NULL`, so a cancel could never disarm the job.
     #[tokio::test]
     async fn schedule_task_persists_scheduler_job_id() {
-        let (tools, store, fake) = build_tools().await;
+        let (tools, store, fake, _queue) = build_tools().await;
         let ctx = make_ctx("80180742");
 
         let out = tools
@@ -541,7 +593,7 @@ mod tests {
     /// cron expression (which is what the tool used to write).
     #[tokio::test]
     async fn schedule_task_stores_real_next_run_timestamp() {
-        let (tools, store, _fake) = build_tools().await;
+        let (tools, store, _fake, _queue) = build_tools().await;
 
         tools
             .execute(
@@ -579,7 +631,7 @@ mod tests {
     /// "No active scheduled tasks.".
     #[tokio::test]
     async fn list_from_scheduled_run_context_is_not_empty() {
-        let (tools, store, _fake) = build_tools().await;
+        let (tools, store, _fake, _queue) = build_tools().await;
 
         // Create the task under the owner, then list as the composite run id.
         tools
@@ -613,7 +665,7 @@ mod tests {
     /// live job is actually removed (not just the DB status flipped).
     #[tokio::test]
     async fn cancel_scheduled_task_disarms_live_job() {
-        let (tools, store, fake) = build_tools().await;
+        let (tools, store, fake, _queue) = build_tools().await;
         let ctx = make_ctx("80180742");
         tools
             .execute(
@@ -655,5 +707,189 @@ mod tests {
         );
         // Row is now cancelled and drops out of active listings.
         assert!(store.list_all_active().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_tasks_is_scoped_to_the_current_bot() {
+        let (tools, _store, _fake, _queue) = build_tools().await;
+        tools
+            .execute(
+                "schedule_task",
+                json!({
+                    "trigger_type": "recurring",
+                    "trigger_value": "0 0 4 * * *",
+                    "prompt": "alpha only",
+                    "description": "alpha"
+                }),
+                make_ctx("owner"),
+            )
+            .await
+            .unwrap();
+        let other = || {
+            let mut ctx = make_ctx("owner");
+            ctx.bot_id = "researcher".into();
+            ctx
+        };
+        let hidden = tools
+            .execute("list_scheduled_tasks", json!({}), other())
+            .await
+            .unwrap();
+        assert!(
+            hidden.contains("No active scheduled tasks."),
+            "bot B must not see bot A's cron: {hidden}"
+        );
+        let mine = tools
+            .execute("list_scheduled_tasks", json!({}), make_ctx("owner"))
+            .await
+            .unwrap();
+        assert!(
+            mine.contains("alpha"),
+            "current bot must see its cron: {mine}"
+        );
+    }
+
+    /// A bot that does not own the row cannot cancel it, read its history,
+    /// rerun it, or retry/cancel its dead-letter row.
+    #[tokio::test]
+    async fn other_bot_cannot_cancel_history_rerun_or_dead_letter() {
+        let (tools, store, fake, queue) = build_tools().await;
+        tools
+            .execute(
+                "schedule_task",
+                json!({
+                    "trigger_type": "recurring",
+                    "trigger_value": "0 0 4 * * *",
+                    "prompt": "owner only",
+                    "description": "owned"
+                }),
+                make_ctx("owner"),
+            )
+            .await
+            .unwrap();
+        let task = store
+            .list_active_for_bot(crate::platform::DEFAULT_BOT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        store
+            .insert_run(
+                "run-owned",
+                &task.id,
+                "2026-10-03T00:00:00",
+                Some("owner-only-history"),
+                None,
+                "completed",
+            )
+            .await
+            .unwrap();
+        let queue_id = queue
+            .enqueue_manual(&task.id, "run-owned", "stalled")
+            .await
+            .unwrap();
+
+        let other = || {
+            let mut ctx = make_ctx("owner");
+            ctx.bot_id = "researcher".into();
+            ctx
+        };
+
+        let cancel = tools
+            .execute(
+                "cancel_scheduled_task",
+                json!({ "task_id": task.id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            cancel.contains("Task not found"),
+            "other bot must not cancel: {cancel}"
+        );
+        assert!(!cancel.contains("Cancelled task"));
+        assert!(
+            fake.disarmed.lock().await.is_empty(),
+            "other bot must not disarm the live job"
+        );
+        assert_eq!(
+            store.get_by_id(&task.id).await.unwrap().unwrap().status,
+            "active"
+        );
+
+        let history = tools
+            .execute(
+                "get_scheduled_task_history",
+                json!({ "task_id": task.id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            history.contains("Task not found"),
+            "other bot must not read history: {history}"
+        );
+        assert!(!history.contains("owner-only-history"));
+
+        let rerun = tools
+            .execute(
+                "rerun_scheduled_task",
+                json!({ "task_id": task.id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rerun.contains("Task not found"),
+            "other bot must not rerun: {rerun}"
+        );
+        assert!(!rerun.contains("Re-run scheduled"));
+
+        let retry = tools
+            .execute(
+                "task_reruns",
+                json!({ "action": "retry", "queue_id": queue_id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            retry.contains("No actionable queue row"),
+            "other bot must not retry the dead-letter row: {retry}"
+        );
+        assert!(!retry.contains("Queued"));
+
+        let qcancel = tools
+            .execute(
+                "task_reruns",
+                json!({ "action": "cancel", "queue_id": queue_id }),
+                other(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            qcancel.contains("No actionable queue row"),
+            "other bot must not cancel the dead-letter row: {qcancel}"
+        );
+        assert!(!qcancel.contains("will not run again"));
+
+        let row = queue.get(&queue_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            crate::scheduler::reruns::RerunState::AwaitingUser
+        );
+
+        let own_history = tools
+            .execute(
+                "get_scheduled_task_history",
+                json!({ "task_id": task.id }),
+                make_ctx("owner"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            own_history.contains("owner-only-history"),
+            "owner must still see the run: {own_history}"
+        );
     }
 }

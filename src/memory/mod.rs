@@ -215,7 +215,8 @@ impl MemoryStore {
                 status           TEXT NOT NULL DEFAULT 'active',
                 created_at       TEXT NOT NULL DEFAULT (datetime('now')),
                 next_run_at      TEXT,
-                deleted_at       TEXT
+                deleted_at       TEXT,
+                bot_id           TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_user
@@ -365,6 +366,15 @@ impl MemoryStore {
         // scheduled_task_runs history survive as evidence (RRSI ledger input).
         conn.execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN deleted_at TEXT;")
             .ok(); // safe no-op on re-run
+
+        // Per-bot schedules: rows from before bot_id existed belong to the default bot.
+        let migrated = crate::scheduler::reminders::migrate_unscoped_schedules(conn)?;
+        if migrated > 0 {
+            info!(
+                "Migrated {migrated} scheduled task(s) onto bot '{}'",
+                crate::platform::DEFAULT_BOT_ID
+            );
+        }
 
         // Stored embedding dimension (None if legacy DB without schema_meta row)
         let raw: Option<String> = conn

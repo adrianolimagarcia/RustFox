@@ -71,7 +71,6 @@ pub fn session_key(bot_id: &str, user_id: &str) -> String {
 /// A request dispatched from a fire closure to the background job runner.
 pub struct ScheduledJobRequest {
     pub incoming: IncomingMessage,
-    pub bot: Arc<Bot>,
     pub task_id: String,
     pub is_recurring: bool,
     pub task_store: ScheduledTaskStore,
@@ -79,6 +78,9 @@ pub struct ScheduledJobRequest {
     /// `id` is the `pending_reruns` row driving it. The runner must not
     /// re-queue a rerun (two-strike rule); it resolves the row instead.
     pub rerun_id: Option<String>,
+    /// Telegram bot that owns this run. `None` means do not send an approval
+    /// or result on some other bot.
+    pub owning_telegram_bot: Option<Arc<Bot>>,
 }
 
 /// Why an agent run stopped short of a clean final answer.
@@ -143,10 +145,11 @@ pub struct Agent {
     /// Per-`[[bots]]` outbound senders. Tool-call UI must use the bot that
     /// owns the turn, not always the shim (`sender` remains the fallback).
     pub bot_senders: Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn PlatformSender>>>>,
-    /// Telegram bot handle — captured by scheduled-task fire closures
-    /// (`build_fire_closure`). Cloned from main's Arc so every arm path
-    /// dispatches to the same bot without threading it through handlers.
+    /// Shim Telegram bot. Scheduled replies do not use this when the run
+    /// belongs to a different `[[bots]]` id.
     pub bot: Arc<Bot>,
+    /// One teloxide bot per `[[bots]]` id. Schedule delivery looks up the owner.
+    pub telegram_bots: Arc<std::sync::RwLock<std::collections::HashMap<String, Arc<Bot>>>>,
     /// Per-user CancellationTokens for /stop — created at process_message entry,
     /// removed on exit. Checked at each iteration boundary.
     pub cancel_token_registry: Arc<tokio::sync::Mutex<HashMap<String, CancellationToken>>>,
@@ -303,6 +306,7 @@ impl Agent {
         tool_registry: ToolRegistry,
         sender: Arc<dyn PlatformSender>,
         bot: Arc<Bot>,
+        telegram_bots: Arc<std::sync::RwLock<std::collections::HashMap<String, Arc<Bot>>>>,
         restart_pending: Arc<AtomicBool>,
         soul_updated: Arc<AtomicBool>,
     ) -> Self {
@@ -330,6 +334,7 @@ impl Agent {
             sender,
             bot_senders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             bot,
+            telegram_bots,
             cancel_token_registry: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_injections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_loop_callbacks: Arc::new(tokio::sync::Mutex::new(
@@ -1084,6 +1089,7 @@ impl Agent {
             let sender = Arc::clone(&turn_sender);
             let cancel_registry = self.cancel_registry.clone();
             let mode = tool_ui_mode;
+            let turn_bot = bot_id.to_string();
             move |uid: &str, cid: &str| ToolContext {
                 sandbox_dir: sandbox_dir.clone(),
                 home_dir: home_dir.clone(),
@@ -1091,6 +1097,7 @@ impl Agent {
                 cancel_registry: cancel_registry.clone(),
                 user_id: uid.to_string(),
                 chat_id: cid.to_string(),
+                bot_id: turn_bot.clone(),
                 tool_ui_mode: mode,
             }
         };
@@ -1385,6 +1392,20 @@ impl Agent {
         }
     }
 
+    /// Conversation a schedule run reads and writes: the owning bot's chat
+    /// with the user stored on the row. Not another bot, and not a shared cron thread.
+    pub fn scheduled_incoming(task: &ScheduledTask) -> crate::platform::IncomingMessage {
+        crate::platform::IncomingMessage {
+            platform: task.platform.clone(),
+            bot_id: crate::platform::normalize_bot_id(&task.bot_id).to_string(),
+            user_id: task.user_id.clone(),
+            chat_id: task.chat_id.clone(),
+            user_name: String::new(),
+            text: task.prompt.clone(),
+            attachments: vec![],
+        }
+    }
+
     /// Build the fire closure shared by every scheduled-task arming path
     /// (startup restore, Telegram tool, portal CRUD). Dispatches a synthetic
     /// agent turn to the background job runner; the response delivery is the
@@ -1394,47 +1415,41 @@ impl Agent {
     /// run against `&self`.
     pub(crate) fn build_fire_closure(
         job_tx: tokio::sync::mpsc::UnboundedSender<ScheduledJobRequest>,
-        bot: Arc<Bot>,
+        _bot: Arc<Bot>,
+        telegram_bots: Arc<std::sync::RwLock<std::collections::HashMap<String, Arc<Bot>>>>,
         store: ScheduledTaskStore,
         task: &ScheduledTask,
     ) -> impl Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static {
-        let tid = task.id.clone();
-        let uid = task.user_id.clone();
-        let cid = task.chat_id.clone();
-        let prompt = task.prompt.clone();
+        let task_for_fire = task.clone();
         let is_recurring = task.trigger_type == "recurring";
         move || {
             let tx = job_tx.clone();
-            let bot = bot.clone();
+            let bots = Arc::clone(&telegram_bots);
             let store = store.clone();
-            let tid = tid.clone();
-            let uid = uid.clone();
-            let cid = cid.clone();
-            let prompt = prompt.clone();
+            let task_for_fire = task_for_fire.clone();
             let recurring = is_recurring;
             Box::pin(async move {
                 // Issue #111 (Part A): advance the stored next fire time as the
                 // job fires, so `next_run_at` tracks the *actual* next run
                 // (arm refreshes it at runtime; this keeps it rolling without a
                 // restart). Best-effort bookkeeping — never block the dispatch.
-                if let Err(e) = store.refresh_next_run_at(&tid).await {
-                    tracing::warn!("Failed to advance next_run_at for {}: {e:#}", tid);
+                if let Err(e) = store.refresh_next_run_at(&task_for_fire.id).await {
+                    tracing::warn!(
+                        "Failed to advance next_run_at for {}: {e:#}",
+                        task_for_fire.id
+                    );
                 }
-                let incoming = crate::platform::IncomingMessage {
-                    platform: "scheduled_task".to_string(),
-                    bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
-                    user_id: format!("{uid}:{tid}"),
-                    chat_id: cid,
-                    user_name: String::new(),
-                    text: prompt,
-                    attachments: vec![],
+                let incoming = Self::scheduled_incoming(&task_for_fire);
+                let owning_telegram_bot = {
+                    let guard = bots.read().unwrap_or_else(|e| e.into_inner());
+                    crate::scheduler::reminders::owning_bot(&incoming.bot_id, &guard).cloned()
                 };
                 let req = ScheduledJobRequest {
+                    task_id: task_for_fire.id.clone(),
                     incoming,
-                    bot,
+                    owning_telegram_bot,
                     is_recurring: recurring,
                     task_store: store,
-                    task_id: tid,
                     rerun_id: None,
                 };
                 if let Err(e) = tx.send(req) {
@@ -1452,23 +1467,17 @@ impl Agent {
     /// can dispatch without reaching into internals.
     pub fn build_rerun_request(
         job_tx: &tokio::sync::mpsc::UnboundedSender<ScheduledJobRequest>,
-        bot: Arc<Bot>,
+        telegram_bots: &std::collections::HashMap<String, Arc<Bot>>,
         store: ScheduledTaskStore,
         task: &ScheduledTask,
         rerun_id: &str,
     ) -> Result<()> {
-        let incoming = crate::platform::IncomingMessage {
-            platform: "scheduled_task".to_string(),
-            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
-            user_id: format!("{}:{}", task.user_id, task.id),
-            chat_id: task.chat_id.clone(),
-            user_name: String::new(),
-            text: task.prompt.clone(),
-            attachments: vec![],
-        };
+        let incoming = Self::scheduled_incoming(task);
+        let owning_telegram_bot =
+            crate::scheduler::reminders::owning_bot(&incoming.bot_id, telegram_bots).cloned();
         let req = ScheduledJobRequest {
             incoming,
-            bot,
+            owning_telegram_bot,
             is_recurring: task.trigger_type == "recurring",
             task_store: store,
             task_id: task.id.clone(),
@@ -1491,6 +1500,7 @@ impl Agent {
         let fire = Self::build_fire_closure(
             self.job_tx.clone(),
             Arc::clone(&self.bot),
+            Arc::clone(&self.telegram_bots),
             self.task_store.clone(),
             task,
         );
@@ -2136,6 +2146,7 @@ impl Agent {
                 let cancel_registry = self.cancel_registry.clone();
                 let user_id = delivery.user_id.clone();
                 let chat_id = delivery.chat_id.clone();
+                let turn_bot = delivery.bot_id.clone();
                 move |_user_id: &str, _chat_id: &str| ToolContext {
                     sandbox_dir: sandbox_dir.clone(),
                     home_dir: home_dir.clone(),
@@ -2143,6 +2154,7 @@ impl Agent {
                     cancel_registry: cancel_registry.clone(),
                     user_id: user_id.clone(),
                     chat_id: chat_id.clone(),
+                    bot_id: turn_bot.clone(),
                     tool_ui_mode: crate::tool_registry::ToolUiMode::Minimal,
                 }
             };

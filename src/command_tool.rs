@@ -394,6 +394,7 @@ mod tests {
             cancel_registry: Arc::new(CancelRegistry::new()),
             user_id: "u".into(),
             chat_id: "1".into(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.into(),
             tool_ui_mode: ToolUiMode::Silent,
         }
     }
