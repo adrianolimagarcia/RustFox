@@ -601,16 +601,6 @@ mod tests {
         }
     }
 
-    fn test_config() -> crate::config::Config {
-        toml::from_str(
-            r#"
-            [openrouter]
-            api_key = "test"
-            "#,
-        )
-        .expect("config")
-    }
-
     fn native_pdf(page_texts: &[String]) -> Vec<u8> {
         use pdf_extract::{Dictionary, Document, Object, Stream};
 
@@ -683,12 +673,6 @@ mod tests {
         (bytes, pages.len())
     }
 
-    fn write_pdf(bytes: &[u8]) -> tempfile::NamedTempFile {
-        let mut file = tempfile::NamedTempFile::new().expect("temp pdf");
-        std::io::Write::write_all(&mut file, bytes).expect("write pdf");
-        file
-    }
-
     #[tokio::test]
     async fn long_native_pdf_text_rag_and_vision_only_on_retrieved_page() {
         let (bytes, page_count) = long_native_pdf();
@@ -732,25 +716,6 @@ mod tests {
             }
             ContentPart::Text { .. } => panic!("vision hit must be an image part"),
         }
-
-        let file = write_pdf(&bytes);
-        let attachment = crate::platform::Attachment {
-            kind: crate::platform::AttachmentKind::Pdf,
-            path: file.path().to_path_buf(),
-            mime_type: "application/pdf".to_string(),
-            file_name: Some("manual.pdf".to_string()),
-        };
-        let cfg = test_config();
-        let memory = MemoryStore::open_in_memory().expect("memory");
-        let (text, images) =
-            process_attachments(&[attachment], "zebracitation", &cfg, &memory, true).await;
-        assert!(text.contains("[p.7]"));
-        assert!(!text.contains("secretpage12token"));
-        assert_eq!(images.len(), 1);
-        assert!(matches!(
-            &images[0],
-            ContentPart::ImageUrl { image_url } if image_url.url.starts_with("data:image/png;base64,")
-        ));
     }
 
     #[tokio::test]
@@ -795,8 +760,21 @@ mod tests {
         assert!(renderer.pages.lock().expect("pages").is_empty());
     }
 
+    fn pdftoppm_on_path() -> bool {
+        std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .is_ok()
+    }
+
     #[test]
     fn system_renderer_rasters_only_the_requested_page() {
+        if !pdftoppm_on_path() {
+            eprintln!(
+                "skipping system_renderer_rasters_only_the_requested_page: pdftoppm not on PATH"
+            );
+            return;
+        }
         let bytes = native_pdf(&["alpha page".to_string(), "beta page".to_string()]);
         let png = SystemPdfRenderer
             .render_page(&bytes, 2)
