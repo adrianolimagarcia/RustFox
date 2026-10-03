@@ -347,6 +347,8 @@ agents/
 
 Photos and documents (PDF, DOCX, images) are processed via vision API or OCR (`ocrs` pure Rust OCR engine), then injected as multi-modal content or text into the conversation.
 
+Native PDFs are not sent to the model as a file. Text at or under 6000 characters is injected as-is. Longer native PDFs stay on the knowledge text-RAG path: 1000-character chunks with 100-character overlap, then the existing hybrid search (top 5). The prompt cites the page number of each hit. When the active model supports vision, only those retrieved pages are rasterized (long edge 1568px, at most 8 images). Scanned-page OCR and ColPali are later slices, not this path.
+
 ### RAG & Vector Search
 
 - Hybrid vector + FTS5 search using `qwen/qwen3-embedding-8b`
