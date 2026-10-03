@@ -7,6 +7,8 @@ use crate::llm::{ContentPart, ImageUrlContent};
 use crate::memory::MemoryStore;
 use crate::platform::{Attachment, AttachmentKind};
 
+mod ocr_chain;
+
 const LONG_CONTEXT_THRESHOLD: usize = 6000;
 const CHUNK_SIZE: usize = 1000;
 const CHUNK_OVERLAP: usize = 100;
@@ -18,7 +20,8 @@ pub enum ImageResult {
 }
 
 /// Process all attachments for a message.
-/// - Images: base64 vision part (if supports_vision) OR OCR text (if not)
+/// - Images: vision part when the model supports vision, otherwise the OCR
+///   chain (RapidOCR PP-OCRv4 `chinese_cht`, optional Tesseract, then `ocrs`)
 /// - PDFs: native text. At or under 6000 chars, inject the text. Longer native
 ///   PDFs stay on the knowledge text-RAG path (1000-char chunks, 100 overlap,
 ///   top 5). Vision, when enabled, is only the pages those hits already
@@ -108,51 +111,37 @@ async fn process_image(
     supports_vision: bool,
     ocr_model_dir: &Path,
 ) -> Result<ImageResult> {
-    if supports_vision {
-        let bytes = tokio::fs::read(path).await?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let data_url = format!("data:{};base64,{}", mime_type, encoded);
-        Ok(ImageResult::VisionPart(ContentPart::ImageUrl {
-            image_url: ImageUrlContent { url: data_url },
-        }))
-    } else {
-        let text = ocr_image(path, ocr_model_dir).await?;
-        Ok(ImageResult::OcrText(text))
+    match ocr_chain::image_read(supports_vision) {
+        ocr_chain::ImageRead::Vision => {
+            let bytes = tokio::fs::read(path).await?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let data_url = format!("data:{};base64,{}", mime_type, encoded);
+            Ok(ImageResult::VisionPart(ContentPart::ImageUrl {
+                image_url: ImageUrlContent { url: data_url },
+            }))
+        }
+        ocr_chain::ImageRead::OcrChain => {
+            let text = ocr_image(path, ocr_model_dir).await?;
+            Ok(ImageResult::OcrText(text))
+        }
     }
 }
 
-/// Perform OCR on an image using the ocrs neural-network engine.
-/// Downloads model files on first use to `model_dir`.
+/// OCR when vision is off. First non-empty text wins.
+/// RapidOCR is skipped (not downloaded) unless the pinned files are already present.
+/// `ocrs` still fetches its own rten files, and only if it is reached.
 async fn ocr_image(path: &Path, model_dir: &Path) -> Result<String> {
-    ensure_ocr_models(model_dir).await?;
-
-    let det_path = model_dir.join("text-detection.rten");
-    let rec_path = model_dir.join("text-recognition.rten");
-
-    let path_owned = path.to_path_buf();
-
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        let detection_model =
-            rten::Model::load_file(&det_path).context("Failed to load OCR detection model")?;
-        let recognition_model =
-            rten::Model::load_file(&rec_path).context("Failed to load OCR recognition model")?;
-
-        let engine = ocrs::OcrEngine::new(ocrs::OcrEngineParams {
-            detection_model: Some(detection_model),
-            recognition_model: Some(recognition_model),
-            ..Default::default()
-        })?;
-
-        let img = image::open(&path_owned)
-            .context("Failed to open image for OCR")?
-            .into_rgb8();
-        let img_source = ocrs::ImageSource::from_bytes(img.as_raw(), img.dimensions())?;
-        let ocr_input = engine.prepare_input(img_source)?;
-        let text = engine.get_text(&ocr_input)?;
-        Ok(text)
-    })
-    .await
-    .context("OCR task panicked")?
+    for stage in ocr_chain::ocr_stage_order() {
+        let hit = match stage {
+            ocr_chain::OcrStage::RapidOcr => ocr_chain::try_rapidocr(path, model_dir).await,
+            ocr_chain::OcrStage::Tesseract => ocr_chain::try_tesseract(path).await,
+            ocr_chain::OcrStage::Ocrs => Some(ocr_chain::ocr_with_ocrs(path, model_dir).await?),
+        };
+        if let Some(text) = hit.as_deref().and_then(ocr_chain::accepted_traditional) {
+            return Ok(text);
+        }
+    }
+    Ok(String::new())
 }
 
 /// Download OCR model files to model_dir if they don't exist.

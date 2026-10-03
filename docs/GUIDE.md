@@ -345,7 +345,9 @@ agents/
 
 ### File & Image Processing
 
-Photos and documents (PDF, DOCX, images) are processed via vision API or OCR (`ocrs` pure Rust OCR engine), then injected as multi-modal content or text into the conversation.
+Photos and documents (PDF, DOCX, images) are processed via vision API or OCR, then injected as multi-modal content or text into the conversation.
+
+When the active model supports vision, a photo is sent as an image and the OCR chain does not run. Otherwise the first non-empty result wins, in this order: RapidOCR ONNX pinned to PP-OCRv4 mobile (`chinese_cht`, rec file `chinese_cht_PP-OCRv3_rec_mobile.onnx`, dict `chinese_cht_dict.txt`, no conversion to simplified Chinese), then Tesseract if the `tesseract` binary is installed (`chi_tra+eng`), then `ocrs` last. `ocrs` is Latin-only and is not the Cantonese path. This is not RapidOCR's PP-OCRv6 default. The ONNX weights are not in git. `scripts/fetch-rapidocr-ppocrv4-chinese-cht.sh` downloads them, checks SHA256, and writes `$HOME/.cache/ocrs/rapidocr` (or `[ocr].model_dir/rapidocr`). Unit tests do not run that script and do not download models. If the pinned files or `python3` with RapidOCR are missing, that stage is skipped.
 
 Native PDFs are not sent to the model as a file. Text at or under 6000 characters is injected as-is. Longer native PDFs stay on the knowledge text-RAG path: 1000-character chunks with 100-character overlap, then the existing hybrid search (top 5). The prompt cites the page number of each hit. When the active model supports vision, only those retrieved pages are rasterized (long edge 1568px, at most 8 images). Scanned-page OCR and ColPali are later slices, not this path.
 
