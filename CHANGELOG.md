@@ -27,7 +27,7 @@ Release candidate on main after `v1.0.3`. Bumps the workspace version users see
 ### Fixed
 
 - Multi-bot tool-call UI routes to the owning bot.
-- LangSmith child `tool` and `llm_call` runs hang under the existing
+- LangSmith child `tool` and `llm_call` runs are recorded on the same
   `rustfox_request` chain (no client swap).
 - Scheduler listing, `next_run_at`, and related owner-scope fixes from the
   post-1.0.3 patch set.
