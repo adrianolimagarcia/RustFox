@@ -118,10 +118,11 @@ impl ToolHandler for BuiltinTools {
                 tool_type: "function".to_string(),
                 function: FunctionDefinition {
                     name: "plan_update".to_string(),
-                    description: "Update a step's status in the active plan. Call before starting a step (in_progress) and after finishing (done or failed).".to_string(),
+                    description: "Update a step in a plan. Omit title to use the active plan. Call before starting a step (in_progress) and after finishing (done or failed).".to_string(),
                     parameters: json!({
                         "type": "object",
                         "properties": {
+                            "title": { "type": "string", "description": "Plan title. Omit to use the active plan." },
                             "step_id": { "type": "integer", "description": "Zero-based index of the step to update" },
                             "status": { "type": "string", "enum": ["todo", "in_progress", "done", "failed"], "description": "New status for the step" },
                             "notes": { "type": "string", "description": "Optional notes — result summary, error message, etc." }
@@ -134,8 +135,14 @@ impl ToolHandler for BuiltinTools {
                 tool_type: "function".to_string(),
                 function: FunctionDefinition {
                     name: "plan_view".to_string(),
-                    description: "View the current plan as a checklist. Call at the end of execution to review progress before synthesising the final answer.".to_string(),
-                    parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+                    description: "View a plan, including notes. Omit title to use the active plan.".to_string(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "description": "Plan title. Omit to use the active plan." }
+                        },
+                        "required": []
+                    }),
                 },
             },
             ToolDefinition {
@@ -302,18 +309,24 @@ impl ToolHandler for BuiltinTools {
             }
             "plan_create" => {
                 let title = args["title"].as_str().context("Missing 'title' argument")?;
-                let plans_dir = ctx.sandbox_dir.join(".plans");
-                tokio::fs::create_dir_all(&plans_dir).await?;
-                let plan_path = plans_dir.join(format!("{}.json", title));
+                reject_plan_title(title)?;
                 let steps = args["steps"]
                     .as_array()
                     .context("Missing 'steps' argument")?;
+                let plans_dir = ctx.sandbox_dir.join(".plans");
+                tokio::fs::create_dir_all(&plans_dir).await?;
                 let plan = json!({
                     "title": title,
                     "steps": steps,
                     "statuses": vec![json!("todo"); steps.len()],
+                    "notes": vec![json!(""); steps.len()],
                 });
-                tokio::fs::write(&plan_path, serde_json::to_string_pretty(&plan)?).await?;
+                tokio::fs::write(
+                    plan_file(&plans_dir, title),
+                    serde_json::to_string_pretty(&plan)?,
+                )
+                .await?;
+                write_active_plan(&plans_dir, title).await?;
                 Ok(format!(
                     "Created plan '{}' with {} steps",
                     title,
@@ -321,43 +334,48 @@ impl ToolHandler for BuiltinTools {
                 ))
             }
             "plan_update" => {
-                let title = args["title"].as_str().unwrap_or("default");
+                let plans_dir = ctx.sandbox_dir.join(".plans");
+                let title = resolve_plan_title(&plans_dir, &args).await?;
                 let step_id = args["step_id"].as_u64().context("Missing 'step_id'")? as usize;
                 let status = args["status"]
                     .as_str()
                     .context("Missing 'status' argument")?;
-                let _notes = args.get("notes").and_then(|v| v.as_str());
-                let plan_path = ctx
-                    .sandbox_dir
-                    .join(".plans")
-                    .join(format!("{}.json", title));
-                let content = tokio::fs::read_to_string(&plan_path).await?;
+                let notes = args.get("notes").and_then(|v| v.as_str());
+                let plan_path = plan_file(&plans_dir, &title);
+                let content = read_plan_file(&plans_dir, &title).await?;
                 let mut plan: Value = serde_json::from_str(&content)?;
-                if let Some(statuses) = plan.get_mut("statuses").and_then(|s| s.as_array_mut()) {
-                    if step_id < statuses.len() {
-                        statuses[step_id] = json!(status);
-                        if let Some(n) = _notes {
-                            if let Some(notes_arr) =
-                                plan.get_mut("notes").and_then(|n| n.as_array_mut())
-                            {
-                                if step_id < notes_arr.len() {
-                                    notes_arr[step_id] = json!(n);
-                                }
-                            }
-                        }
+                let len = plan
+                    .get("statuses")
+                    .and_then(|s| s.as_array())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                if step_id >= len {
+                    anyhow::bail!("step_id {step_id} is out of range (0..{len})");
+                }
+                plan["statuses"][step_id] = json!(status);
+                if let Some(note) = notes {
+                    let arr = plan
+                        .as_object_mut()
+                        .context("plan is not an object")?
+                        .entry("notes")
+                        .or_insert_with(|| json!([]));
+                    let arr = arr.as_array_mut().context("notes is not an array")?;
+                    while arr.len() <= step_id {
+                        arr.push(json!(""));
                     }
+                    arr[step_id] = json!(note);
                 }
                 tokio::fs::write(&plan_path, serde_json::to_string_pretty(&plan)?).await?;
+                write_active_plan(&plans_dir, &title).await?;
                 Ok(format!("Updated step {step_id} to '{status}'"))
             }
             "plan_view" => {
-                let title = args["title"].as_str().unwrap_or("default");
-                let plan_path = ctx
-                    .sandbox_dir
-                    .join(".plans")
-                    .join(format!("{}.json", title));
-                let content = tokio::fs::read_to_string(&plan_path).await?;
-                Ok(content)
+                let plans_dir = ctx.sandbox_dir.join(".plans");
+                let title = resolve_plan_title(&plans_dir, &args).await?;
+                let content = read_plan_file(&plans_dir, &title).await?;
+                let mut plan: Value = serde_json::from_str(&content)?;
+                ensure_plan_notes(&mut plan);
+                Ok(serde_json::to_string_pretty(&plan)?)
             }
             "try_new_tech" => {
                 let technology = args["technology"]
@@ -647,6 +665,104 @@ impl ToolHandler for BuiltinTools {
     }
 }
 
+const PLAN_POINTER: &str = "active";
+
+fn reject_plan_title(title: &str) -> anyhow::Result<()> {
+    let bad = title.trim().is_empty()
+        || title.contains('/')
+        || title.contains('\\')
+        || title.split(['/', '\\']).any(|part| part == "..");
+    if bad {
+        anyhow::bail!("invalid plan title: {title:?}");
+    }
+    Ok(())
+}
+
+fn plan_file(plans_dir: &std::path::Path, title: &str) -> PathBuf {
+    plans_dir.join(format!("{title}.json"))
+}
+
+fn ensure_plan_notes(plan: &mut Value) {
+    let n = plan
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let Some(obj) = plan.as_object_mut() else {
+        return;
+    };
+    let notes = obj.entry("notes").or_insert_with(|| json!([]));
+    if let Some(arr) = notes.as_array_mut() {
+        while arr.len() < n {
+            arr.push(json!(""));
+        }
+    }
+}
+
+async fn list_plan_titles(plans_dir: &std::path::Path) -> Vec<String> {
+    let mut titles = Vec::new();
+    let mut dir = match tokio::fs::read_dir(plans_dir).await {
+        Ok(dir) => dir,
+        Err(_) => return titles,
+    };
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(title) = name.strip_suffix(".json") {
+            titles.push(title.to_string());
+        }
+    }
+    titles.sort();
+    titles
+}
+
+fn plans_list(titles: &[String]) -> String {
+    if titles.is_empty() {
+        "(none)".to_string()
+    } else {
+        titles.join(", ")
+    }
+}
+
+async fn read_active_plan(plans_dir: &std::path::Path) -> Option<String> {
+    let raw = tokio::fs::read_to_string(plans_dir.join(PLAN_POINTER))
+        .await
+        .ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+async fn write_active_plan(plans_dir: &std::path::Path, title: &str) -> anyhow::Result<()> {
+    tokio::fs::write(plans_dir.join(PLAN_POINTER), serde_json::to_string(title)?).await?;
+    Ok(())
+}
+
+async fn resolve_plan_title(plans_dir: &std::path::Path, args: &Value) -> anyhow::Result<String> {
+    if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
+        reject_plan_title(title)?;
+        return Ok(title.to_string());
+    }
+    match read_active_plan(plans_dir).await {
+        Some(title) => Ok(title),
+        None => {
+            let existing = list_plan_titles(plans_dir).await;
+            anyhow::bail!("no active plan. existing plans: {}", plans_list(&existing))
+        }
+    }
+}
+
+async fn read_plan_file(plans_dir: &std::path::Path, title: &str) -> anyhow::Result<String> {
+    match tokio::fs::read_to_string(plan_file(plans_dir, title)).await {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let existing = list_plan_titles(plans_dir).await;
+            anyhow::bail!(
+                "plan {title:?} not found. existing plans: {}",
+                plans_list(&existing)
+            )
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +792,181 @@ mod tests {
         assert!(
             names.contains(&"revert_soul_file"),
             "revert_soul_file must be in BuiltinTools definitions"
+        );
+    }
+
+    struct NopSender;
+
+    #[async_trait]
+    impl crate::platform::sender::PlatformSender for NopSender {
+        async fn send_message(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::platform::sender::MessageFormat,
+        ) -> anyhow::Result<crate::platform::sender::PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn send_file(
+            &self,
+            _: &str,
+            _: &std::path::Path,
+            _: Option<&str>,
+        ) -> anyhow::Result<crate::platform::sender::PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn show_cancel_button(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<crate::platform::sender::PlatformMessageId> {
+            Ok("0:1".into())
+        }
+        async fn edit_message(
+            &self,
+            _: &str,
+            _: &crate::platform::sender::PlatformMessageId,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(
+            &self,
+            _: &str,
+            _: &crate::platform::sender::PlatformMessageId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn notify_shutdown(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn plan_ctx(sandbox: &std::path::Path) -> ToolContext {
+        ToolContext {
+            sandbox_dir: sandbox.to_path_buf(),
+            home_dir: None,
+            sender: Arc::new(NopSender),
+            cancel_registry: Arc::new(crate::cancel_registry::CancelRegistry::new()),
+            user_id: "u".into(),
+            chat_id: "1".into(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.into(),
+            tool_ui_mode: crate::tool_registry::ToolUiMode::Silent,
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_pointer_notes_and_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = make_tools();
+        let ctx = || plan_ctx(dir.path());
+
+        let created = tools
+            .execute(
+                "plan_create",
+                json!({"title": "第一份: plan", "steps": ["a", "b"]}),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(created.contains("第一份: plan"));
+
+        let viewed = tools.execute("plan_view", json!({}), ctx()).await.unwrap();
+        let plan: Value = serde_json::from_str(&viewed).unwrap();
+        assert_eq!(plan["title"], "第一份: plan");
+        assert_eq!(plan["notes"], json!(["", ""]));
+
+        tools
+            .execute(
+                "plan_create",
+                json!({"title": "second plan", "steps": ["only"]}),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        let active = tools.execute("plan_view", json!({}), ctx()).await.unwrap();
+        assert!(active.contains("second plan"));
+        let first = tools
+            .execute("plan_view", json!({"title": "第一份: plan"}), ctx())
+            .await
+            .unwrap();
+        assert!(first.contains("第一份: plan"));
+        let still = tools.execute("plan_view", json!({}), ctx()).await.unwrap();
+        assert!(still.contains("second plan"));
+
+        tools
+            .execute(
+                "plan_update",
+                json!({"step_id": 0, "status": "done", "notes": "ok"}),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        let updated: Value =
+            serde_json::from_str(&tools.execute("plan_view", json!({}), ctx()).await.unwrap())
+                .unwrap();
+        assert_eq!(updated["statuses"][0], "done");
+        assert_eq!(updated["notes"][0], "ok");
+
+        let missed = tools
+            .execute(
+                "plan_update",
+                json!({"title": "第一份: plan", "step_id": 9, "status": "failed"}),
+                ctx(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missed.contains("out of range"), "{missed}");
+        let unchanged: Value = serde_json::from_str(
+            &tools
+                .execute("plan_view", json!({"title": "第一份: plan"}), ctx())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unchanged["statuses"][0], "todo");
+        let pointer = tools.execute("plan_view", json!({}), ctx()).await.unwrap();
+        assert!(pointer.contains("second plan"));
+
+        tools
+            .execute(
+                "plan_create",
+                json!({"title": "second plan", "steps": ["replaced"]}),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        let replaced: Value =
+            serde_json::from_str(&tools.execute("plan_view", json!({}), ctx()).await.unwrap())
+                .unwrap();
+        assert_eq!(replaced["steps"], json!(["replaced"]));
+        assert_eq!(replaced["notes"], json!([""]));
+
+        for title in ["", "   ", "a/b", "a\\b", "..", "foo/.."] {
+            let err = tools
+                .execute(
+                    "plan_create",
+                    json!({"title": title, "steps": ["x"]}),
+                    ctx(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid plan title"), "{title:?} -> {err}");
+        }
+
+        let missing = tools
+            .execute("plan_view", json!({"title": "nope"}), ctx())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("not found"), "{missing}");
+        assert!(missing.contains("第一份: plan"), "{missing}");
+        assert!(
+            !missing.to_ascii_lowercase().contains("os error"),
+            "{missing}"
         );
     }
 
