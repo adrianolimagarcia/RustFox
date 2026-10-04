@@ -998,18 +998,19 @@ impl Agent {
             provider.supports_vision()
         };
 
-        let image_parts = cmgr
+        let (combined_text, image_parts) = cmgr
             .add_incoming(incoming, &self.config, supports_vision)
             .await?;
 
-        // Build user message content
+        // Build user message content — same text that add_incoming persisted
+        // (user text + attachment/OCR), plus vision image parts when present.
         let user_msg_content = if image_parts.is_empty() {
-            MessageContent::from_text(incoming.text.clone())
+            MessageContent::from_text(combined_text)
         } else {
             let mut parts: Vec<ContentPart> = Vec::new();
-            if !incoming.text.is_empty() {
+            if !combined_text.is_empty() {
                 parts.push(ContentPart::Text {
-                    text: incoming.text.clone(),
+                    text: combined_text,
                 });
             }
             parts.extend(image_parts);

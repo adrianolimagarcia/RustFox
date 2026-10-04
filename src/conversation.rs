@@ -106,13 +106,28 @@ impl ConversationManager {
         })
     }
 
+    /// Text content the model sees for a user turn (and that we persist).
+    /// Typed user text plus attachment/OCR extraction when present, joined by a blank line.
+    pub(crate) fn combine_user_and_attachment_text(
+        user_text: &str,
+        attachment_text: &str,
+    ) -> String {
+        if attachment_text.is_empty() {
+            user_text.to_string()
+        } else if user_text.is_empty() {
+            attachment_text.to_string()
+        } else {
+            format!("{user_text}\n\n{attachment_text}")
+        }
+    }
+
     pub async fn add_incoming(
         &mut self,
         incoming: &IncomingMessage,
         config: &Config,
         supports_vision: bool,
-    ) -> Result<Vec<ContentPart>> {
-        let (augmented_text, image_parts) = crate::file_processor::process_attachments(
+    ) -> Result<(String, Vec<ContentPart>)> {
+        let (attachment_text, image_parts) = crate::file_processor::process_attachments(
             &incoming.attachments,
             &incoming.text,
             config,
@@ -121,9 +136,13 @@ impl ConversationManager {
         )
         .await;
 
+        // Persist the same text the model will see (user text + attachment/OCR),
+        // not the bare process_attachments return (empty when there is no attachment).
+        let combined = Self::combine_user_and_attachment_text(&incoming.text, &attachment_text);
+
         let user_msg = ChatMessage {
             role: "user".to_string(),
-            content: Some(MessageContent::Text(augmented_text)),
+            content: Some(MessageContent::Text(combined.clone())),
             tool_calls: None,
             tool_call_id: None,
         };
@@ -135,7 +154,7 @@ impl ConversationManager {
                 .await?;
         }
 
-        Ok(image_parts)
+        Ok((combined, image_parts))
     }
 
     pub fn add_user_turn(&mut self, msg: ChatMessage) {
@@ -826,6 +845,210 @@ mod tests {
                 .unwrap()
                 .as_text(),
             "UNIQUE_KEYWORD_B follow-up"
+        );
+    }
+
+    fn persist_test_config() -> Config {
+        // keep(): temp dir must outlive the loaded config.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[telegram]
+bot_token = "test"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "test"
+
+[sandbox]
+allowed_directory = "."
+"#,
+        )
+        .unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    /// Short native PDF fixture (same shape as file_processor tests).
+    fn short_pdf_bytes(page_text: &str) -> Vec<u8> {
+        use pdf_extract::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut font = Dictionary::new();
+        font.set("Type", Object::Name(b"Font".to_vec()));
+        font.set("Subtype", Object::Name(b"Type1".to_vec()));
+        font.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+        let font_id = doc.add_object(Object::Dictionary(font));
+
+        let escaped = page_text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let content = format!("BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET");
+        let content_id = doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        let mut resources = Dictionary::new();
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", Object::Reference(font_id));
+        resources.set("Font", Object::Dictionary(fonts));
+        let mut page = Dictionary::new();
+        page.set("Type", Object::Name(b"Page".to_vec()));
+        page.set("Parent", Object::Reference(pages_id));
+        page.set(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        page.set("Contents", Object::Reference(content_id));
+        page.set("Resources", Object::Dictionary(resources));
+        let page_id = doc.add_object(Object::Dictionary(page));
+
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages.set("Count", Object::Integer(1));
+        doc.set_object(pages_id, Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut out = Vec::new();
+        doc.save_to(&mut out).expect("write pdf");
+        out
+    }
+
+    #[tokio::test]
+    async fn add_incoming_persists_plain_user_text_not_empty() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let config = persist_test_config();
+        let skills = crate::skills::SkillRegistry::new();
+        let mut cm = ConversationManager::new(
+            &store,
+            "telegram",
+            crate::platform::DEFAULT_BOT_ID,
+            "persist_plain",
+            "sys".to_string(),
+            &skills,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let msg = IncomingMessage {
+            platform: "telegram".to_string(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
+            user_id: "persist_plain".to_string(),
+            chat_id: "1".to_string(),
+            user_name: "tester".to_string(),
+            text: "Hi".to_string(),
+            attachments: vec![],
+            schedule_id: None,
+        };
+
+        let (combined, image_parts) = cm.add_incoming(&msg, &config, false).await.unwrap();
+        assert!(image_parts.is_empty());
+        // Same text the model is given for a plain turn.
+        assert_eq!(combined, "Hi");
+
+        let conv = store
+            .get_or_create_conversation(
+                "telegram",
+                crate::platform::DEFAULT_BOT_ID,
+                "persist_plain",
+            )
+            .await
+            .unwrap();
+        let rows = store.load_messages(&conv).await.unwrap();
+        let user_rows: Vec<_> = rows.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_rows.len(), 1, "one persisted user row");
+        assert_eq!(
+            user_rows[0].content.as_ref().unwrap().as_text(),
+            "Hi",
+            "DB row must equal the text the model was given, not empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_incoming_persists_user_text_plus_attachment_text() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let config = persist_test_config();
+        let skills = crate::skills::SkillRegistry::new();
+        let mut cm = ConversationManager::new(
+            &store,
+            "telegram",
+            crate::platform::DEFAULT_BOT_ID,
+            "persist_attach",
+            "sys".to_string(),
+            &skills,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("note.pdf");
+        std::fs::write(&pdf_path, short_pdf_bytes("attachment ocr body")).unwrap();
+
+        let msg = IncomingMessage {
+            platform: "telegram".to_string(),
+            bot_id: crate::platform::DEFAULT_BOT_ID.to_string(),
+            user_id: "persist_attach".to_string(),
+            chat_id: "1".to_string(),
+            user_name: "tester".to_string(),
+            text: "Please read this".to_string(),
+            attachments: vec![crate::platform::Attachment {
+                kind: crate::platform::AttachmentKind::Pdf,
+                path: pdf_path,
+                mime_type: "application/pdf".to_string(),
+                file_name: Some("note.pdf".to_string()),
+            }],
+            schedule_id: None,
+        };
+
+        let (combined, image_parts) = cm.add_incoming(&msg, &config, false).await.unwrap();
+        assert!(
+            image_parts.is_empty(),
+            "short PDF is text-only, no vision parts"
+        );
+
+        assert!(
+            combined.starts_with("Please read this\n\n[File: note.pdf]\n"),
+            "combined must include user text and attachment text, got: {combined:?}"
+        );
+        assert!(
+            combined.contains("attachment ocr body"),
+            "combined must include extracted attachment body: {combined:?}"
+        );
+        // Not only the attachment return (which would omit the user text).
+        assert!(
+            combined.contains("Please read this"),
+            "must include typed user text, not only attachment return"
+        );
+        assert_ne!(combined, "", "must not be empty");
+
+        let conv = store
+            .get_or_create_conversation(
+                "telegram",
+                crate::platform::DEFAULT_BOT_ID,
+                "persist_attach",
+            )
+            .await
+            .unwrap();
+        let rows = store.load_messages(&conv).await.unwrap();
+        let user_rows: Vec<_> = rows.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_rows.len(), 1);
+        assert_eq!(
+            user_rows[0].content.as_ref().unwrap().as_text(),
+            combined,
+            "DB row must match the combined content the model sees"
         );
     }
 }
