@@ -397,8 +397,9 @@ async fn run_web(config_dir: &Path) -> Result<()> {
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
         let url = format!("http://localhost:{SETUP_PORT}");
-        let _ = std::process::Command::new("xdg-open").arg(&url).status();
-        let _ = std::process::Command::new("open").arg(&url).status();
+        if !open_browser(&url) {
+            println!("Couldn't open a browser. Open the URL above manually.");
+        }
     });
 
     axum::serve(listener, app)
@@ -409,6 +410,40 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .context("Server error")?;
 
     Ok(())
+}
+
+/// Launchers to try, in order, for the wizard URL (ADR 0015). WSL hands off
+/// to the Windows browser; headless Linux gets none (URL is printed instead).
+fn browser_openers(wsl: bool, has_display: bool) -> &'static [&'static [&'static str]] {
+    if cfg!(target_os = "macos") {
+        &[&["open"]]
+    } else if cfg!(windows) {
+        &[&["cmd", "/c", "start"]]
+    } else if wsl {
+        &[&["wslview"], &["cmd.exe", "/c", "start"]]
+    } else if has_display {
+        &[&["xdg-open"]]
+    } else {
+        &[]
+    }
+}
+
+/// `true` if some launcher exited 0.
+fn open_browser(url: &str) -> bool {
+    let wsl = std::fs::read_to_string("/proc/version")
+        .is_ok_and(|v| v.to_lowercase().contains("microsoft"));
+    let has_display = ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    browser_openers(wsl, has_display).iter().any(|cmd| {
+        std::process::Command::new(cmd[0])
+            .args(&cmd[1..])
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 // ── Web handlers ───────────────────────────────────────────────────────
@@ -1475,6 +1510,21 @@ pub fn parse_existing_config(content: &str) -> ExistingConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wsl_opens_the_windows_browser_not_xdg_open() {
+        let got = browser_openers(true, true);
+        assert_eq!(got, &[&["wslview"][..], &["cmd.exe", "/c", "start"][..]]);
+        assert_eq!(browser_openers(true, false), got, "WSL ignores DISPLAY");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_linux_skips_auto_open_desktop_uses_xdg_open() {
+        assert!(browser_openers(false, false).is_empty());
+        assert_eq!(browser_openers(false, true), &[&["xdg-open"][..]]);
+    }
     use super::*;
 
     #[test]
