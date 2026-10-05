@@ -452,7 +452,8 @@ async fn serve_index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-/// Open SecretStore beside `config_path` and seal BotFather plaintext tokens so
+/// Open SecretStore beside `config_path` and seal plaintext bot tokens and the
+/// `[openrouter].api_key` (ADR 0016) so
 /// the written file never contains them (wizard first-save / re-save).
 fn seal_credentials_for_wizard_write(config_path: &Path, content: &str) -> anyhow::Result<String> {
     let home = config_path
@@ -471,7 +472,7 @@ fn seal_credentials_for_wizard_write(config_path: &Path, content: &str) -> anyho
 /// Report (without echoing any secret material) that plaintext credentials were
 /// sealed. Kept argument-free so no sealing-call output flows into a log sink.
 fn report_sealed_credentials() {
-    println!("\u{2713} Bot credentials sealed into SecretStore (config now holds refs only)");
+    println!("\u{2713} Credentials sealed into SecretStore (config now holds refs only)");
 }
 
 async fn save_config(
@@ -1597,9 +1598,14 @@ mod tests {
         );
         assert!(raw.contains("AAWizardCliFirstSaveTokenXX"));
         let (sealed, n) = seal_plaintext_bot_tokens_in_config(&raw, &store).unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 2, "bot token + [openrouter].api_key");
         assert!(!sealed.contains("AAWizardCliFirstSaveTokenXX"));
         assert!(sealed.contains("secret:bot.default.token"));
+        assert!(sealed.contains(r#"api_key = "secret:openrouter.api_key""#));
+        assert_eq!(
+            store.get("openrouter.api_key").unwrap().unwrap().expose(),
+            "key"
+        );
         assert_eq!(
             store.get("bot.default.token").unwrap().unwrap().expose(),
             "111111111:AAWizardCliFirstSaveTokenXX"

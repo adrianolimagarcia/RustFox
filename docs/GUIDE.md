@@ -23,7 +23,7 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 | `[telegram]` | `bot_token` | Telegram Bot API token | — |
 | | `api_base_url` | Bot API root override (teloxide + rich_sender) | `https://api.telegram.org` |
 | | `allowed_user_ids` | Comma-separated whitelist of user IDs | — |
-| `[openrouter]` | `api_key` | OpenRouter API key | — |
+| `[openrouter]` | `api_key` | OpenRouter API key; sealed to `secret:openrouter.api_key` (see below) | — |
 | | `model` | LLM model ID | `moonshotai/kimi-k2.6` |
 | | `base_url` | API base URL override | `https://openrouter.ai/api/v1` |
 | `[sandbox]` | `allowed_directory` | Directory for sandboxed file/command ops | `<home>/workspace` |
@@ -52,6 +52,8 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 > **Secrets:** macOS and Windows use the OS keyring (Keychain / Credential Manager). Linux always uses the encrypted vault, because Linux keyutils is in-memory and per-session (a `systemctl --user` service cannot see it and a reboot clears it); secrets left in keyutils by older builds are copied into the vault on first read. If the keyring is unavailable, RustFox uses an AES-GCM vault at `~/.rustfox/secrets/vault` whose master key is a **plaintext file** `~/.rustfox/secrets/vault.key` (mode `0600`). Anyone who can read `vault.key` can decrypt the vault — treat home-directory permissions as the trust boundary. Pending secret entry uses the portal masked form + Telegram notify/link (never paste values in chat). Required secrets for MCP env use the `secret:NAME` value form; `[sandbox].secret_env` injects named secrets into `execute_command` child processes via env only (never chat/LLM/tool args/logs).
 >
 > **Bot tokens:** `[[bots]].bot_token` / legacy `[telegram].bot_token` must be a `secret:NAME` reference (canonical name `bot.<id>.token`). Wizard initial save, `/agents` bind, and wizard add-bot write the BotFather token into SecretStore **before** disk write — `config.toml` never receives plaintext. Startup migrate+scrub remains a safety net for any leftover BotFather-shaped values (`.bak` via the shared config write path). `/config`, `/agents`, and restart replies never echo token values (`bot_token=***`). Manual path: store set `bot.<id>.token` then set `bot_token = "secret:bot.<id>.token"` in config.
+>
+> **OpenRouter key (ADR 0016):** `[openrouter].api_key` is stored in SecretStore as `openrouter.api_key`; config keeps only `api_key = "secret:openrouter.api_key"`. The wizard seals it before writing `config.toml`, and startup migrate+scrub moves any leftover plaintext key into the store (`.bak` via the shared config write path). The ref is resolved at startup, including the legacy `[openrouter]` provider. `[embedding].api_key` and other `[[provider]].api_key` values are deliberately not sealed yet and may stay plaintext.
 
 ---
 
