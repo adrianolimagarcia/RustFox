@@ -1,7 +1,7 @@
 # ADR 0016: OpenRouter API key lives in SecretStore
 
 ## Status
-Proposed
+Accepted
 
 ## Date
 2026-10-05

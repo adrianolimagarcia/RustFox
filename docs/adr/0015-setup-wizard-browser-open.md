@@ -1,7 +1,7 @@
 # ADR 0015: Setup wizard opens the browser on WSL via Windows, skips headless
 
 ## Status
-Proposed
+Accepted
 
 ## Date
 2026-10-05

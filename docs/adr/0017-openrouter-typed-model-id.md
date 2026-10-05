@@ -1,7 +1,7 @@
 # ADR 0017: OpenRouter model pick allows a typed model id
 
 ## Status
-Proposed
+Accepted
 
 ## Date
 2026-10-05
