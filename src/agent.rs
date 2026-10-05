@@ -1026,8 +1026,10 @@ impl Agent {
         };
         cmgr.add_user_turn(user_msg);
 
-        // Per-turn compaction (ADR 0003 Q1): routine compaction runs once per
-        // user turn, before the agentic loop, at 85% of the real provider window.
+        // Per-turn compaction (ADR 0003 Q1 / ADR 0019 ③): runs before the
+        // agentic loop at 85% of the real provider window. compact_messages
+        // may apply a second in-turn pass if still over the watermark; it
+        // never trims system/soul/skill bodies (summarize history only).
         let current_model = self.current_model.read().await.clone();
         let context_window = self.registry.effective_context_window(&current_model);
         let compaction_model = self.config.learning.compaction_model.clone();
