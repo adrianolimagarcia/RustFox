@@ -5,7 +5,7 @@
 //! One-time startup migration moves legacy plaintext into the store and scrubs
 //! `config.toml` (bak via [`crate::config_edit::write_config_validated`]).
 
-use super::{validate_name, SecretStore, SECRET_REF_PREFIX};
+use super::{set_verified, validate_name, SecretStore, SECRET_REF_PREFIX};
 use crate::agents_edit::looks_like_bot_token;
 use crate::config::Config;
 use crate::config_edit::write_config_validated;
@@ -67,7 +67,7 @@ pub fn store_bot_token(store: &dyn SecretStore, bot_id: &str, plaintext: &str) -
     if token.is_empty() {
         bail!("bot_token cannot be empty");
     }
-    store.set(&name, token)?;
+    set_verified(store, &name, token)?;
     Ok(bot_token_secret_ref(bot_id))
 }
 
