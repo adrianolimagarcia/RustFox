@@ -697,6 +697,8 @@ mod tests {
         assert!(html.contains("id=\"f-openrouter-model\""));
         assert!(html.contains("id=\"f-openrouter-model-pick\""));
         assert!(html.contains(OPENROUTER_MODELS_URL));
+        // Client mirrors the server '/' rule (server stays authoritative).
+        assert!(html.contains("requireField('f-openrouter-model', v => v.includes('/'))"));
         assert!(!html.contains("<select id=\"f-openrouter-model\""));
         assert!(!html.contains("no typed id"));
         assert!(html.contains("<select id=\"f-ollama-model\""));

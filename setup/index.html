@@ -541,12 +541,12 @@ function nextStep() {
   showStep(currentStep + 1);
 }
 
-function requireField(id) {
+function requireField(id, valid) {
   const el = document.getElementById(id);
   if (!el) return true;
   const errEl = el.parentElement.querySelector('.error-msg');
   const value = (el.value || '').trim();
-  if (!value) {
+  if (!value || (valid && !valid(value))) {
     el.classList.add('error');
     if (errEl) errEl.classList.add('visible');
     return false;
@@ -569,7 +569,7 @@ function validateStep() {
     if (!state.ollama_running) ok = 0;
     ok = requireField('f-ollama-model') & ok;
   } else {
-    ok = requireField('f-openrouter-key') & requireField('f-openrouter-model') & ok;
+    ok = requireField('f-openrouter-key') & requireField('f-openrouter-model', v => v.includes('/')) & ok;
   }
   return !!ok;
 }
