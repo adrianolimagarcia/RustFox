@@ -1,6 +1,6 @@
 # ADR 0019: Walk `[fallback] chain` on any primary failure (amends ADR-0012)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-05
 - **Amends:** ADR-0012 (request-layer model fallback), ADR-0009 (per-model 429/5xx retry)
 - **Notion:** https://app.notion.com/p/3f095d6dd45e810893e5cac373f2405a
