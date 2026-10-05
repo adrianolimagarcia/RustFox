@@ -18,7 +18,8 @@ mod value;
 
 pub use bot_token::{
     bot_token_secret_name, bot_token_secret_ref, is_secret_ref, migrate_plaintext_bot_tokens,
-    parse_secret_ref, resolve_bot_token, seal_plaintext_bot_tokens_in_config, store_bot_token,
+    parse_secret_ref, resolve_bot_token, resolve_openrouter_api_key,
+    seal_plaintext_bot_tokens_in_config, store_bot_token, store_secret, OPENROUTER_API_KEY_SECRET,
 };
 pub use bridge::{
     MissingSecret, MissingSecretError, SecretBridge, SecretNotifyFn, SECRET_REF_PREFIX,
