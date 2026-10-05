@@ -111,6 +111,29 @@ pub struct FunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// Deduplicate tool definitions by exact `function.name`, keeping the **first**
+/// occurrence (ADR-0019 slice ② / Wafer `duplicate_tool_name`). Later duplicates
+/// are dropped; do not rename tools or change MCP prefix rules.
+pub fn dedupe_tool_definitions_keep_first(tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = tool.function.name.clone();
+        if seen.insert(name.clone()) {
+            out.push(tool);
+        } else {
+            tracing::warn!(
+                tool_name = %name,
+                kept = "first",
+                "Dropping duplicate tool function.name; keeping first occurrence"
+            );
+        }
+    }
+    out
+}
+
 /// Completion wrapper that preserves metadata alongside the assistant message.
 #[derive(Debug, Clone)]
 pub struct ChatCompletion {
@@ -673,6 +696,68 @@ mod tests {
         assert!(
             result.is_ok(),
             "stream_text must return Ok even when receiver is dropped"
+        );
+    }
+
+    fn make_tool(name: &str, description: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+        }
+    }
+
+    #[test]
+    fn test_dedupe_tool_definitions_keep_first_drops_later_duplicates() {
+        let tools = vec![
+            make_tool("alpha", "first-alpha"),
+            make_tool("beta", "only-beta"),
+            make_tool("alpha", "second-alpha"),
+            make_tool("gamma", "only-gamma"),
+            make_tool("beta", "second-beta"),
+        ];
+        let deduped = dedupe_tool_definitions_keep_first(tools);
+        let names: Vec<&str> = deduped.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(deduped[0].function.description, "first-alpha");
+        assert_eq!(deduped[1].function.description, "only-beta");
+    }
+
+    #[test]
+    fn test_dedupe_tool_definitions_wafer_style_high_index_duplicate() {
+        // Regression for Wafer `duplicate_tool_name` at tools[155]-style payloads:
+        // a long tool list with a late duplicate must not retain two identical names.
+        let mut tools: Vec<ToolDefinition> = (0..160)
+            .map(|i| make_tool(&format!("tool_{i}"), &format!("desc_{i}")))
+            .collect();
+        // Insert a duplicate of tools[10] at index 155.
+        tools[155] = make_tool("tool_10", "late-duplicate-of-tool-10");
+        let deduped = dedupe_tool_definitions_keep_first(tools);
+        let names: Vec<&str> = deduped.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names.len(), 159, "exactly one duplicate should be dropped");
+        assert_eq!(
+            names.iter().filter(|n| **n == "tool_10").count(),
+            1,
+            "tool_10 must appear exactly once"
+        );
+        let tool_10 = deduped
+            .iter()
+            .find(|t| t.function.name == "tool_10")
+            .expect("tool_10 kept");
+        assert_eq!(
+            tool_10.function.description, "desc_10",
+            "first occurrence must be kept"
+        );
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "no duplicate function.name remains"
         );
     }
 

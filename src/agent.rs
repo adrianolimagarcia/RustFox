@@ -1050,10 +1050,6 @@ impl Agent {
             );
         }
 
-        // Gather all tool definitions
-        let mut all_tools: Vec<ToolDefinition> = self.tool_registry.all_definitions();
-        all_tools.extend(self.mcp.tool_definitions());
-
         // --- LangSmith: start root chain run ---
         let chain_run_id = uuid::Uuid::new_v4().to_string();
         let ls_project = self
@@ -1619,11 +1615,12 @@ impl Agent {
         Ok(())
     }
 
-    /// Get all tool definitions for display
+    /// Get all tool definitions (builtin → MCP), deduped by exact `function.name`
+    /// keep-first (ADR-0019 slice ②) before any provider/LLM call or display.
     pub fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut all = self.tool_registry.all_definitions();
         all.extend(self.mcp.tool_definitions());
-        all
+        crate::llm::dedupe_tool_definitions_keep_first(all)
     }
 
     /// Handle `invoke_agent` tool args with §7.5 peer depth/cycle guards and
@@ -1776,11 +1773,7 @@ impl Agent {
                 allowed_tools.len()
             );
 
-            let all_possible_tools: Vec<ToolDefinition> = {
-                let mut t = self.tool_registry.all_definitions();
-                t.extend(self.mcp.tool_definitions());
-                t
-            };
+            let all_possible_tools: Vec<ToolDefinition> = self.all_tool_definitions();
 
             let subagent_tools: Vec<ToolDefinition> = all_possible_tools
                 .into_iter()
@@ -1881,11 +1874,7 @@ impl Agent {
         );
 
         // Build the subagent tool definitions (filtered to whitelist only)
-        let all_possible_tools: Vec<ToolDefinition> = {
-            let mut t = self.tool_registry.all_definitions();
-            t.extend(self.mcp.tool_definitions());
-            t
-        };
+        let all_possible_tools: Vec<ToolDefinition> = self.all_tool_definitions();
 
         // Warn if any declared tool is not available at runtime (e.g. MCP server not configured).
         let available_names: Vec<String> = all_possible_tools
