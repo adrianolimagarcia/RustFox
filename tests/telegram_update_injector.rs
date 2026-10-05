@@ -1016,3 +1016,18 @@ async fn fully_silent_max_iterations_still_sends_the_sentence() {
         "fully_silent must still hide tool and Thinking bubbles; got {progress:?}"
     );
 }
+
+#[tokio::test]
+async fn max_iterations_sentence_is_saved_to_history() {
+    let h = HandleMessageHarness::tool_turn_cfg(false, 1, true).await;
+    drive_tool_turn(&h, "main").await;
+
+    let saved = h.agent.memory.recent_messages(20).await.unwrap();
+    assert!(
+        saved.iter().any(|m| m.role == "assistant"
+            && m.content.as_ref().is_some_and(|c| c
+                .as_text()
+                .contains("maximum number of tool call iterations"))),
+        "the max-iterations sentence sent to the chat must be in history; saved={saved:?}"
+    );
+}
