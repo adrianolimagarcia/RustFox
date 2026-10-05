@@ -1,7 +1,7 @@
 # ADR 0018: Self-upgrade must surface causes; GitHub API auth optional
 
 ## Status
-Proposed
+Accepted
 
 ## Date
 2026-10-05
