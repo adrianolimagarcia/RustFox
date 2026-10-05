@@ -1178,21 +1178,20 @@ async fn run_cli(config_dir: &Path) -> Result<()> {
             };
             println!("  {}) {name}{mark}", i + 1);
         }
+        let other_n = super::thin::OPENROUTER_MODELS.len() + 1;
+        println!("  {}) Other", other_n);
+        println!("Catalog: {}", super::thin::OPENROUTER_MODELS_URL);
         let prompt = format!(
             "Pick a number [{}]: ",
             super::thin::OPENROUTER_DEFAULT_MODEL
         );
         let pick = read_line(&prompt)?;
-        openrouter_model = if pick.is_empty() {
-            super::thin::OPENROUTER_DEFAULT_MODEL.to_string()
+        let typed = if pick.trim().parse::<usize>().ok() == Some(other_n) {
+            Some(read_line("Model id (provider/model): ")?)
         } else {
-            let idx: usize = pick
-                .parse()
-                .ok()
-                .filter(|n| (1..=super::thin::OPENROUTER_MODELS.len()).contains(n))
-                .context("pick an OpenRouter model")?;
-            super::thin::OPENROUTER_MODELS[idx - 1].to_string()
+            None
         };
+        openrouter_model = super::thin::openrouter_model_from_cli_choice(&pick, typed.as_deref())?;
     }
     let tg_token = read_line("Telegram bot token: ")?;
     let sentence = read_line("System prompt (one sentence): ")?;
