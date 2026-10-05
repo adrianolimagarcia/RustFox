@@ -362,9 +362,10 @@ pub struct LlmClient {
     pub client: reqwest::Client,
     pub registry: Arc<crate::provider::ProviderRegistry>,
     /// Ordered fallback chain of fully-qualified `provider/model` names tried
-    /// (after the primary) when a call dies with a *transient* HTTP error
-    /// (429/5xx — see [`crate::provider::LlmHttpError`]). Empty (default) =
-    /// ADR-0009 behaviour exactly: primary only. ADR-0012.
+    /// (after the primary) on almost any failure (ADR-0019; amends ADR-0012).
+    /// Hard-excludes only HTTP 401/403 and pre-HTTP config errors — see
+    /// [`crate::provider::should_walk_fallback`]. Empty (default) = ADR-0009
+    /// behaviour exactly: primary only.
     pub fallback_chain: Vec<String>,
 }
 
@@ -407,12 +408,9 @@ impl LlmClient {
             Ok(completion) => return Ok(completion),
             Err(e) => e,
         };
-        // Only transient (429/5xx) failures justify switching model — a 400
-        // would fail identically on every candidate (ADR-0012 trigger rule).
-        let transient = primary_err
-            .downcast_ref::<crate::provider::LlmHttpError>()
-            .is_some_and(|e| e.is_transient());
-        if !transient || self.fallback_chain.is_empty() {
+        // ADR-0019: walk on any failure except hard exclusions (401/403,
+        // pre-HTTP missing-key/config). 400/402/timeout/network/parse all walk.
+        if !crate::provider::should_walk_fallback(&primary_err) || self.fallback_chain.is_empty() {
             return Err(primary_err);
         }
         let mut last_err = primary_err;
@@ -440,12 +438,9 @@ impl LlmClient {
                     return Ok(completion);
                 }
                 Err(e) => {
-                    let still_transient = e
-                        .downcast_ref::<crate::provider::LlmHttpError>()
-                        .is_some_and(|x| x.is_transient());
-                    if !still_transient {
-                        // Non-transient on a fallback: resending elsewhere is
-                        // pointless; surface it (usually config/compat error).
+                    if !crate::provider::should_walk_fallback(&e) {
+                        // Auth hard-exclusion on a backup: surface it — do not
+                        // keep hammering later chain entries with a bad key story.
                         return Err(e);
                     }
                     last_err = e;
@@ -985,7 +980,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // ADR-0012: request-layer fallback chain (wiremock matrix)
+    // ADR-0012 / ADR-0019: request-layer fallback chain (wiremock matrix)
     // ---------------------------------------------------------------
 
     use crate::config::ProviderType;
@@ -1136,12 +1131,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fallback_400_never_switches_models() {
+    async fn fallback_400_walks_to_backup_and_rewrites_model() {
+        // ADR-0019: top-level 400 (incl. OpenRouter envelopes) MUST walk.
         let server = MockServer::start().await;
         mount_model(
             &server,
             "m1",
             ResponseTemplate::new(400).set_body_string("bad"),
+        )
+        .await;
+        mount_model(
+            &server,
+            "m2",
+            ResponseTemplate::new(200).set_body_string(ok_body()),
+        )
+        .await;
+        let llm = LlmClient::new(fb_registry(server.uri()))
+            .with_fallback_chain(vec!["p2/m2".to_string()]);
+        let c = llm
+            .chat_completion_with_model(&fb_msgs(), &[], "p1/m1")
+            .await
+            .unwrap();
+        assert_eq!(c.model, "p2/m2");
+        assert_eq!(
+            c.message.content.as_ref().map(|m| m.as_text()).unwrap(),
+            "ok"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_401_never_walks() {
+        let server = MockServer::start().await;
+        mount_model(
+            &server,
+            "m1",
+            ResponseTemplate::new(401).set_body_string("bad key"),
         )
         .await;
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1162,11 +1186,151 @@ mod tests {
             .unwrap_err();
         assert!(
             err.downcast_ref::<crate::provider::LlmHttpError>()
-                .is_some_and(|e| e.status == 400),
-            "typed error must carry status"
+                .is_some_and(|e| e.status == 401),
+            "typed 401 must surface: {err}"
         );
-        // m2 mock exists but must never have been consulted.
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "400 must not switch models");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "401 must not walk fallback");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_403_never_walks() {
+        let server = MockServer::start().await;
+        mount_model(
+            &server,
+            "m1",
+            ResponseTemplate::new(403).set_body_string("forbidden"),
+        )
+        .await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |_req: &wiremock::Request| {
+                h.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_string(ok_body())
+            })
+            .mount(&server)
+            .await;
+        let llm = LlmClient::new(fb_registry(server.uri()))
+            .with_fallback_chain(vec!["p2/m2".to_string()]);
+        let err = llm
+            .chat_completion_with_model(&fb_msgs(), &[], "p1/m1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::provider::LlmHttpError>()
+                .is_some_and(|e| e.status == 403),
+            "typed 403 must surface: {err}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "403 must not walk fallback");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_402_walks_to_backup() {
+        let server = MockServer::start().await;
+        mount_model(
+            &server,
+            "m1",
+            ResponseTemplate::new(402).set_body_json(serde_json::json!({
+                "error": { "code": 402, "message": "Payment Required" }
+            })),
+        )
+        .await;
+        mount_model(
+            &server,
+            "m2",
+            ResponseTemplate::new(200).set_body_string(ok_body()),
+        )
+        .await;
+        let llm = LlmClient::new(fb_registry(server.uri()))
+            .with_fallback_chain(vec!["p2/m2".to_string()]);
+        let c = llm
+            .chat_completion_with_model(&fb_msgs(), &[], "p1/m1")
+            .await
+            .unwrap();
+        assert_eq!(
+            c.model, "p2/m2",
+            "402 credits must still reach local/backup"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_envelope_400_with_inner_429_walks() {
+        // Observed Kan failure shape: outer HTTP 400 + previous_errors 429.
+        let envelope = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "Provider returned error",
+                "metadata": { "provider_name": "InferenceNet" }
+            },
+            "previous_errors": [
+                {
+                    "code": 429,
+                    "message": "Rate limit",
+                    "metadata": { "error_type": "rate_limit_exceeded" }
+                }
+            ]
+        });
+        let insight = crate::provider::parse_openrouter_envelope(&envelope.to_string())
+            .expect("envelope must parse");
+        assert!(
+            insight.has_transient_inner(),
+            "inner 429 / rate_limit_exceeded must classify as transient: {insight:?}"
+        );
+        assert!(insight.inner_codes.contains(&429));
+        assert!(insight
+            .error_types
+            .iter()
+            .any(|t| t == "rate_limit_exceeded"));
+
+        let server = MockServer::start().await;
+        mount_model(
+            &server,
+            "m1",
+            ResponseTemplate::new(400).set_body_json(envelope),
+        )
+        .await;
+        mount_model(
+            &server,
+            "m2",
+            ResponseTemplate::new(200).set_body_string(ok_body()),
+        )
+        .await;
+        let llm = LlmClient::new(fb_registry(server.uri()))
+            .with_fallback_chain(vec!["p2/m2".to_string()]);
+        let c = llm
+            .chat_completion_with_model(&fb_msgs(), &[], "p1/m1")
+            .await
+            .unwrap();
+        assert_eq!(c.model, "p2/m2");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_connect_fail_walks_to_backup() {
+        // Primary points at a closed local port (never HTTP); backup is healthy.
+        let server = MockServer::start().await;
+        mount_model(
+            &server,
+            "m2",
+            ResponseTemplate::new(200).set_body_string(ok_body()),
+        )
+        .await;
+        let mut providers = std::collections::HashMap::new();
+        let dead: Arc<dyn crate::provider::Provider> = Arc::new(OpenRouterProvider::new(
+            fb_provider_config("p1", "http://127.0.0.1:1".to_string(), "m1"),
+        ));
+        let live: Arc<dyn crate::provider::Provider> = Arc::new(OpenRouterProvider::new(
+            fb_provider_config("p2", server.uri(), "m2"),
+        ));
+        providers.insert("p1".to_string(), dead);
+        providers.insert("p2".to_string(), live);
+        let reg = Arc::new(ProviderRegistry::new(providers, "p1".to_string()));
+        let llm = LlmClient::new(reg).with_fallback_chain(vec!["p2/m2".to_string()]);
+        let c = llm
+            .chat_completion_with_model(&fb_msgs(), &[], "p1/m1")
+            .await
+            .unwrap();
+        assert_eq!(c.model, "p2/m2", "connect/network fail must walk");
     }
 
     #[tokio::test(start_paused = true)]
