@@ -322,6 +322,15 @@ allowed_directory = "/tmp"
         );
         let bak = std::fs::read_to_string(dir.path().join("config.toml.bak")).unwrap();
         assert!(bak.contains("sk-test"), ".bak keeps the pre-scrub file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("config.toml.bak"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, ".bak is owner-only");
+        }
         assert_eq!(
             store.get("bot.main.token").unwrap().unwrap().expose(),
             "111111111:AAMainTokenSecretValueXXXX"
