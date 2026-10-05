@@ -272,6 +272,8 @@ MCP tools are namespaced as `mcp_<server-name>_<tool-name>` (e.g. `mcp_git_git_l
 | `try_new_tech` | Run a sandboxed experiment with a new technology (Rust/JS) |
 | `self_upgrade` | Upgrade the bot — auto-detects source code (git + cargo build) or release binary (downloads from GitHub). Re-registers systemd/launchd service if installed. Restarts after success. |
 
+Release-binary `/selfupgrade` asks GitHub for the latest release. Anonymous calls share a low rate limit; if Telegram shows HTTP 403 / rate limit, wait for the quota to reset or export `GITHUB_TOKEN` / `GH_TOKEN` (classic PAT with `public_repo`, or fine-grained Releases read) and retry. See ADR 0018.
+
 ---
 
 ## Bot Commands

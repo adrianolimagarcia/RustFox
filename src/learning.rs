@@ -619,6 +619,44 @@ async fn update_user_model_inner(
 
 // ─── Feature 4: Self-Update ─────────────────────────────────────────────────
 
+/// Optional GitHub token for release lookups (`GITHUB_TOKEN`, then `GH_TOKEN`).
+/// Empty values are ignored so anonymous quota still works when unset.
+fn github_release_auth_token() -> Option<String> {
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(token) = std::env::var(key) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_github_rate_limit(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    let status_hint = s.contains("403")
+        || s.contains("rate limit")
+        || s.contains("rate-limit")
+        || s.contains("ratelimit");
+    let api_hint = s.contains("api request failed")
+        || s.contains("github")
+        || s.contains("networkerror")
+        || s.contains("network error");
+    status_hint && api_hint
+}
+
+/// Prefer a clear rate-limit hint over a bare `self_update failed` chain.
+fn map_self_update_error(err: anyhow::Error) -> anyhow::Error {
+    if looks_like_github_rate_limit(&err) {
+        err.context(
+            "GitHub API rate limit (HTTP 403) while checking releases — not a missing asset. Wait for the anonymous quota to reset, or set GITHUB_TOKEN / GH_TOKEN (public_repo or fine-grained Releases read) and retry /selfupgrade",
+        )
+    } else {
+        err
+    }
+}
+
 /// Unified self-upgrade: auto-detects deployment mode (source or release binary),
 /// upgrades the binary, re-registers the service if running as one, and restarts.
 ///
@@ -725,19 +763,24 @@ pub async fn self_upgrade(
             log.push_str("Mode: release binary\n→ Checking GitHub releases...\n");
             send_progress(&mut log);
 
-            let update_result = tokio::task::spawn_blocking(|| {
-                self_update::backends::github::Update::configure()
+            let auth_token = github_release_auth_token();
+            let update_result = tokio::task::spawn_blocking(move || {
+                let mut builder = self_update::backends::github::Update::configure();
+                builder
                     .repo_owner("chinkan")
                     .repo_name("RustFox")
                     .bin_name("rustfox")
                     .show_download_progress(false)
-                    .current_version(self_update::cargo_crate_version!())
-                    .build()
-                    .and_then(|updater| updater.update())
+                    .current_version(self_update::cargo_crate_version!());
+                if let Some(ref token) = auth_token {
+                    builder.auth_token(token);
+                }
+                builder.build().and_then(|updater| updater.update())
             })
             .await
             .context("spawn_blocking failed")?
-            .context("self_update failed")?;
+            .context("self_update failed")
+            .map_err(map_self_update_error)?;
 
             if update_result.updated() {
                 log.push_str(&format!(
@@ -1100,4 +1143,55 @@ mod tests {
         let result = self_patch_skill(dir.path(), "no-such-skill", "patch", &registry).await;
         assert!(result.is_err());
     }
+    #[test]
+    fn github_release_auth_token_prefers_github_token() {
+        let _lock = GITHUB_ENV_LOCK.lock().unwrap();
+        let prev_github = std::env::var_os("GITHUB_TOKEN");
+        let prev_gh = std::env::var_os("GH_TOKEN");
+        std::env::remove_var("GITHUB_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+        assert!(github_release_auth_token().is_none());
+        std::env::set_var("GH_TOKEN", "from-gh");
+        assert_eq!(github_release_auth_token().as_deref(), Some("from-gh"));
+        std::env::set_var("GITHUB_TOKEN", "from-github");
+        assert_eq!(github_release_auth_token().as_deref(), Some("from-github"));
+        std::env::set_var("GITHUB_TOKEN", "  ");
+        assert_eq!(github_release_auth_token().as_deref(), Some("from-gh"));
+        match prev_github {
+            Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+            None => std::env::remove_var("GITHUB_TOKEN"),
+        }
+        match prev_gh {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+    }
+
+    #[test]
+    fn map_self_update_error_explains_github_403() {
+        let err = anyhow::anyhow!("NetworkError: api request failed with status: 403 - for: https://api.github.com/repos/chinkan/RustFox/releases/latest")
+            .context("self_update failed");
+        let mapped = map_self_update_error(err);
+        let text = format!("{mapped:#}");
+        assert!(
+            text.contains("rate limit") && text.contains("GITHUB_TOKEN"),
+            "friendly hint missing: {text}"
+        );
+        assert!(text.contains("403"), "cause chain should remain: {text}");
+    }
+
+    #[test]
+    fn map_self_update_error_leaves_other_failures_alone() {
+        let err =
+            anyhow::anyhow!("permission denied replacing binary").context("self_update failed");
+        let mapped = map_self_update_error(err);
+        let text = format!("{mapped:#}");
+        assert!(
+            !text.contains("rate limit"),
+            "must not invent rate-limit copy: {text}"
+        );
+        assert!(text.contains("permission denied"), "{text}");
+    }
+
+    static GITHUB_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

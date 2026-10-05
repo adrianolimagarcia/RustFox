@@ -1715,7 +1715,7 @@ pub async fn handle_message(
                             .edit_message_text(
                                 chat_id,
                                 msg_id,
-                                format!("❌ Upgrade failed:\n{}", e),
+                                format!("❌ Upgrade failed:\n{:#}", e),
                             )
                             .await
                             .ok();
