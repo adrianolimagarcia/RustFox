@@ -1314,28 +1314,11 @@ impl Agent {
         )
         .await;
 
-        match outcome {
+        let (text, stop) = match outcome {
             Ok(crate::loop_runner::LoopOutcome::FinalResponse {
                 text: final_content,
                 iterations,
             }) => {
-                // Save the delivered content to persistent memory.
-                // A scheduled run's prompt and result are written by the job
-                // runner so failure, cancel, and max-iterations get a result
-                // turn too, with the schedule id on the segment.
-                if incoming.schedule_id.is_none() {
-                    let save_msg = ChatMessage {
-                        role: "assistant".to_string(),
-                        content: Some(MessageContent::from_text(final_content.clone())),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    };
-                    self.memory
-                        .save_message(&conversation_id, &save_msg)
-                        .await?;
-                }
-
-                // --- LangSmith: end chain run (success) ---
                 self.langsmith.end_run(crate::langsmith::EndRunParams {
                     id: chain_run_id,
                     outputs: Some(serde_json::json!({
@@ -1345,21 +1328,7 @@ impl Agent {
                     error: None,
                     end_time: Self::now_iso8601_static(),
                 });
-
-                self.clear_cancel_token(bot_id, user_id).await;
-
-                // Post-loop soul reflection: if the agent didn't update SOUL.md during the
-                // conversation but the soul_updated flag was set by a tool, fire a reflection
-                // update to capture session-end insights.
-                if self.soul_updated.load(std::sync::atomic::Ordering::Relaxed) {
-                    // The soul was already updated by update_soul_file tool during the conversation.
-                    // No need to fire a second reflection.
-                }
-
-                Ok(RunOutcome {
-                    text: final_content,
-                    stop: RunStop::FinalResponse,
-                })
+                (final_content, RunStop::FinalResponse)
             }
             Ok(crate::loop_runner::LoopOutcome::Cancelled) => {
                 info!(
@@ -1372,11 +1341,7 @@ impl Agent {
                     error: Some("Cancelled by user".to_string()),
                     end_time: Self::now_iso8601_static(),
                 });
-                self.clear_cancel_token(bot_id, user_id).await;
-                Ok(RunOutcome {
-                    text: "Processing was cancelled.".to_string(),
-                    stop: RunStop::Cancelled,
-                })
+                ("Processing was cancelled.".to_string(), RunStop::Cancelled)
             }
             Ok(crate::loop_runner::LoopOutcome::MaxIterations) => {
                 warn!(
@@ -1393,11 +1358,10 @@ impl Agent {
                     )),
                     end_time: Self::now_iso8601_static(),
                 });
-                self.clear_cancel_token(bot_id, user_id).await;
-                Ok(RunOutcome {
-                    text: "I've reached the maximum number of tool call iterations. Please try rephrasing your request.".to_string(),
-                    stop: RunStop::MaxIterations,
-                })
+                (
+                    "I've reached the maximum number of tool call iterations. Please try rephrasing your request.".to_string(),
+                    RunStop::MaxIterations,
+                )
             }
             Err(e) => {
                 self.langsmith.end_run(crate::langsmith::EndRunParams {
@@ -1407,9 +1371,28 @@ impl Agent {
                     end_time: Self::now_iso8601_static(),
                 });
                 self.clear_cancel_token(bot_id, user_id).await;
-                Err(e)
+                return Err(e);
             }
+        };
+        self.clear_cancel_token(bot_id, user_id).await;
+
+        // Every Ok reply is sent to the chat, so history keeps it too
+        // (final, cancelled, or max iterations). A scheduled run's prompt and
+        // result are written by the job runner's `write_schedule_segment`, so
+        // skip it here to avoid a double write.
+        if incoming.schedule_id.is_none() {
+            let save_msg = ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::from_text(text.clone())),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            self.memory
+                .save_message(&conversation_id, &save_msg)
+                .await?;
         }
+
+        Ok(RunOutcome { text, stop })
     }
 
     /// Conversation a schedule run reads: the owning bot's chat with the user
